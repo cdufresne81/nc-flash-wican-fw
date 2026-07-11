@@ -164,6 +164,22 @@ static csv_column_provider_t csv_col_provider = NULL;
 // voltage ignition gate. Written once at boot before the writer runs; read lock-free in the gate.
 static csv_engine_state_fn_t csv_engine_state_fn = NULL;
 
+// Live-stream hook (registered by main/datalog_stream at boot). NULL = no-op. Fired from the
+// writer task at session/header/row/close points to mirror the SD file onto a live TCP stream
+// (issue #3); the hook is non-blocking and touches no SD/flash/PSRAM (see csv_logger.h).
+static csv_stream_hook_t csv_stream_hook = NULL;
+
+// Fire the stream hook if one is registered. All hook payloads come from INTERNAL-RAM buffers
+// (literals, csv_line_buf, sanitized header copies) so the non-blocking sink can memcpy them
+// even inside a flash-cache-disable window.
+static inline void csv_stream_emit(csv_stream_event_t ev, const char *data, size_t len)
+{
+    if (csv_stream_hook != NULL)
+    {
+        csv_stream_hook(ev, data, len);
+    }
+}
+
 // Distinct diagnostics -- do NOT overload csv_rows_dropped (which means "queue full"):
 static uint32_t csv_cols_unmatched = 0;   // WIDE record whose (source,name) isn't a column
 static uint32_t csv_pending_drops  = 0;   // records lost while a WIDE session waited for enum
@@ -229,6 +245,11 @@ static esp_err_t csv_open_new_file(void)
         return ESP_FAIL;
     }
 
+    // Live stream (issue #3): announce the (re)opened session before any header bytes. By
+    // convention SESSION_OPEN carries the column count in len and the file path in data; the
+    // header line is then mirrored chunk-for-chunk below (EV_HDR_CHUNK) and closed by EV_HDR_END.
+    csv_stream_emit(CSV_STREAM_EV_SESSION_OPEN, csv_file_path, (size_t)csv_col_count);
+
     // Wide header: timestamp_ms + two system columns (datetime, BATT_V) + one column per channel
     // + a trailing "mark" column (one-shot web event marker; empty on every row unless clicked).
     // Long format was removed (Task #16) and a session only opens after columns are enumerated, so
@@ -238,8 +259,12 @@ static esp_err_t csv_open_new_file(void)
     // buffer bound here). The two system columns are emitted in the same fixed order by
     // csv_emit_wide_row(), so header and rows stay aligned.
     csv_file_bytes = 0;
+    // Each header piece is written to SD and mirrored to the live stream as an EV_HDR_CHUNK so
+    // the stream's header copy is byte-identical to the file's header line (leading fixed columns,
+    // each sanitized channel name, ",mark", then "\n"). EV_HDR_END marks the copy complete.
     int n = fprintf(csv_file, "timestamp_ms,datetime,BATT_V");
     if (n > 0) csv_file_bytes += (size_t)n;
+    csv_stream_emit(CSV_STREAM_EV_HDR_CHUNK, "timestamp_ms,datetime,BATT_V", strlen("timestamp_ms,datetime,BATT_V"));
     for (int c = 0; c < csv_col_count; c++)
     {
         char hdr[CSV_LOGGER_NAME_MAX + CSV_LOGGER_SOURCE_MAX + 4];
@@ -250,11 +275,20 @@ static esp_err_t csv_open_new_file(void)
         csv_sanitize_field(hdr);   // sanitize a COPY; the column table keeps the raw name
         n = fprintf(csv_file, ",%s", hdr);
         if (n > 0) csv_file_bytes += (size_t)n;
+        if (csv_stream_hook != NULL)
+        {
+            char chunk[sizeof(hdr) + 1];
+            int cn = snprintf(chunk, sizeof(chunk), ",%s", hdr);
+            if (cn > 0) csv_stream_emit(CSV_STREAM_EV_HDR_CHUNK, chunk, (size_t)cn);
+        }
     }
     n = fprintf(csv_file, ",mark");          /* FINAL column: one-shot event marker (see csv_mark_pending) */
     if (n > 0) csv_file_bytes += (size_t)n;
+    csv_stream_emit(CSV_STREAM_EV_HDR_CHUNK, ",mark", 5);
     n = fprintf(csv_file, "\n");
     if (n > 0) csv_file_bytes += (size_t)n;
+    csv_stream_emit(CSV_STREAM_EV_HDR_CHUNK, "\n", 1);
+    csv_stream_emit(CSV_STREAM_EV_HDR_END, NULL, 0);
     csv_files_count++;
     ESP_LOGI(TAG, "CSV log started: %s (wide, %d cols)", csv_file_path, csv_col_count);
     return ESP_OK;
@@ -264,6 +298,9 @@ static void csv_close_file(void)
 {
     if (csv_file != NULL)
     {
+        // Live stream (issue #3): announce the close before we tear down (invalidates the
+        // stream's joiner header copy). Fired outside the fflush/fsync flash-cache window.
+        csv_stream_emit(CSV_STREAM_EV_CLOSE, NULL, 0);
         fflush(csv_file);
         fsync(fileno(csv_file));
         fclose(csv_file);
@@ -419,6 +456,8 @@ static bool csv_emit_wide_row(int64_t ts_ms)
     if (w < 0) return false;
     csv_file_bytes += (size_t)w;
     csv_rows_written++;
+    // Live stream (issue #3): mirror the committed row byte-for-byte (len includes the '\n').
+    csv_stream_emit(CSV_STREAM_EV_ROW, buf, len);
     return true;
 }
 
@@ -503,6 +542,11 @@ void csv_logger_set_column_provider(csv_column_provider_t provider)
 void csv_logger_set_engine_state_fn(csv_engine_state_fn_t fn)
 {
     csv_engine_state_fn = fn;
+}
+
+void csv_logger_set_stream_hook(csv_stream_hook_t hook)
+{
+    csv_stream_hook = hook;
 }
 
 static void csv_logger_task(void *pvParameters)

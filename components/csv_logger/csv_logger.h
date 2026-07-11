@@ -23,6 +23,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "esp_err.h"
 #include "esp_http_server.h"
 
@@ -93,6 +94,38 @@ typedef int (*csv_column_provider_t)(char (*names)[CSV_LOGGER_NAME_MAX],
  * @brief Register the wide-CSV column provider. Call once at boot (before logging starts).
  */
 void csv_logger_set_column_provider(csv_column_provider_t provider);
+
+/**
+ * @brief Live-stream hook for the wide-CSV writer (datalog stream, issue #3).
+ *
+ * Registered by main/ at boot so the CSV writer can mirror what it commits to SD onto a
+ * live TCP stream WITHOUT a build-time dependency on main/ (same one-way pattern as the
+ * column provider above). The hook fires from the CSV WRITER TASK at these points:
+ *
+ *   CSV_STREAM_EV_SESSION_OPEN  a new file opened (also on rotation). By convention the
+ *                               column count is carried in `len` and the NUL-terminated
+ *                               CSV file path in `data` (this event only; see below).
+ *   CSV_STREAM_EV_HDR_CHUNK     one piece of the header line; `data`/`len` are the bytes
+ *                               (the same bytes written to SD, sanitized copy).
+ *   CSV_STREAM_EV_HDR_END       the header line is complete (`data`==NULL, `len`==0).
+ *   CSV_STREAM_EV_ROW           one committed data row; `data`/`len` are the bytes
+ *                               (including the trailing '\n').
+ *   CSV_STREAM_EV_CLOSE         the session closed (`data`==NULL, `len`==0).
+ *
+ * CONTRACT: register ONCE at boot before logging starts. The hook runs on the writer task,
+ * so it MUST be non-blocking and MUST NOT touch SD/flash/PSRAM-heavy work (it can fire from
+ * inside an fprintf/fflush/fsync flash-cache-disable window). A NULL hook is a zero-cost no-op.
+ */
+typedef enum {
+    CSV_STREAM_EV_SESSION_OPEN = 0,
+    CSV_STREAM_EV_HDR_CHUNK,
+    CSV_STREAM_EV_HDR_END,
+    CSV_STREAM_EV_ROW,
+    CSV_STREAM_EV_CLOSE,
+} csv_stream_event_t;
+
+typedef void (*csv_stream_hook_t)(csv_stream_event_t ev, const char *data, size_t len);
+void csv_logger_set_stream_hook(csv_stream_hook_t hook);
 
 /**
  * @brief Engine-running predicate for the "Require engine running" CSV gate.

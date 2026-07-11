@@ -48,6 +48,7 @@
 #include "comm_server.h"
 #include "slcan_port.h"   /* dedicated always-on SLCAN listener (no-reboot coexistence, task #36) */
 #include "datalog_lease_task.h"   /* dead-man's-switch reaper (brick-safe datalog auto-resume, task #36) */
+#include "datalog_stream.h"   /* always-on live-datalog TCP stream listener (issue #3) */
 #include "config_server.h"
 #include "slcan.h"
 #include "can.h"
@@ -110,7 +111,8 @@ static QueueHandle_t xMsg_Tx_Queue, xMsg_Rx_Queue, xmsg_ble_tx_queue, xmsg_uart_
  * never collide with the stock port's xMsg_Tx_Queue. WICAN_PRO only. */
 static QueueHandle_t xMsg_SlcanPort_Tx_Queue;
 /* Fixed TCP port of the dedicated always-on SLCAN listener; MUST match the host's
- * WICAN_DEDICATED_SLCAN_PORT (src/ecu/constants.py). */
+ * WICAN_DEDICATED_SLCAN_PORT (src/ecu/constants.py). The live-datalog stream listener
+ * (issue #3) sits alongside on WICAN_DATALOG_STREAM_PORT (35002), defined in datalog_stream.h. */
 #define WICAN_DEDICATED_SLCAN_PORT   35001
 static xdev_buffer ucTCP_RX_Buffer;
 static xdev_buffer ucTCP_TX_Buffer;
@@ -1016,6 +1018,28 @@ void app_main(void)
 	 * mid-coexistence (lid close / crash / Wi-Fi drop). Reads coexistence state only; safe to
 	 * start regardless of whether the dedicated port came up. See WICAN_DEADMAN_AUTORESUME.md. */
 	datalog_lease_task_start();
+
+	/* Live-datalog stream (issue #3): an always-on, tail-only TCP listener that mirrors the
+	 * wide-CSV datalog the device is writing to SD onto port 35002 for NC Flash. Same
+	 * bind-collision guard as the SLCAN port: if the stock port is (mis)configured to 35002,
+	 * skip rather than fight the bind (the stream is simply unavailable, capability-probed by
+	 * the host). Touches no CAN bit / park / claim / lease. */
+	if(port == WICAN_DATALOG_STREAM_PORT)
+	{
+		ESP_LOGW(TAG, "stock port == %d collides with datalog stream port; live-stream listener NOT started",
+				 WICAN_DATALOG_STREAM_PORT);
+	}
+	else if(datalog_stream_init(WICAN_DATALOG_STREAM_PORT) == 0)
+	{
+		/* Register the csv writer-task hook only after init proved every handle valid (a
+		 * half-armed hook would panic the writer). The writer task starts ~20 s from now
+		 * (csv_logger_init_deferred), long after this ordering resolves. */
+		csv_logger_set_stream_hook(datalog_stream_csv_hook);
+	}
+	else
+	{
+		ESP_LOGE(TAG, "datalog stream init failed (live datalog stream unavailable)");
+	}
 	#endif
 
 	if(config_server_get_ble_config())

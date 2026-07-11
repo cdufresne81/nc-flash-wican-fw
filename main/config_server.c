@@ -99,6 +99,7 @@
 #include "restart_tracker.h"
 #include "restart_tracker_http.h"
 #include "led_indicator.h"
+#include "datalog_stream.h"   /* live-datalog stream status for /check_status (issue #3) */
 
 
 #define WIFI_CONNECTED_BIT			BIT0
@@ -1320,6 +1321,13 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	// LED, and this is what lets the flash/datalog indications be verified
 	// over HTTP.
 	cJSON_AddStringToObject(root, "led_indicator", led_indicator_get_state_str());
+	// Live-datalog stream (issue #3): capability + liveness for the NC Flash host. stream_port
+	// advertises the tail-only listener; the host still banner-probes it. Getters are safe on any
+	// hardware (return defaults when the listener was never started).
+	cJSON_AddNumberToObject(root, "stream_port", WICAN_DATALOG_STREAM_PORT);
+	cJSON_AddBoolToObject(root, "stream_connected", datalog_stream_client_connected());
+	cJSON_AddNumberToObject(root, "stream_rows_sent", datalog_stream_rows_sent());
+	cJSON_AddNumberToObject(root, "stream_rows_dropped", datalog_stream_rows_dropped());
 	char uptime_str[32];
 	dev_status_format_uptime(uptime_str, sizeof(uptime_str));
 	if(uptime_str[0] == '\0')
