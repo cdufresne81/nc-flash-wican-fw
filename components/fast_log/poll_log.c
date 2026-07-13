@@ -432,6 +432,11 @@ static void polllog_rx_task(void *arg)
 
         if (s_engine_running)
         {
+            /* A pending wake-kick is already satisfied while we poll NORMALLY: consume
+             * it here so a kick that raced a still-running poller cannot fire a stale
+             * spurious resume out of some LATER quiesce. */
+            can_datalog_kick_clear();
+
             /* One single-PID round-robin sweep over all configured polled PIDs. */
             for (uint32_t i = 0; i < s_cfg->pid_count; i++)
             {
@@ -505,7 +510,14 @@ static void polllog_rx_task(void *arg)
                 got++;
             }
 
-            bool resume = (got >= POLLLOG_RESUME_FRAMES) ||
+            /* A wake-kick (csv op=start/op=auto, can.c) joins the resume triggers: the
+             * user just armed a trip (or the host gave the device back) on a bus that may
+             * never deliver the frame this loop waits for. Consumed ONLY on a successful
+             * flip -- a kick landing inside the FLIP_MIN_MS anti-flap window stays pending
+             * for the next pass instead of being lost. Cost of a wrong kick: one ~2 s
+             * NORMAL probe, then re-quiesce. */
+            bool kicked = can_datalog_kick_pending();
+            bool resume = (got >= POLLLOG_RESUME_FRAMES) || kicked ||
                           ((now - s_last_flip_us) > (int64_t)POLLLOG_MAX_QUIESCE_MS * 1000);
 
             if (resume && (now - s_last_flip_us) > (int64_t)POLLLOG_FLIP_MIN_MS * 1000)
@@ -515,12 +527,14 @@ static void polllog_rx_task(void *arg)
                 can_enable();
                 if (can_is_enabled())
                 {
+                    can_datalog_kick_clear();
                     s_quiesced       = false;
                     s_engine_running = true;
                     s_confirmed      = false; /* PROBE: a frame woke us, but require a real OK to confirm running */
                     s_norm_start_us  = now;   /* start the probe window (re-quiesce after PROBE_MS if no OK) */
                     s_last_flip_us   = now;
-                    ESP_LOGI(TAG, "bus alive (%d frame[s]) -> NORMAL, probing for ECU", got);
+                    if (kicked) { ESP_LOGI(TAG, "manual-start kick -> NORMAL, probing for ECU"); }
+                    else        { ESP_LOGI(TAG, "bus alive (%d frame[s]) -> NORMAL, probing for ECU", got); }
                     /* ENGINE_START is emitted on the first OK (polllog_poll_one), NOT here: a stray
                      * wind-down frame that yields no OK is a false alarm and must not log a start. */
                 }
@@ -668,14 +682,18 @@ uint32_t poll_log_bus_idle_ms(void)
  */
 char *poll_log_get_status_json(void)
 {
-    char *buf = malloc(320);
+    char *buf = malloc(384);
     if (buf == NULL)
         return NULL;
-    snprintf(buf, 320,
+    /* "parked" makes a fenced snapshot self-describing: while a host park/claim/flash
+     * reserves the bus the poll task publishes NO new metrics, so every other field is a
+     * stale pre-park snapshot that reads as healthy (Start Trip field incident,
+     * 2026-07-11 — a "fine-looking" /poll_status hid the parked producer). */
+    snprintf(buf, 384,
              "{\"active\":%s,\"ok\":%u,\"timeout\":%u,\"txfail\":%u,"
              "\"rtt_avg_ms\":%.2f,\"rtt_min_ms\":%.2f,\"rtt_max_ms\":%.2f,\"req_s\":%.1f,"
              "\"win_ok\":%u,\"win_timeout\":%u,\"win_txfail\":%u,"
-             "\"engine_running\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u}",
+             "\"engine_running\":%s,\"quiesced\":%s,\"parked\":%s,\"bus_idle_ms\":%u}",
              s_active ? "true" : "false",
              (unsigned)s_cum_ok, (unsigned)s_cum_timeout, (unsigned)s_cum_txfail,
              (double)s_win_rtt_avg_ms, (double)s_win_rtt_min_ms, (double)s_win_rtt_max_ms,
@@ -683,6 +701,7 @@ char *poll_log_get_status_json(void)
              (unsigned)s_win_ok, (unsigned)s_win_timeout, (unsigned)s_win_txfail,
              poll_log_engine_running() ? "true" : "false",
              s_quiesced ? "true" : "false",
+             can_should_park() ? "true" : "false",
              (unsigned)poll_log_bus_idle_ms());
     return buf;
 }

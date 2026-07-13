@@ -2911,6 +2911,11 @@ function csv_status_render(j) {
         line.textContent = 'logging • ' + (j.file || '') + ' • ' + (j.rows_written || 0) + ' rows';
     } else if (j && j.manual_mode === 'on' && j.sd_mounted === false) {
         line.textContent = 'waiting for SD card…';
+    } else if (j && j.manual_mode === 'on' && j.producers_parked) {
+        // The honest why-no-data state: NC Flash holds the bus, so the poller is
+        // parked and an armed trip records NOTHING until it disconnects (the old
+        // "waiting for data…" here sent users on a false chase — field, 2026-07-11).
+        line.textContent = 'armed — paused: bus reserved by NC Flash (recording resumes when it disconnects)';
     } else if (j && j.manual_mode === 'on') {
         line.textContent = 'armed — waiting for data…';
     } else if (j && j.manual_mode === 'off') {
@@ -2944,7 +2949,9 @@ function csv_log_control() {
         .then(function(j) {
             csv_status_render(j);
             if (op === 'start') {
-                csv_notify(j.session_active ? 'Datalogging started' : 'Datalogging armed — waiting for data',
+                csv_notify(j.session_active ? 'Datalogging started'
+                           : (j.producers_parked ? 'Armed, but NC Flash holds the bus — no data until it disconnects'
+                                                 : 'Datalogging armed — waiting for data'),
                            j.session_active ? 'green' : 'orange');
             } else {
                 csv_notify('Datalogging stopped', 'blue');
@@ -3094,9 +3101,11 @@ function console_status_render(j, on) {
     if (!dot || !state || !btn) return;
     var live = !!(j && j.session_active);
     var armed = !!(j && j.manual_mode === 'on' && !live);
+    var parked = !!(j && j.producers_parked);
     dot.className = 'rec-dot' + (live ? ' live' : (armed ? ' armed' : ''));
-    state.textContent = live ? 'Recording' : (armed ? 'Armed' : 'Idle');
-    if (file) file.textContent = live ? (j.file || '') : (armed ? 'waiting for data\u2026' : '\u00a0');
+    state.textContent = live ? 'Recording' : (armed ? (parked ? 'Armed (paused)' : 'Armed') : 'Idle');
+    if (file) file.textContent = live ? (j.file || '')
+        : (armed ? (parked ? 'paused \u2014 bus reserved by NC Flash' : 'waiting for data\u2026') : '\u00a0');
     btn.textContent = on ? 'Stop Trip' : 'Start Trip';
     btn.className = 'console-rec-btn' + (on ? ' stop' : '');
     var markBtn = document.getElementById('console_mark_btn');
@@ -3125,7 +3134,9 @@ function consoleRecClick() {
         .then(function(j) {
             csv_status_render(j);
             if (op === 'start') {
-                csv_notify(j.session_active ? 'Trip recording started' : 'Trip armed \u2014 waiting for data',
+                csv_notify(j.session_active ? 'Trip recording started'
+                           : (j.producers_parked ? 'Trip armed, but NC Flash holds the bus \u2014 no data until it disconnects'
+                                                 : 'Trip armed \u2014 waiting for data'),
                            j.session_active ? 'green' : 'orange');
             } else {
                 csv_notify('Trip stopped', 'blue');

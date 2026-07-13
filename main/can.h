@@ -115,8 +115,18 @@ bool     can_park_lease_release(uint32_t token);     /* token-matched clear (0 =
 bool     can_park_lease_reap(uint32_t token, uint64_t deadline_us);       /* reaper compare-and-clear */
 uint32_t can_park_token(void);                        /* 0 = disarmed */
 
-/* Bus-idle evidence: ms since the last TWAI TX or RX (whichever is later). */
+/* Bus-idle evidence: ms since the last DEVICE TX. RX must not feed this clock — the
+ * PCM's periodic broadcasts would pin it at ~0 in any running car and the dead-man
+ * reaper could never fire (see s_last_bus_activity_ms in can.c). */
 uint32_t can_bus_idle_ms(void);
+
+/* Datalog wake-kick: csv op=start/op=auto ask the poll_log task to leave its engine-off
+ * LISTEN_ONLY quiesce for one NORMAL re-probe (a silent bus never delivers the frame the
+ * quiesce loop waits for). Lives here because csv_logger may not depend on fast_log.
+ * Set by the httpd task; consumed (pending -> clear) only by the poll_log task. */
+void can_datalog_kick(void);
+bool can_datalog_kick_pending(void);
+void can_datalog_kick_clear(void);
 
 /* Stuck-flash alarm (reported in /datalog state JSON; NEVER clears FLASH_ACTIVE_BIT). */
 void can_set_stuck_flash_alarm(bool on);

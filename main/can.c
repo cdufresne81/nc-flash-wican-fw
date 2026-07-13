@@ -83,7 +83,15 @@ typedef struct {
 
 static lease_t s_claim = {0};   /* host bus-claim raised over the UDS auth window (auth fence) */
 static lease_t s_park  = {0};   /* host REST datalog-pause (advisory pre-park)                 */
-static volatile uint32_t s_last_bus_activity_ms = 0; /* last TWAI TX or RX (atomic 32-bit ms) */
+/* Last DEVICE TRANSMISSION (atomic 32-bit ms) — the reaper's "operation in flight"
+ * evidence. Deliberately TX-ONLY: every host->ECU exchange must transmit THROUGH this
+ * device (poll requests, forwarded 35001 frames, flash blocks), so TX-idle proves no
+ * host-driven operation is mid-flight. RX must NOT stamp this: the PCM broadcasts
+ * periodic frames (0x201 RPM etc.) continuously with the ignition on, so an RX-fed
+ * clock never goes idle in a running car and the dead-man reaper could NEVER fire —
+ * a crashed host would leave the datalogger parked until reboot (observed on the
+ * bench 2026-07-11: bus_idle_ms pinned at single digits while fully parked). */
+static volatile uint32_t s_last_bus_activity_ms = 0;
 static volatile bool     s_stuck_flash_alarm = false;
 
 #define TAG 		__func__
@@ -324,6 +332,32 @@ uint32_t can_bus_idle_ms(void)
 {
 	uint32_t now_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
 	return now_ms - s_last_bus_activity_ms;   /* unsigned wrap is fine (same modulus) */
+}
+
+/* --- Datalog wake-kick (csv op=start/op=auto -> poll_log re-probe) --------------------
+ * A user's manual trip start (or the host giving the device back) is intent to record
+ * NOW, but the poll_log task may sit in its engine-off LISTEN_ONLY quiesce and only
+ * re-probe on a bus frame -- a silent (sleeping-ECU) bus never delivers one, so an armed
+ * trip records nothing (Start Trip field incident, 2026-07-11). The flag lives HERE, not
+ * in fast_log, because csv_logger may not depend on fast_log (fast_log feeds csv_logger);
+ * can.c is already the producers' coordination point. Set by the /csv_logger handler
+ * (httpd task), consumed by the single poll_log task: one volatile bool, no ordering
+ * requirement beyond "eventually seen" (the quiesce loop re-reads it every ~20 ms). */
+static volatile bool s_datalog_kick = false;
+
+void can_datalog_kick(void)
+{
+	s_datalog_kick = true;
+}
+
+bool can_datalog_kick_pending(void)
+{
+	return s_datalog_kick;
+}
+
+void can_datalog_kick_clear(void)
+{
+	s_datalog_kick = false;
 }
 
 void can_set_stuck_flash_alarm(bool on)
@@ -635,12 +669,8 @@ esp_err_t can_receive(twai_message_t *message, TickType_t ticks_to_wait)
 	// else
 	{
 		esp_err_t ret = twai_receive(message, ticks_to_wait);
-		if(ret == ESP_OK)
-		{
-			/* Stamp bus activity (dead-man's-switch bus-idle evidence): a received frame
-			 * proves the bus is not quiescent. Single atomic 32-bit ms write. */
-			s_last_bus_activity_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
-		}
+		/* NO activity stamp on RX: the PCM's periodic broadcasts would pin the
+		 * dead-man idle clock at ~0 in any running car (see s_last_bus_activity_ms). */
 		return ret;
 	}
 }
@@ -670,8 +700,8 @@ esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait)
 		esp_err_t ret = twai_transmit(message, ticks_to_wait);
 		if(ret == ESP_OK)
 		{
-			/* Stamp bus activity (dead-man's-switch bus-idle evidence): the single TX
-			 * chokepoint. Single atomic 32-bit ms write. */
+			/* Stamp device-TX activity (dead-man's-switch idle evidence): the single
+			 * TX chokepoint. Single atomic 32-bit ms write. */
 			s_last_bus_activity_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
 		}
 		return ret;

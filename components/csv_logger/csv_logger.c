@@ -116,6 +116,26 @@ static volatile int8_t csv_manual_mode = CSV_MANUAL_AUTO;
 // case = two clicks before the next row coalesce into one X; the UI debounces). .bss => RAM.
 static volatile int8_t csv_mark_pending = 0;
 
+// Live-trip host dead-man (op=start&lease_ms=N). While armed, stopped renewals mean the
+// NC-Flash host vanished mid manual trip (crash / lid close): the writer reaps manual-ON
+// back to AUTO so an orphaned FORCE_ON can't fill the SD with grid rows forever. The web
+// UI's unleased op=start disarms it (operator takeover). Cross-core contract mirrors
+// csv_manual_mode: each field is an individually-atomic aligned store; the httpd task
+// writes expiry FIRST then armed=1, the writer only ever writes armed=0 — the worst torn
+// pair is one stale expiry read, i.e. a reap delayed by one renewal period. Expiry is
+// esp_timer/1000 truncated to uint32 (wrap ~49.7 days) compared with the signed-diff
+// idiom, so wrap-around never false-fires.
+#define CSV_LEASE_TTL_MIN_MS   5000u     // floor: below ~1 renewal period the lease flaps
+#define CSV_LEASE_TTL_MAX_MS   600000u   // cap: a forgotten huge TTL must still reap same-drive
+static volatile uint32_t csv_lease_expiry_ms = 0;
+static volatile int8_t csv_lease_armed = 0;
+
+// Deferred new-trip rotation (op=start&rotate=1): close the ACTIVE session so the next
+// record opens a fresh file — the host's "every Live-Datalog press is a new trip". Without
+// it a manual start while an AUTO session is already open silently appends to the old
+// trip. One-shot, same httpd-writes-1 / writer-writes-0 contract as csv_mark_pending.
+static volatile int8_t csv_rotate_pending = 0;
+
 // ---- Wide (Tactrix-style) CSV format state (Task #11) ----
 // Approach B: write WIDE incrementally (one column per channel) with in-RAM last-observation-
 // carried-forward (LOCF). Fast channels (RPM) change each row, slow ones (ECT/IAT) repeat
@@ -623,18 +643,39 @@ static void csv_logger_task(void *pvParameters)
         // running (poll_log: ECU answering / not quiesced) IN ADDITION to the voltage ignition gate.
         // The provider returns true when poll_log isn't the active mode, so this auto-degrades to the
         // voltage gate when RPM isn't available. FORCE_ON/FORCE_OFF still win for bench use.
+        // Live-trip lease reap: renewals stopped => the NC-Flash host vanished mid manual
+        // trip. Restore AUTO (follow ignition) — the csv twin of the /datalog park reaper.
+        // Touches ONLY csv_manual_mode, so it is brick-safe by construction. Runs every
+        // pass (the queue timeout above bounds a pass at <=250 ms even fully idle).
+        if (csv_lease_armed)
+        {
+            uint32_t lease_now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            if ((int32_t)(lease_now_ms - csv_lease_expiry_ms) > 0)
+            {
+                csv_lease_armed = 0;
+                if (csv_manual_mode == CSV_MANUAL_ON)
+                {
+                    csv_manual_mode = CSV_MANUAL_AUTO;
+                    event_log_emit(EVL_REAPER_RESUME, "live-trip lease expired -> auto");
+                }
+            }
+        }
+
         bool engine_ok = !require_engine || csv_engine_state_fn == NULL || csv_engine_state_fn();
         bool logging_active = (csv_manual_mode == CSV_MANUAL_ON)  ? true
                             : (csv_manual_mode == CSV_MANUAL_OFF) ? false
                             : (ignition_on && engine_ok);
 
-        // Session close: logging stopped (ignition off / disabled) or SD was pulled.
-        if (csv_session_active && (!logging_active || !sdcard_is_mounted()))
+        // Session close: logging stopped (ignition off / disabled), SD was pulled, or the
+        // host asked for a new-trip rotation (close now; the next record opens fresh).
+        if (csv_session_active &&
+            (!logging_active || !sdcard_is_mounted() || csv_rotate_pending))
         {
             // Accurate close cause for post-hoc forensics: distinguish a voltage ignition-off from the
             // "require engine running" gate going false (engine quiesced while the bench/voltage still
             // reads ON). ignition_on / engine_ok are already computed above for logging_active.
             const char *why = !sdcard_is_mounted()             ? "sd_removed"
+                            : csv_rotate_pending                  ? "rotate"
                             : (csv_manual_mode == CSV_MANUAL_OFF) ? "manual_stop"
                             : (!ignition_on)                      ? "ignition_off"
                                                                   : "engine_stopped";
@@ -642,9 +683,16 @@ static void csv_logger_task(void *pvParameters)
             csv_close_file();
             csv_session_active = false;
             csv_free_wide_state();
+            csv_rotate_pending = 0;   // rotation consumed (or overtaken by a real close)
             // Operational event (Task #24): one emit per real session close. Non-blocking enqueue.
             event_log_emit(EVL_DATALOG_CLOSE, "%s (%s, %u bytes)",
                            csv_file_path, why, (unsigned)closed_bytes);
+        }
+        else if (csv_rotate_pending)
+        {
+            // rotate=1 with no open session: nothing to close — the next record already
+            // opens a fresh file. Consume the flag so it can't close a FUTURE session.
+            csv_rotate_pending = 0;
         }
 
         // WIDE fixed-rate grid: emit one LOCF snapshot row per 1/hz, even on idle passes.
@@ -874,6 +922,15 @@ char *csv_logger_get_status_json(void)
     cJSON_AddStringToObject(root, "manual_mode",
                             (csv_manual_mode == CSV_MANUAL_ON)  ? "on" :
                             (csv_manual_mode == CSV_MANUAL_OFF) ? "off" : "auto");
+    // Live-trip dead-man state (op=start&lease_ms): lets the host/tests verify the lease
+    // armed/reaped without waiting out a TTL blind.
+    cJSON_AddBoolToObject(root, "lease_armed", csv_lease_armed != 0);
+    // The honest "why is my armed trip not recording" bit: while a flash codec or a host
+    // park/bus-claim reserves the CAN controller, BOTH record producers (poll_log/AutoPID)
+    // stand down, so an armed trip gets zero records and its file never even opens. The
+    // web UI turns this into "paused — bus reserved by NC Flash" instead of the misleading
+    // "waiting for data" (field incident, 2026-07-11).
+    cJSON_AddBoolToObject(root, "producers_parked", can_should_park());
     cJSON_AddStringToObject(root, "file", csv_session_active ? csv_file_path : "");
     cJSON_AddNumberToObject(root, "rows_written", csv_rows_written);
     cJSON_AddNumberToObject(root, "rows_dropped", csv_rows_dropped);
@@ -1070,7 +1127,26 @@ static esp_err_t csv_download_handler(httpd_req_t *req)
     return ret;
 }
 
-// POST /csv_logger?op=start|stop|mark -- runtime manual start/stop + one-shot trip marker.
+// Mode the /datalog resume path restores (snapshotted on the FIRST pause so a re-pause
+// can't clobber it; reset to AUTO by op=auto so a later resume/reap lands on AUTO, never a
+// stale ON/OFF). Declared here because BOTH httpd handlers below write it; the reaper task
+// reads it via datalog_restore_mode() — volatile int8, same cross-core contract as
+// csv_manual_mode.
+static volatile int8_t s_datalog_prepause_mode = CSV_MANUAL_AUTO;
+
+// POST /csv_logger?op=start|stop|auto|renew|mark -- runtime manual control + trip marker.
+//   start : force logging ON (web UI button, or the host's leased live trip — see the
+//           lease_ms/rotate params parsed below).
+//   stop  : force logging OFF until the next start/auto/reboot (authoritative bench stop).
+//   auto  : restore follow-ignition as the steady state EVERYWHERE — current mode, the
+//           /datalog pre-pause restore target, and the live-trip lease. The host's "give
+//           the device back" op (Stop Live Datalog / disconnect / app close).
+//   renew : heartbeat-ONLY lease renewal for the host's live trip. Never (re)starts
+//           logging: a web-UI Stop between two heartbeats must WIN — the old
+//           start&lease_ms heartbeat silently restarted the trip the operator had just
+//           stopped (field incident, 2026-07-11). 409 = the trip is no longer running
+//           manual; the host ends its stream and leaves the mode to whoever set it.
+//   mark  : brand the next row of the open trip file.
 static esp_err_t csv_control_handler(httpd_req_t *req)
 {
     char query[64];
@@ -1078,14 +1154,84 @@ static esp_err_t csv_control_handler(httpd_req_t *req)
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
         httpd_query_key_value(query, "op", op, sizeof(op)) != ESP_OK)
     {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing op=start|stop|mark");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing op=start|stop|auto|renew|mark");
         return ESP_FAIL;
     }
 
     esp_err_t e = ESP_OK;
-    bool conflict = false;   /* no trip file open -> 409, like datalog_control_handler */
-    if (strcmp(op, "start") == 0)     { e = csv_logger_set_manual_override(true); }
-    else if (strcmp(op, "stop") == 0) { e = csv_logger_set_manual_override(false); }
+    /* 409 paths, body still the live status JSON: op=mark with no trip file open, and
+     * op=renew when the trip is no longer manual-ON (stopped/redirected under the host). */
+    bool conflict = false;
+    if (strcmp(op, "start") == 0)
+    {
+        e = csv_logger_set_manual_override(true);
+        if (e == ESP_OK)
+        {
+            // Host dead-man: lease_ms arms (and every renewal re-arms) the live-trip
+            // lease. An UNLEASED start (the web UI button) disarms any leftover lease —
+            // an explicit operator takeover must not be reaped from under the operator.
+            char buf[16];
+            if (httpd_query_key_value(query, "lease_ms", buf, sizeof(buf)) == ESP_OK)
+            {
+                uint32_t ttl = (uint32_t)strtoul(buf, NULL, 10);
+                if (ttl < CSV_LEASE_TTL_MIN_MS) { ttl = CSV_LEASE_TTL_MIN_MS; }
+                if (ttl > CSV_LEASE_TTL_MAX_MS) { ttl = CSV_LEASE_TTL_MAX_MS; }
+                csv_lease_expiry_ms = (uint32_t)(esp_timer_get_time() / 1000) + ttl;
+                csv_lease_armed = 1;   // armed LAST: expiry is coherent first
+            }
+            else
+            {
+                csv_lease_armed = 0;
+            }
+            // New-trip rotation: close the active session so the next record opens a
+            // fresh file. One-shot — lease renewals never pass rotate=1.
+            if (httpd_query_key_value(query, "rotate", buf, sizeof(buf)) == ESP_OK &&
+                strcmp(buf, "1") == 0)
+            {
+                csv_rotate_pending = 1;
+            }
+            // A manual start is user intent to record NOW: if the poller sits in its
+            // engine-off LISTEN_ONLY quiesce (ECU asleep -> zero records -> the trip
+            // arms forever), kick one NORMAL re-probe. A sleeping ECU just re-quiesces
+            // after the short probe window, so a wrong kick costs ~2 s of probing.
+            can_datalog_kick();
+        }
+    }
+    else if (strcmp(op, "stop") == 0)
+    {
+        e = csv_logger_set_manual_override(false);
+        csv_lease_armed = 0;   // explicit stop: the dead-man has nothing left to guard
+    }
+    else if (strcmp(op, "auto") == 0)
+    {
+        csv_manual_mode = CSV_MANUAL_AUTO;
+        s_datalog_prepause_mode = CSV_MANUAL_AUTO;
+        csv_lease_armed = 0;
+        // Same wake-kick as op=start: "give the device back" should resume ignition-
+        // follow logging promptly even if the poller quiesced while the host held it.
+        can_datalog_kick();
+    }
+    else if (strcmp(op, "renew") == 0)
+    {
+        char buf[16];
+        if (httpd_query_key_value(query, "lease_ms", buf, sizeof(buf)) != ESP_OK)
+        {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "renew needs lease_ms");
+            return ESP_FAIL;
+        }
+        if (csv_manual_mode == CSV_MANUAL_ON)
+        {
+            uint32_t ttl = (uint32_t)strtoul(buf, NULL, 10);
+            if (ttl < CSV_LEASE_TTL_MIN_MS) { ttl = CSV_LEASE_TTL_MIN_MS; }
+            if (ttl > CSV_LEASE_TTL_MAX_MS) { ttl = CSV_LEASE_TTL_MAX_MS; }
+            csv_lease_expiry_ms = (uint32_t)(esp_timer_get_time() / 1000) + ttl;
+            csv_lease_armed = 1;   // armed LAST: expiry is coherent first
+        }
+        else
+        {
+            conflict = true;   /* trip stopped under the host: renew must NOT restart it */
+        }
+    }
     else if (strcmp(op, "mark") == 0)
     {
         // One-shot trip marker. Plain read of the writer's session flag (same benign
@@ -1101,7 +1247,7 @@ static esp_err_t csv_control_handler(httpd_req_t *req)
     }
     else
     {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "op must be start, stop or mark");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "op must be start, stop, auto, renew or mark");
         return ESP_FAIL;
     }
 
@@ -1128,8 +1274,8 @@ static esp_err_t csv_control_handler(httpd_req_t *req)
 }
 
 // ---- /datalog coordination endpoint (no-reboot coexistence, task #36.C) ----
-// Mode to restore on resume (snapshotted on the FIRST pause so a re-pause can't clobber it).
-static volatile int8_t s_datalog_prepause_mode = CSV_MANUAL_AUTO;
+// (s_datalog_prepause_mode — the mode resume restores — is declared above
+// csv_control_handler, which also writes it via op=auto.)
 
 // Compact live state for the host to verify quiesce/resume + run the dead-man's-switch
 // (host reconcile reads flash_active/host_bus_claimed; pause/bus_claim read the issued
@@ -1146,6 +1292,7 @@ static char *datalog_state_json(void)
     cJSON_AddStringToObject(root, "manual_mode",
                             (csv_manual_mode == CSV_MANUAL_ON)  ? "on" :
                             (csv_manual_mode == CSV_MANUAL_OFF) ? "off" : "auto");
+    cJSON_AddBoolToObject(root, "lease_armed", csv_lease_armed != 0);
     uint32_t park_tok = can_park_token();
     uint32_t claim_tok = can_host_bus_claim_token();
     if (park_tok) { cJSON_AddNumberToObject(root, "park_token", park_tok); }

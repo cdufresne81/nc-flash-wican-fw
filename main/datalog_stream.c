@@ -556,6 +556,7 @@ static void datalog_stream_server_task(void *pvParameters)
     int keepIdle = KEEPALIVE_IDLE;
     int keepInterval = KEEPALIVE_INTERVAL;
     int keepCount = KEEPALIVE_COUNT;
+    int noDelay = 1;
     struct timeval snd_timeout = { .tv_sec = SEND_TIMEOUT_S, .tv_usec = 0 };
     struct sockaddr_storage dest_addr;
     struct sockaddr_storage source_addr;
@@ -617,6 +618,10 @@ static void datalog_stream_server_task(void *pvParameters)
             setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
             setsockopt(new_sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
             setsockopt(new_sock, SOL_SOCKET, SO_SNDTIMEO, &snd_timeout, sizeof(snd_timeout));
+            /* Rows are small (~100 B) at ~10 Hz: Nagle + the host's delayed ACK clump them into
+             * ~200 ms bursts, which is most of the visible live-tail lag. Disable coalescing so
+             * each row leaves as soon as the tx task sends it. */
+            setsockopt(new_sock, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(int));
             /* Swap the live fd and bump the generation atomically w.r.t. every send()/teardown
              * (all under s_sock_mutex) so a stalled tx can never write into the new socket. */
             if (xSemaphoreTake(s_sock_mutex, portMAX_DELAY) == pdTRUE)
