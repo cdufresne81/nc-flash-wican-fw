@@ -35,8 +35,7 @@ async function checkFirmwareUpdate() {
             // when it actually looks like a vX.Y[.Z] tag -- dev builds report a bare
             // SHA (e.g. "b79549b-dirty") that must not be mis-parsed as a version.
             const fwRaw = document.getElementById('fw_version')?.textContent?.trim();
-            const currentRaw = (fwRaw && /v?\d+\.\d+/i.test(fwRaw)) ? fwRaw : null;
-            if (!currentRaw) return;
+            if (!fwRaw || !/v?\d+\.\d+/i.test(fwRaw)) return;
 
             // Helpers: extract numeric version and compare a.b.c parts
             const extractVersion = (str) => {
@@ -57,7 +56,7 @@ async function checkFirmwareUpdate() {
                 return 0;
             };
 
-            const currentVersion = extractVersion(currentRaw);
+            const currentVersion = extractVersion(fwRaw);
             if (!currentVersion) return;
 
             const response = await fetch(`https://api.github.com/repos/${FW_UPDATE_REPO}/releases`);
@@ -296,7 +295,7 @@ async function checkFirmwareUpdate() {
         const addBtn = document.getElementById('add_fallback_button');
         if (!addBtn) return;
         const count = document.querySelectorAll('#fallback_rows .fallback-row').length;
-        addBtn.disabled = count >= 5 || document.getElementById('wifi_mode').value === 'SmartConnect';
+        addBtn.disabled = count >= 5;
     }
 
     function addRowAutoTable() {
@@ -394,23 +393,20 @@ const pidEntryStyles = `
     }
 `;
 
-async function runPidTest(kind, entry) {
+async function runPidTest(entry) {
     const resultEl = entry.querySelector('.test-result');
     const buttonEl = entry.querySelector('.test-btn');
     if (!resultEl || !buttonEl) return;
 
-    const payload = { kind };
-
-    if (kind === 'custom') {
-        const init = document.getElementById('initialisation')?.value || '';
-        const pid = entry.querySelector('.pid-input')?.value || '';
-        const pidInit = entry.querySelector('.init-input')?.value || '';
-        const expr = entry.querySelector('.expression-input')?.value || '';
-        if (init.trim()) payload.init = init;
-        payload.pid = pid.trim();
-        if (pidInit.trim()) payload.pid_init = pidInit;
-        payload.expr = expr;
-    }
+    const payload = { kind: 'custom' };
+    const init = document.getElementById('initialisation')?.value || '';
+    const pid = entry.querySelector('.pid-input')?.value || '';
+    const pidInit = entry.querySelector('.init-input')?.value || '';
+    const expr = entry.querySelector('.expression-input')?.value || '';
+    if (init.trim()) payload.init = init;
+    payload.pid = pid.trim();
+    if (pidInit.trim()) payload.pid_init = pidInit;
+    payload.expr = expr;
 
     buttonEl.disabled = true;
     resultEl.style.display = 'inline-flex';
@@ -434,7 +430,7 @@ async function runPidTest(kind, entry) {
             resultEl.classList.add('status-connected');
             resultEl.classList.remove('status-disconnected');
             let unit = (data.unit || '').trim();
-            if (!unit && kind !== 'std') {
+            if (!unit) {
                 unit = (entry.querySelector('.unit-input')?.value || '').trim();
             }
             const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
@@ -620,7 +616,7 @@ deleteBtn.addEventListener('click', () => {
 
 testBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    runPidTest('custom', entry);
+    runPidTest(entry);
 });
 
 const toggleCollapse = (e) => {
@@ -1571,43 +1567,31 @@ function submit_enable() {
 function configureWifiModeSettings(elements, wifiMode) {
     const isAP = wifiMode === "AP";
     const isAPStation = wifiMode === "APStation";
-    const isSmartConnect = wifiMode === "SmartConnect";
-    const isBLEStation = wifiMode === "BLEStation";
     const isStation = wifiMode === "Station";
     const usesAP = isAP || isAPStation;
     const apChValue = document.getElementById("ap_ch_value");
-    
+
     // Set station fields
     elements.ssidValue.disabled = isAP;
     elements.passValue.disabled = isAP;
     elements.staSecurity.disabled = isAP;
     elements.wifiScanButton.disabled = isAP;
 
-    // Set AP fields (Station-only/BLE+Station do not run AP)
+    // Set AP fields (Station-only does not run AP)
     if (apChValue) apChValue.disabled = !usesAP;
     if (elements.apPassValue) elements.apPassValue.disabled = !usesAP;
 
     // Auto-disable AP only applies to AP+Station
     elements.apAutoDisable.disabled = !isAPStation;
-    
-    // Set BLE settings based on mode
+
+    // BLE element state (the BLE section is hidden but still round-trips) + station info note
     if (isAP) {
         elements.bleStatus.disabled = false;
         elements.blePassValue.disabled = false;
         elements.sta_ble_info.style.display = "none";
-    } else if (isBLEStation) {
-        elements.bleStatus.disabled = true;
-        elements.bleStatus.value = "enable";
-        elements.bleStatus.selectedIndex = 0;
-        elements.blePassValue.disabled = false;
-        elements.sta_ble_info.style.display = "block";
     } else if (isStation) {
         elements.sta_ble_info.style.display = "block";
-    }
-    else if (isSmartConnect) {
-        elements.bleStatus.disabled = true;
-        elements.blePassValue.disabled = true;
-    } else {
+    } else {   // APStation
         elements.bleStatus.disabled = true;
         elements.bleStatus.value = "disable";
         elements.bleStatus.selectedIndex = 1;
@@ -1618,9 +1602,8 @@ function configureWifiModeSettings(elements, wifiMode) {
 
 function handleBleStatus(elements) {
     const isBleEnabled = elements.bleStatus.value === "enable";
-    const isBLEStation = elements.wifiMode.value === "BLEStation";
 
-    elements.bleWarningDiv.style.display = (isBleEnabled && !isBLEStation) ? "block" : "none";
+    elements.bleWarningDiv.style.display = isBleEnabled ? "block" : "none";
     // Enable BLE passkey input only when BLE is enabled
     elements.blePassValue.disabled = !isBleEnabled;
     
@@ -1901,14 +1884,9 @@ async function postConfig() {
     obj["sta_ssid"] = document.getElementById("ssid_value").value;
     obj["sta_pass"] = document.getElementById("pass_value").value;
     obj["sta_security"] = document.getElementById("sta_security").value;
-    // SmartConnect UI was removed (the feature is unreachable -- no SmartConnect wifi
-    // mode); re-send its stored home_*/drive_* keys verbatim so they survive a Submit.
-    Object.assign(obj, loadedSmartConnect);
-    // No UI selectors for these (the NC platform is always 500K/normal): re-send the
-    // stored values verbatim so config-file edits survive a Submit. /store_config
-    // rejects the whole POST if either key is missing, so they must always be sent.
-    obj["can_datarate"] = loadedCanDatarate;
-    obj["can_mode"] = loadedCanMode;
+    // Keys with no UI (CAN, IMU, log period, SmartConnect leftovers): re-send the
+    // stored values verbatim so they survive a Submit (see loadedPassthrough).
+    Object.assign(obj, loadedPassthrough);
     obj["port_type"] = document.getElementById("port_type").value;
     obj["port"] = document.getElementById("tcp_port_value").value;
     obj["ap_pass"] = document.getElementById("ap_pass_value").value;
@@ -1945,8 +1923,6 @@ async function postConfig() {
     obj["csv_grid_mode"] = document.getElementById("csv_grid_mode").value;
     obj["csv_grid_hz"] = document.getElementById("csv_grid_hz").value;
     obj["csv_require_engine"] = document.getElementById("csv_require_engine").value;
-    obj["log_period"] = loadedLogPeriod;   // preserve persisted datalog period (no UI element after trim)
-    obj["imu_threshold"] = loadedImuThreshold;   // no UI slider (only SmartConnect consumes the IMU)
     obj["led_blink_ms"] = String(ledBlinkMsFromSlider());
 
     // Collect fallback networks (max 5)
@@ -2336,16 +2312,25 @@ async function uploadCfg() {
     }
 }
 
-var loadedLogPeriod = "10";   // last persisted datalog period; re-sent by postConfig (no UI element after trim)
-// Keys with no UI after the issue #21 streamline: captured on load, re-sent verbatim on
-// save so config-file edits survive a Submit / Store (same pattern as loadedLogPeriod).
-var loadedCanDatarate = "500K";     // config.json, re-sent by postConfig
-var loadedCanMode = "normal";       // config.json, re-sent by postConfig
-var loadedImuThreshold = "8";       // config.json, re-sent by postConfig (IMU only feeds SmartConnect)
-var loadedSmartConnect = {};        // config.json home_*/drive_* keys (SmartConnect UI removed), re-sent by postConfig
-var loadedStdPids = [];             // auto_pid.json, re-sent by storeAutoTableData
-var loadedStandardPids = "disable"; // auto_pid.json, re-sent by storeAutoTableData
-var loadedEcuProtocol = "6";        // auto_pid.json, re-sent by storeAutoTableData
+// Config keys with no UI after the streamline: captured from /load_config in Load(),
+// re-sent verbatim by postConfig() so config-file edits survive a Submit. The four
+// pre-seeded defaults are mandatory keys -- /store_config rejects the whole POST when
+// any of them is missing, so they must always be sent even if /load_config omits them.
+// The home_*/drive_* SmartConnect keys are optional and captured only when present.
+var loadedPassthrough = {
+    can_datarate: "500K",   // NC platform is always 500K
+    can_mode: "normal",
+    imu_threshold: "8",     // IMU only feeds the removed SmartConnect logic
+    log_period: "10",       // datalog period (no UI element after the trim)
+};
+var PASSTHROUGH_KEYS = ["can_datarate", "can_mode", "imu_threshold", "log_period",
+    "home_ssid", "home_password", "home_security", "home_protocol",
+    "drive_ssid", "drive_password", "drive_security", "drive_protocol",
+    "drive_connection_type", "drive_mode_timeout"];
+// Same idea for /store_auto_data (separate endpoint/lifecycle, captured in loadAutoTable):
+var loadedStdPids = [];             // re-sent by storeAutoTableData
+var loadedStandardPids = "disable"; // re-sent by storeAutoTableData
+var loadedEcuProtocol = "6";        // re-sent by storeAutoTableData
 
 async function Load() {
     const xhttp = new XMLHttpRequest();
@@ -2361,12 +2346,9 @@ xhttp.onload = async function() {
             }
         }
 
-        // SmartConnect UI removed (feature unreachable): capture its stored keys for
-        // postConfig's passthrough instead of populating deleted form fields.
-        ["home_ssid", "home_password", "home_security", "home_protocol",
-         "drive_ssid", "drive_password", "drive_security", "drive_protocol",
-         "drive_connection_type", "drive_mode_timeout"].forEach(function(k) {
-            if (obj[k] !== undefined) loadedSmartConnect[k] = obj[k];
+        // Capture every UI-less passthrough key for postConfig (see loadedPassthrough).
+        PASSTHROUGH_KEYS.forEach(function(k) {
+            if (obj[k] !== undefined && obj[k] !== null) loadedPassthrough[k] = obj[k];
         });
 
         
@@ -2397,10 +2379,6 @@ xhttp.onload = async function() {
         document.getElementById("ssid_value").value = obj.sta_ssid;
         document.getElementById("pass_value").value = obj.sta_pass;
         document.getElementById("sta_security").value = obj.sta_security || "wpa3";			
-        // CAN bitrate/mode selectors were removed from the UI (issue #21: the NC is
-        // always 500K/normal). Capture the stored values for postConfig's passthrough.
-        if (obj.can_datarate) loadedCanDatarate = obj.can_datarate;
-        if (obj.can_mode) loadedCanMode = obj.can_mode;
         if(obj.port_type == "tcp") {
             document.getElementById("port_type").selectedIndex = "0";
         } else if(obj.port_type == "udp") {
@@ -2459,9 +2437,6 @@ xhttp.onload = async function() {
         document.getElementById("csv_require_engine").value = (obj.csv_require_engine === "disable") ? "disable" : "enable";
         applyLoggerXor();
 
-        // IMU wake threshold: no UI slider (only SmartConnect consumes the IMU);
-        // capture the stored value for postConfig's passthrough.
-        if (obj.imu_threshold) loadedImuThreshold = obj.imu_threshold;
         {   // LED activity-indicator blink rate: config stores ms, the slider stores an index
             const slider = document.getElementById("led_blink_rate");
             slider.max = LED_BLINK_STEPS.length - 1;   // the table owns the range, not the HTML
@@ -2497,11 +2472,6 @@ xhttp.onload = async function() {
         document.getElementById("batt_alert_url").value = obj.batt_alert_url.slice(7);
         document.getElementById("batt_alert_port").value = obj.batt_alert_port;
         document.getElementById("batt_alert_topic").value = obj.batt_alert_topic;
-        // Preserve the persisted datalog period (no UI element after the trim; feeds
-        // poll_log_init/fast_log_init). Re-sent verbatim by postConfig so Submit never pins it to 10.
-        if (obj.log_period !== undefined && obj.log_period !== null) {
-            loadedLogPeriod = obj.log_period;
-        }
         loadautoPID();
 
         // Load fallback networks if present

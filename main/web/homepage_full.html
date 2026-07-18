@@ -1324,9 +1324,11 @@
                         </tr>
                         <!-- Battery Alert is inoperative in this fork: the firmware pins
                              batt_alert to "disable" in /store_config (config_server.c). Row
-                             hidden; the select stays in the DOM so the batt_* keys keep
-                             round-tripping. A reimplementation (periodic wake -> voltage
-                             check -> alert via nearby network) is tracked on GitHub. -->
+                             hidden; the select AND the full batt_alert_div form below stay
+                             in the DOM deliberately -- the batt_* keys keep round-tripping
+                             through them, and the battery-guard reimplementation (GitHub
+                             issue #24: periodic wake -> voltage check -> alert via nearby
+                             network) can resurrect this form as-is. -->
                         <tr style="display:none">
                             <td>Battery Alert:</td>
                             <td><select id="batt_alert" name="batt_alert" onchange="submit_enable();">
@@ -1659,7 +1661,7 @@
                     <div style="color:#78350f;font-size:13px;line-height:1.4">The current protocol does not poll PIDs, so nothing can be recorded. Restore the Datalogger (poll_log) protocol by downloading the configuration on the System page, setting "protocol" to "poll_log", and uploading it back.</div>
                 </div>
             </div>
-            <div id="automate_custom">
+            <div>
                 <div class="section-title-row">
                     <div class="section-title section-title--no-underline">PIDs</div>
                     <div class="section-title-actions"><button class="primary-button success-button" onclick="addRowAutoTable()">New PID</button></div>
