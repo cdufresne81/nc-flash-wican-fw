@@ -62,6 +62,16 @@ static void wifi_network_set_sta_hostname(wifi_mgr_config_t *wifi_config)
              "wican_%s", device_id);
 }
 
+/* HTTP throughput expectation (bench-measured 2026-07-18, APStation mode, RTT 3-8 ms):
+ * file downloads plateau at ~0.75-0.82 MB/s regardless of source -- flash-embedded
+ * assets and SD card files serve at the same rate, so the ceiling is this network
+ * layer, not storage. Contributors: AP+STA radio time-slicing, the 20 KB TCP send
+ * window (CONFIG_LWIP_TCP_SND_BUF_DEFAULT), and esp_http_server's synchronous
+ * read-then-send chunk loop. That is a normal figure for esp_http_server on this
+ * platform; don't chase it in the SD or handler code.
+ * Power save: manual modes get WIFI_PS_NONE via wifi_mgr (wifi_mgr.h default).
+ * The SmartConnect path below never calls esp_wifi_set_ps(), so it runs on the
+ * IDF station default (WIFI_PS_MIN_MODEM) and will benchmark noticeably slower. */
 void wifi_network_init(char* ap_ssid_uid)
 {
     wifi_mgr_config_t wifi_config;
