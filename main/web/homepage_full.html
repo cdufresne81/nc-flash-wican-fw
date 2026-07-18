@@ -1322,7 +1322,12 @@
                             <td>Wakeup Every:</td>
                             <td class="slider-container"><input oninput="document.getElementById('wakeup_interval_value').textContent = this.value;submit_enable();" id="wakeup_interval" max="240" min="5" name="wakeup_interval" step="1" type="range" value="60"> <span id="wakeup_interval_value">60</span>min</td>
                         </tr>
-                        <tr>
+                        <!-- Battery Alert is inoperative in this fork: the firmware pins
+                             batt_alert to "disable" in /store_config (config_server.c). Row
+                             hidden; the select stays in the DOM so the batt_* keys keep
+                             round-tripping. A reimplementation (periodic wake -> voltage
+                             check -> alert via nearby network) is tracked on GitHub. -->
+                        <tr style="display:none">
                             <td>Battery Alert:</td>
                             <td><select id="batt_alert" name="batt_alert" onchange="submit_enable();">
                                     <option value="disable">Disable</option>
@@ -1405,10 +1410,9 @@
                     <tbody>
                         <tr>
                             <td>Mode:</td>
-                            <td><select onchange="toggleSmartConnectConfig(); toggleApStationWarning(); submit_enable();" id="wifi_mode" name="wifi_mode">
+                            <td><select onchange="toggleApStationWarning(); submit_enable();" id="wifi_mode" name="wifi_mode">
                                     <option value="AP">AP Mode</option>
                                     <option value="APStation">AP+Station</option>
-                                    <option value="BLEStation">BLE+Station</option>
                                     <option value="Station">Station Mode</option>
                                 </select></td>
                         </tr>
@@ -1457,77 +1461,6 @@
                         </tr>
                     </tbody>
                 </table>
-                <div id="smartconnect_config" style="display:none">
-                    <div class="divider"></div>
-                    <div class="section-title">SmartConnect Configuration</div>
-                    <div class="divider"></div>
-                    <div style="color:#2563eb;border-bottom:2px solid #93c5fd;align-items:center;gap:8px;padding-bottom:.25rem;font-size:1.25rem;display:flex" class="section-title"><span data-lucide="home" style="width:20px;height:20px"></span> Home Mode</div>
-                    <table class="form-table">
-                        <tbody>
-                            <tr>
-                                <td>Home SSID:</td>
-                                <td><input id="home_ssid" name="home_ssid" oninput="submit_enable();" value="MeatPi"></td>
-                            </tr>
-                            <tr>
-                                <td>Home Password:</td>
-                                <td><input id="home_password" name="home_password" oninput="submit_enable();" value="TomatoSauce"></td>
-                            </tr>
-                            <tr>
-                                <td>Home Security:</td>
-                                <td><select id="home_security" name="home_security" onchange="submit_enable();">
-                                        <option value="wpa3">WPA3</option>
-                                        <option value="wpa2">WPA2</option>
-                                    </select></td>
-                            </tr>
-                            <tr>
-                                <td>Home Protocol:</td>
-                                <td><select id="home_protocol" name="home_protocol" onchange="submit_enable();">
-                                        <option value="elm327">OBD App (elm327)</option>
-                                        <option value="auto_pid">Legacy AutoPID (auto_pid)</option>
-                                    </select></td>
-                            </tr>
-                        </tbody>
-                    </table>
-                    <div class="divider"></div>
-                    <div style="color:#059669;border-bottom:2px solid #6ee7b7;align-items:center;gap:8px;padding-bottom:.25rem;font-size:1.25rem;display:flex" class="section-title"><span data-lucide="car" style="width:20px;height:20px"></span> Drive Mode</div>
-                    <table class="form-table">
-                        <tbody>
-                            <tr>
-                                <td>Drive Connection Type:</td>
-                                <td><select onchange="toggleDriveConfig(); submit_enable();" id="drive_connection_type" name="drive_connection_type">
-                                        <option value="wifi">WiFi</option>
-                                        <option value="ble">BLE</option>
-                                    </select></td>
-                            </tr>
-                            <tr id="drive_wifi_config">
-                                <td>Drive SSID:</td>
-                                <td><input id="drive_ssid" name="drive_ssid" oninput="submit_enable();" value="MeatPi"></td>
-                            </tr>
-                            <tr id="drive_wifi_password">
-                                <td>Drive Password:</td>
-                                <td><input id="drive_password" name="drive_password" oninput="submit_enable();" value="TomatoSauce"></td>
-                            </tr>
-                            <tr id="drive_wifi_security">
-                                <td>Drive Security:</td>
-                                <td><select id="drive_security" name="drive_security" onchange="submit_enable();">
-                                        <option value="wpa3">WPA3</option>
-                                        <option value="wpa2">WPA2</option>
-                                    </select></td>
-                            </tr>
-                            <tr>
-                                <td>Drive Protocol:</td>
-                                <td><select id="drive_protocol" name="drive_protocol" onchange="submit_enable();">
-                                        <option value="elm327">OBD App (elm327)</option>
-                                        <option value="auto_pid">Legacy AutoPID (auto_pid)</option>
-                                    </select></td>
-                            </tr>
-                            <tr>
-                                <td>Drive Mode Timeout:</td>
-                                <td class="slider-container"><input oninput="document.getElementById('drive_mode_timeout_value').textContent = this.value;submit_enable();" id="drive_mode_timeout" max="600" min="10" name="drive_mode_timeout" step="1" type="range" value="60"> <span id="drive_mode_timeout_value">60</span>sec</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
                 <div class="divider"></div>
                 <div id="station_config_section">
                     <div class="section-title">Network Configuration</div>
@@ -1566,6 +1499,12 @@
                         <div style="color:#6b7280;margin-top:6px;font-size:12px">These SSIDs are used as backup networks if the primary station fails.</div>
                     </div>
                 </div>
+                <!-- BLE settings hidden, not removed: the streamlined UI is Wi-Fi-only for now.
+                     BLE stays in the firmware and may return if users need it (e.g. a phone whose
+                     Wi-Fi is captive to CarPlay/Android Auto). The elements must stay in the DOM:
+                     Load()/postConfig() round-trip ble_pass/ble_status/ble_power through them.
+                     See the BLE note in README.md. -->
+                <div id="ble_section" style="display:none">
                 <div class="divider"></div>
                 <div class="section-title">BLE</div>
                 <table class="form-table">
@@ -1587,6 +1526,7 @@
                         </tr>
                     </tbody>
                 </table>
+                </div>
                 <div style="margin:8px 0;display:none" id="ble_warning_div">
                     <div style="background:linear-gradient(135deg,#fef3c7 0%,#fde68a 100%);border:1px solid #f59e0b;border-radius:8px;padding:12px;box-shadow:0 2px 4px #0000001a">
                         <div style="align-items:center;margin-bottom:6px;display:flex"><span data-lucide="alert-triangle" style="margin-right:8px;font-size:16px"></span><strong style="color:#92400e;font-size:14px">BLE Connection Warning</strong></div>
@@ -1608,7 +1548,12 @@
                             <td>TCP/UDP Port:</td>
                             <td><input id="tcp_port_value" max="65535" min="1" name="tcp_port_value" type="number" value="3333"></td>
                         </tr>
-                        <tr>
+                        <!-- Protocol selector hidden: this product always runs the Datalogger
+                             (poll_log) protocol, and NC Flash talks to the always-on port 35001
+                             regardless. The select stays in the DOM: checkStatus() mirrors the
+                             device's live protocol into it and postConfig() re-sends that value,
+                             so config-file edits round-trip. -->
+                        <tr style="display:none">
                             <td>Protocol:</td>
                             <td><select id="protocol" name="protocol">
                                     <option value="poll_log">Datalogger (poll_log)</option>
@@ -1711,7 +1656,7 @@
             <div style="margin:8px 0;display:none" id="autopid_warning_div">
                 <div style="background:linear-gradient(135deg,#fef3c7 0%,#fde68a 100%);border:1px solid #f59e0b;border-radius:8px;padding:12px;box-shadow:0 2px 4px #0000001a">
                     <div style="align-items:center;margin-bottom:6px;display:flex"><span data-lucide="alert-triangle" style="margin-right:8px;font-size:16px"></span><strong style="color:#92400e;font-size:14px">PID Polling Inactive</strong></div>
-                    <div style="color:#78350f;font-size:13px;line-height:1.4">The current protocol does not poll PIDs. Go to Settings → CAN → Protocol, select Datalogger (poll_log) and press Submit Changes to record PIDs.</div>
+                    <div style="color:#78350f;font-size:13px;line-height:1.4">The current protocol does not poll PIDs, so nothing can be recorded. Restore the Datalogger (poll_log) protocol by downloading the configuration on the System page, setting "protocol" to "poll_log", and uploading it back.</div>
                 </div>
             </div>
             <div id="automate_custom">

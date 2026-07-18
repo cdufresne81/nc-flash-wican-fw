@@ -238,41 +238,6 @@ async function checkFirmwareUpdate() {
         return date.toLocaleString();
     }
 
-    function toggleSmartConnectConfig() {
-        const wifiMode = document.getElementById("wifi_mode").value;
-        const smartConnectConfig = document.getElementById("smartconnect_config");
-        const stationConfigSection = document.getElementById("station_config_section");
-        const protocolSelect = document.getElementById("protocol");
-        const addFbBtn = document.getElementById("add_fallback_button");
-        const fbRows = document.querySelectorAll('#fallback_rows input, #fallback_rows select, #fallback_rows button');
-        
-        if (wifiMode === "SmartConnect") {
-            smartConnectConfig.style.display = "block";
-            stationConfigSection.style.display = "none";
-            protocolSelect.disabled = true; 
-            
-            toggleDriveConfig(); 
-            
-            if (addFbBtn) addFbBtn.disabled = true;
-            fbRows.forEach(el => el.disabled = true);
-        } else {
-            smartConnectConfig.style.display = "none";
-            stationConfigSection.style.display = "block";
-            protocolSelect.disabled = false;
-
-            const bleStatus = document.getElementById("ble_status");
-            const blePasskey = document.getElementById("ble_pass_value");
-            bleStatus.disabled = false;
-            blePasskey.disabled = false;
-            if (addFbBtn) addFbBtn.disabled = false;
-            fbRows.forEach(el => el.disabled = false);
-        }
-        try { toggleApStationWarning(); } catch(_) {}
-
-        // Trigger validation when switching modes
-        submit_enable();
-    }
-
     function toggleApStationWarning() {
         const wifiModeEl = document.getElementById("wifi_mode");
         const apAutoDisableEl = document.getElementById("ap_auto_disable");
@@ -283,40 +248,6 @@ async function checkFirmwareUpdate() {
         div.style.display = shouldShow ? "block" : "none";
     }
 
-    function toggleDriveConfig() {
-        const wifiMode = document.getElementById("wifi_mode").value;
-        const driveConnectionType = document.getElementById("drive_connection_type").value;
-        const driveWifiConfig = document.getElementById("drive_wifi_config");
-        const driveWifiPassword = document.getElementById("drive_wifi_password");
-        const driveWifiSecurity = document.getElementById("drive_wifi_security");
-        const bleStatus = document.getElementById("ble_status");
-        const blePasskey = document.getElementById("ble_pass_value");
-        
-        // Only apply SmartConnect logic when in SmartConnect mode
-        if (wifiMode === "SmartConnect") {
-            if (driveConnectionType === "wifi") {
-                // Show WiFi config, force disable BLE
-                driveWifiConfig.style.display = "table-row";
-                driveWifiPassword.style.display = "table-row";
-                driveWifiSecurity.style.display = "table-row";
-                bleStatus.value = "disable";
-                bleStatus.selectedIndex = 1; // Select "Disable" option
-                bleStatus.disabled = true;
-                blePasskey.disabled = true;
-            } else if (driveConnectionType === "ble") {
-                // Hide WiFi config, force enable BLE
-                driveWifiConfig.style.display = "none";
-                driveWifiPassword.style.display = "none";
-                driveWifiSecurity.style.display = "none";
-                bleStatus.value = "enable";
-                bleStatus.selectedIndex = 0; // Select "Enable" option
-                bleStatus.disabled = true;
-                blePasskey.disabled = false;
-            }
-        }
-        // Trigger validation when changing drive connection type
-        submit_enable();
-    }
 
     function renderFallbackNetworks(list) {
         const container = document.getElementById('fallback_rows');
@@ -1763,29 +1694,6 @@ function validateForm(elements, wifiMode) {
         return disableSubmitWithError("You must agree to disable sleep mode", 5000);
     }
     
-    // SmartConnect validation
-    if (wifiMode === "SmartConnect") {
-        return validateSmartConnect();
-    }
-    
-    return true;
-}
-
-function validateSmartConnect() {
-    const homeSSID = document.getElementById("home_ssid").value.trim();
-    const homePassword = document.getElementById("home_password").value.trim();
-    const driveConnectionType = document.getElementById("drive_connection_type").value;
-    const driveSSID = document.getElementById("drive_ssid").value.trim();
-    const drivePassword = document.getElementById("drive_password").value.trim();
-    
-    if (!homeSSID || !homePassword) {
-        return disableSubmitWithError("SmartConnect: Home SSID and Password are required", 5000);
-    }
-    
-    if (driveConnectionType === "wifi" && (!driveSSID || !drivePassword)) {
-        return disableSubmitWithError("SmartConnect: Drive SSID and Password are required when WiFi is selected", 5000);
-    }
-    
     return true;
 }
 
@@ -1993,16 +1901,9 @@ async function postConfig() {
     obj["sta_ssid"] = document.getElementById("ssid_value").value;
     obj["sta_pass"] = document.getElementById("pass_value").value;
     obj["sta_security"] = document.getElementById("sta_security").value;
-    obj["home_ssid"] = document.getElementById("home_ssid").value;
-    obj["home_password"] = document.getElementById("home_password").value;
-    obj["home_security"] = document.getElementById("home_security").value;
-    obj["drive_ssid"] = document.getElementById("drive_ssid").value;
-    obj["drive_password"] = document.getElementById("drive_password").value;
-    obj["drive_security"] = document.getElementById("drive_security").value;
-    obj["home_protocol"] = document.getElementById("home_protocol").value;
-    obj["drive_protocol"] = document.getElementById("drive_protocol").value;
-    obj["drive_connection_type"] = document.getElementById("drive_connection_type").value;
-    obj["drive_mode_timeout"] = document.getElementById("drive_mode_timeout").value;
+    // SmartConnect UI was removed (the feature is unreachable -- no SmartConnect wifi
+    // mode); re-send its stored home_*/drive_* keys verbatim so they survive a Submit.
+    Object.assign(obj, loadedSmartConnect);
     // No UI selectors for these (the NC platform is always 500K/normal): re-send the
     // stored values verbatim so config-file edits survive a Submit. /store_config
     // rejects the whole POST if either key is missing, so they must always be sent.
@@ -2441,6 +2342,7 @@ var loadedLogPeriod = "10";   // last persisted datalog period; re-sent by postC
 var loadedCanDatarate = "500K";     // config.json, re-sent by postConfig
 var loadedCanMode = "normal";       // config.json, re-sent by postConfig
 var loadedImuThreshold = "8";       // config.json, re-sent by postConfig (IMU only feeds SmartConnect)
+var loadedSmartConnect = {};        // config.json home_*/drive_* keys (SmartConnect UI removed), re-sent by postConfig
 var loadedStdPids = [];             // auto_pid.json, re-sent by storeAutoTableData
 var loadedStandardPids = "disable"; // auto_pid.json, re-sent by storeAutoTableData
 var loadedEcuProtocol = "6";        // auto_pid.json, re-sent by storeAutoTableData
@@ -2459,19 +2361,13 @@ xhttp.onload = async function() {
             }
         }
 
-        // Load SmartConnect configuration
-        document.getElementById("home_ssid").value = obj.home_ssid || "";
-        document.getElementById("home_password").value = obj.home_password || "";
-        document.getElementById("home_security").value = obj.home_security || "wpa3";
-        document.getElementById("home_protocol").value = obj.home_protocol || "elm327";
-        document.getElementById("drive_ssid").value = obj.drive_ssid || "";
-        document.getElementById("drive_password").value = obj.drive_password || "";
-        document.getElementById("drive_security").value = obj.drive_security || "wpa3";
-        document.getElementById("drive_protocol").value = obj.drive_protocol || "elm327";
-        document.getElementById("drive_connection_type").value = obj.drive_connection_type || "wifi";
-        // Load drive mode timeout value and update display
-        document.getElementById("drive_mode_timeout").value = obj.drive_mode_timeout || "60";
-        document.getElementById("drive_mode_timeout_value").textContent = obj.drive_mode_timeout || "60";
+        // SmartConnect UI removed (feature unreachable): capture its stored keys for
+        // postConfig's passthrough instead of populating deleted form fields.
+        ["home_ssid", "home_password", "home_security", "home_protocol",
+         "drive_ssid", "drive_password", "drive_security", "drive_protocol",
+         "drive_connection_type", "drive_mode_timeout"].forEach(function(k) {
+            if (obj[k] !== undefined) loadedSmartConnect[k] = obj[k];
+        });
 
         
         if(obj.ap_auto_disable == "enable") {
@@ -2617,7 +2513,6 @@ xhttp.onload = async function() {
         }
 
         // Apply mode-dependent enable/disable rules after values are loaded
-        try { toggleSmartConnectConfig(); } catch(_) {}
         try { toggleApStationWarning(); } catch(_) {}
         try { submit_enable(); } catch(_) {}
 
@@ -2628,9 +2523,6 @@ xhttp.onload = async function() {
     xhttp.open("GET", "/load_config");
     xhttp.send();
 
-    
-    // Initialize SmartConnect configuration visibility
-    toggleSmartConnectConfig();
 
     // Initialize AP+Station warning visibility
     try { toggleApStationWarning(); } catch(_) {}
