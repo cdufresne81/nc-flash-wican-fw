@@ -1629,6 +1629,13 @@
                 </tbody>
             </table>
             <div id="automate">
+            <!-- Low-Voltage Behavior hidden: disable_on_sleep_voltage /
+                 pid_polling_min_voltage are honored only by the Legacy AutoPID ELM task
+                 (autopid_task / autopid_should_pause_pid_polling in autopid.c) -- the
+                 Datalogger (poll_log) protocol this product always runs never reads
+                 them. Elements stay in the DOM so storeAutoTableData() keeps
+                 round-tripping the auto_pid.json keys. -->
+            <div style="display:none">
             <table class="form-table">
                 <tbody>
                     <tr>
@@ -1654,6 +1661,7 @@
                     <div style="align-items:center;margin-bottom:6px;display:flex"><span data-lucide="alert-triangle" style="margin-right:8px;font-size:16px"></span><strong style="color:#92400e;font-size:14px">Low-Voltage Protection Warning</strong></div>
                     <div style="color:#78350f;font-size:13px;line-height:1.4">It is recommended to keep this enabled. Polling the ECU when the battery voltage is low can increase battery drain while the vehicle is parked.</div>
                 </div>
+            </div>
             </div>
             <div style="margin:8px 0;display:none" id="autopid_warning_div">
                 <div style="background:linear-gradient(135deg,#fef3c7 0%,#fde68a 100%);border:1px solid #f59e0b;border-radius:8px;padding:12px;box-shadow:0 2px 4px #0000001a">
