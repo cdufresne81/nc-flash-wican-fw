@@ -34,7 +34,8 @@ NC Flash (desktop app)  ⇄  Wi-Fi  ⇄  WiCAN PRO (this firmware)  ⇄  OBD-II 
   a dedicated **SLCAN** port lets NC Flash run UDS while the datalogger is active,
   without a protocol-switch reboot.
 - **CSV datalogger + Field Console.** One-tap trip logging from a mobile-friendly web
-  console; logs are written to microSD and downloadable from the Files tab.
+  console; logs are written to microSD and downloadable right from the console's trip
+  list (or the Files tab), also scriptable via `/csv_list` + `/download_csv`.
 - **Five selectable CAN modes:** Datalogger (`poll_log`), Passive Logger (`fast_log`),
   OBD App (`elm327`), `auto_pid`, and Bench SLCAN (`slcan`).
 - **Built-in web UI** — status, settings, automation, power saving, logger, file
@@ -71,6 +72,9 @@ NC Flash (desktop app)  ⇄  Wi-Fi  ⇄  WiCAN PRO (this firmware)  ⇄  OBD-II 
   other device).
 - In **AP+Station** mode, use the **station IP** to communicate with the device; the
   **access point is for configuration only**.
+- **Expect ~0.7–0.8 MB/s on file downloads** (a 27 MB day-log ≈ 35 s). That's the
+  device's Wi-Fi/HTTP serving ceiling — not the SD card — and it holds even while a
+  trip is recording. See the note above `wifi_network_init()` in `main/wifi_network.c`.
 
 ## Build
 
