@@ -1944,8 +1944,8 @@ function applyLoggerXor() {
     if (!masterEl || !cs) { return; }
     var csvShow = (masterEl.value === "enable");
     cs.value = csvShow ? "enable" : "disable";
-    // Wide CSV (Task #11) controls, progressive: Grid Mode shown when CSV is active; Grid Rate
-    // only when Fixed-rate. (Format toggle removed in Task #16 -- output is always Wide.)
+    // Wide CSV (Task #11) controls, progressive: Polling Mode shown when CSV is active; Polling
+    // Rate only when Fixed-rate. (Format toggle removed in Task #16 -- output is always Wide.)
     var gmEl = document.getElementById("csv_grid_mode");
     var gmRow = document.getElementById("csv_grid_mode_row");
     var hzRow = document.getElementById("csv_grid_hz_row");
@@ -2037,13 +2037,15 @@ async function postConfig() {
     obj["batt_mqtt_pass"] = document.getElementById("batt_mqtt_pass").value;
     applyLoggerXor();   // compose the real csv_log key from the master widget
     obj["csv_log"] = document.getElementById("csv_log").value;
-    obj["log_filesystem"] = document.getElementById("log_filesystem").value;
-    obj["log_storage"] = document.getElementById("log_storage").value;
+    // Single-option selects removed from the UI (SD card / FATFS are the only
+    // supported values) -- send the constants the firmware expects.
+    obj["log_filesystem"] = "fatfs";
+    obj["log_storage"] = "sdcard";
     obj["csv_grid_mode"] = document.getElementById("csv_grid_mode").value;
     obj["csv_grid_hz"] = document.getElementById("csv_grid_hz").value;
     obj["csv_require_engine"] = document.getElementById("csv_require_engine").value;
     obj["log_period"] = loadedLogPeriod;   // preserve persisted datalog period (no UI element after trim)
-    obj["imu_threshold"] = document.getElementById("imu_threshold").value;
+    obj["imu_threshold"] = loadedImuThreshold;   // no UI slider (only SmartConnect consumes the IMU)
     obj["led_blink_ms"] = String(ledBlinkMsFromSlider());
 
     // Collect fallback networks (max 5)
@@ -2438,6 +2440,7 @@ var loadedLogPeriod = "10";   // last persisted datalog period; re-sent by postC
 // save so config-file edits survive a Submit / Store (same pattern as loadedLogPeriod).
 var loadedCanDatarate = "500K";     // config.json, re-sent by postConfig
 var loadedCanMode = "normal";       // config.json, re-sent by postConfig
+var loadedImuThreshold = "8";       // config.json, re-sent by postConfig (IMU only feeds SmartConnect)
 var loadedStdPids = [];             // auto_pid.json, re-sent by storeAutoTableData
 var loadedStandardPids = "disable"; // auto_pid.json, re-sent by storeAutoTableData
 var loadedEcuProtocol = "6";        // auto_pid.json, re-sent by storeAutoTableData
@@ -2560,13 +2563,9 @@ xhttp.onload = async function() {
         document.getElementById("csv_require_engine").value = (obj.csv_require_engine === "disable") ? "disable" : "enable";
         applyLoggerXor();
 
-        // SD card is the only storage option after the trim ("internal" was removed);
-        // the select has a single option, so pin it to index 0.
-        document.getElementById("log_storage").selectedIndex = 0;
-
-        // IMU wake threshold (raw LSB; displayed in mg at 3.9 mg/LSB).
-        document.getElementById("imu_threshold").value = obj.imu_threshold || "8";
-        document.getElementById("imu_threshold_value").textContent = ((obj.imu_threshold || 8) * 3.9).toFixed(1) + ' mg';
+        // IMU wake threshold: no UI slider (only SmartConnect consumes the IMU);
+        // capture the stored value for postConfig's passthrough.
+        if (obj.imu_threshold) loadedImuThreshold = obj.imu_threshold;
         {   // LED activity-indicator blink rate: config stores ms, the slider stores an index
             const slider = document.getElementById("led_blink_rate");
             slider.max = LED_BLINK_STEPS.length - 1;   // the table owns the range, not the HTML
