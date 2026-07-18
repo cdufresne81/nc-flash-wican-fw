@@ -30,15 +30,12 @@ async function checkFirmwareUpdate() {
         if (fwUpdateChecked) return;
         fwUpdateChecked = true;
         try {
-            // Prefer the git-describe tag (git_version, e.g. "v1.2.3"): it carries the
-            // full semver including patch and matches our release tag format exactly.
-            // Only trust it when it actually looks like a vX.Y[.Z] tag -- dev builds
-            // report a bare SHA (e.g. "b79549b-dirty") that must not be mis-parsed as a
-            // version. Otherwise fall back to the major.minor fw_version display.
-            const gitRaw = document.getElementById('git_version')?.textContent?.trim();
+            // The About page's fw_version element shows the git-describe tag (e.g.
+            // "v1.2.3"), which matches our release tag format exactly. Only trust it
+            // when it actually looks like a vX.Y[.Z] tag -- dev builds report a bare
+            // SHA (e.g. "b79549b-dirty") that must not be mis-parsed as a version.
             const fwRaw = document.getElementById('fw_version')?.textContent?.trim();
-            const currentRaw = (gitRaw && /v?\d+\.\d+/i.test(gitRaw)) ? gitRaw : fwRaw;
-            if (!currentRaw) return;
+            if (!fwRaw || !/v?\d+\.\d+/i.test(fwRaw)) return;
 
             // Helpers: extract numeric version and compare a.b.c parts
             const extractVersion = (str) => {
@@ -59,7 +56,7 @@ async function checkFirmwareUpdate() {
                 return 0;
             };
 
-            const currentVersion = extractVersion(currentRaw);
+            const currentVersion = extractVersion(fwRaw);
             if (!currentVersion) return;
 
             const response = await fetch(`https://api.github.com/repos/${FW_UPDATE_REPO}/releases`);
@@ -240,53 +237,6 @@ async function checkFirmwareUpdate() {
         return date.toLocaleString();
     }
 
-    function toggleStandardPIDOptions() {
-        const standardPidsSelect = document.getElementById("standard_pids");
-        const ecuProtocolSelect = document.getElementById("ecu_protocol");
-        const availablePidsSelect = document.getElementById("available_pids");
-        const scanPidButton = document.getElementById("scan_pids_button");
-        
-        const isEnabled = standardPidsSelect.value === "enable";
-        ecuProtocolSelect.disabled = !isEnabled;
-        availablePidsSelect.disabled = !isEnabled;
-        scanPidButton.disabled = !isEnabled;
-    }
-
-    function toggleSmartConnectConfig() {
-        const wifiMode = document.getElementById("wifi_mode").value;
-        const smartConnectConfig = document.getElementById("smartconnect_config");
-        const stationConfigSection = document.getElementById("station_config_section");
-        const protocolSelect = document.getElementById("protocol");
-        const addFbBtn = document.getElementById("add_fallback_button");
-        const fbRows = document.querySelectorAll('#fallback_rows input, #fallback_rows select, #fallback_rows button');
-        
-        if (wifiMode === "SmartConnect") {
-            smartConnectConfig.style.display = "block";
-            stationConfigSection.style.display = "none";
-            protocolSelect.disabled = true; 
-            
-            toggleDriveConfig(); 
-            
-            if (addFbBtn) addFbBtn.disabled = true;
-            fbRows.forEach(el => el.disabled = true);
-        } else {
-            smartConnectConfig.style.display = "none";
-            stationConfigSection.style.display = "block";
-            protocolSelect.disabled = false;
-
-            const bleStatus = document.getElementById("ble_status");
-            const blePasskey = document.getElementById("ble_pass_value");
-            bleStatus.disabled = false;
-            blePasskey.disabled = false;
-            if (addFbBtn) addFbBtn.disabled = false;
-            fbRows.forEach(el => el.disabled = false);
-        }
-        try { toggleApStationWarning(); } catch(_) {}
-
-        // Trigger validation when switching modes
-        submit_enable();
-    }
-
     function toggleApStationWarning() {
         const wifiModeEl = document.getElementById("wifi_mode");
         const apAutoDisableEl = document.getElementById("ap_auto_disable");
@@ -297,40 +247,6 @@ async function checkFirmwareUpdate() {
         div.style.display = shouldShow ? "block" : "none";
     }
 
-    function toggleDriveConfig() {
-        const wifiMode = document.getElementById("wifi_mode").value;
-        const driveConnectionType = document.getElementById("drive_connection_type").value;
-        const driveWifiConfig = document.getElementById("drive_wifi_config");
-        const driveWifiPassword = document.getElementById("drive_wifi_password");
-        const driveWifiSecurity = document.getElementById("drive_wifi_security");
-        const bleStatus = document.getElementById("ble_status");
-        const blePasskey = document.getElementById("ble_pass_value");
-        
-        // Only apply SmartConnect logic when in SmartConnect mode
-        if (wifiMode === "SmartConnect") {
-            if (driveConnectionType === "wifi") {
-                // Show WiFi config, force disable BLE
-                driveWifiConfig.style.display = "table-row";
-                driveWifiPassword.style.display = "table-row";
-                driveWifiSecurity.style.display = "table-row";
-                bleStatus.value = "disable";
-                bleStatus.selectedIndex = 1; // Select "Disable" option
-                bleStatus.disabled = true;
-                blePasskey.disabled = true;
-            } else if (driveConnectionType === "ble") {
-                // Hide WiFi config, force enable BLE
-                driveWifiConfig.style.display = "none";
-                driveWifiPassword.style.display = "none";
-                driveWifiSecurity.style.display = "none";
-                bleStatus.value = "enable";
-                bleStatus.selectedIndex = 0; // Select "Enable" option
-                bleStatus.disabled = true;
-                blePasskey.disabled = false;
-            }
-        }
-        // Trigger validation when changing drive connection type
-        submit_enable();
-    }
 
     function renderFallbackNetworks(list) {
         const container = document.getElementById('fallback_rows');
@@ -379,7 +295,7 @@ async function checkFirmwareUpdate() {
         const addBtn = document.getElementById('add_fallback_button');
         if (!addBtn) return;
         const count = document.querySelectorAll('#fallback_rows .fallback-row').length;
-        addBtn.disabled = count >= 5 || document.getElementById('wifi_mode').value === 'SmartConnect';
+        addBtn.disabled = count >= 5;
     }
 
     function addRowAutoTable() {
@@ -387,51 +303,8 @@ async function checkFirmwareUpdate() {
         enableAutoStoreButton();
     }
 
-async function scanAvailablePIDs() {
-    const scanButton = document.querySelector('#scan_pids_button');
-    const addButton = document.querySelector('#add_pid_button');
-    
-    try {
-        scanButton.disabled = true;
-        scanButton.textContent = "Scanning...";
-        addButton.disabled = true;
-
-        const ecuProtocol = document.getElementById('ecu_protocol').value;
-        const response = await fetch(`/scan_available_pids?protocol=${ecuProtocol}`);
-        
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        
-        const data = await response.json();
-        const pidSelect = document.getElementById('available_pids');
-        pidSelect.innerHTML = '';
-        if (data.text) {
-            showNotification(data.text, "red");
-        } else if (data.std_pids && Array.isArray(data.std_pids) && data.std_pids.length > 0) {
-            data.std_pids.forEach(pid => {
-                const option = document.createElement('option');
-                option.value = pid;
-                option.textContent = pid;
-                pidSelect.appendChild(option);
-            });
-            addButton.disabled = false;
-            showNotification("PID scan complete", "green");
-        } else {
-            showNotification("No PIDs found. Try a different protocol or check if ignition is ON", "orange");
-        }
-    } catch (error) {
-        console.error('Error:', error);
-        showNotification("PID scan failed: " + error.message, "red");
-    } finally {
-        scanButton.disabled = false;
-        scanButton.textContent = "Scan PIDs";
-    }
-}
-
 const pidEntryStyles = `
     .pid-entry,
-    .std-pid-entry,
     .custom-canfilter-entry {
         border: 1px solid #e2e8f0;
         background: #fff;
@@ -520,30 +393,20 @@ const pidEntryStyles = `
     }
 `;
 
-async function runPidTest(kind, entry) {
+async function runPidTest(entry) {
     const resultEl = entry.querySelector('.test-result');
     const buttonEl = entry.querySelector('.test-btn');
     if (!resultEl || !buttonEl) return;
 
-    const payload = { kind };
-
-    if (kind === 'std') {
-        const name = entry.querySelector('.name-input')?.value || entry.querySelector('.pid-title')?.textContent || '';
-        const protocol = document.getElementById('ecu_protocol')?.value || '';
-        const rxheader = entry.querySelector('.receive-header-input')?.value || '';
-        payload.name = name.trim();
-        payload.protocol = protocol;
-        if (rxheader.trim()) payload.rxheader = rxheader.trim();
-    } else if (kind === 'custom') {
-        const init = document.getElementById('initialisation')?.value || '';
-        const pid = entry.querySelector('.pid-input')?.value || '';
-        const pidInit = entry.querySelector('.init-input')?.value || '';
-        const expr = entry.querySelector('.expression-input')?.value || '';
-        if (init.trim()) payload.init = init;
-        payload.pid = pid.trim();
-        if (pidInit.trim()) payload.pid_init = pidInit;
-        payload.expr = expr;
-    }
+    const payload = { kind: 'custom' };
+    const init = document.getElementById('initialisation')?.value || '';
+    const pid = entry.querySelector('.pid-input')?.value || '';
+    const pidInit = entry.querySelector('.init-input')?.value || '';
+    const expr = entry.querySelector('.expression-input')?.value || '';
+    if (init.trim()) payload.init = init;
+    payload.pid = pid.trim();
+    if (pidInit.trim()) payload.pid_init = pidInit;
+    payload.expr = expr;
 
     buttonEl.disabled = true;
     resultEl.style.display = 'inline-flex';
@@ -567,7 +430,7 @@ async function runPidTest(kind, entry) {
             resultEl.classList.add('status-connected');
             resultEl.classList.remove('status-disconnected');
             let unit = (data.unit || '').trim();
-            if (!unit && kind !== 'std') {
+            if (!unit) {
                 unit = (entry.querySelector('.unit-input')?.value || '').trim();
             }
             const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
@@ -753,7 +616,7 @@ deleteBtn.addEventListener('click', () => {
 
 testBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    runPidTest('custom', entry);
+    runPidTest(entry);
 });
 
 const toggleCollapse = (e) => {
@@ -779,96 +642,6 @@ entry.querySelectorAll('input, select').forEach(input => {
 });
 
 container.appendChild(entry);
-}
-
-function addSelectedPID(rowData = {}) {
-const pidSelect = document.getElementById('available_pids');
-const selectedPID = rowData.Name || pidSelect.value;
-
-if (selectedPID) {
-    const container = document.querySelector('.std-pid-entries');
-    const entry = document.createElement('div');
-    entry.className = 'std-pid-entry';
-
-    entry.innerHTML = `
-        <div class="pid-header">
-            <div class="header-left">
-                <button type="button" class="collapse-btn">▼</button>
-                <span class="pid-title">${selectedPID}</span>
-            </div>
-            <div class="header-right">
-                <span class="test-result status-indicator" style="display:none"></span>
-                <button type="button" class="test-btn">Test</button>
-                <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
-                    <input type="checkbox" class="enabled-chk" ${(rowData.enabled === false || rowData.Enabled === false) ? '' : 'checked'}>
-                    Enabled
-                </label>
-                <button type="button" class="delete-btn">Delete</button>
-            </div>
-        </div>
-        <div class="pid-content" style="display: none;">
-            <table class="compact-form-table">
-                <tr>
-                    <td>Name:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td>
-                    <td><input type="text" class="name-input" value="${selectedPID}" readonly></td>
-                </tr>
-                <tr>
-                    <td>Receive Header:</td>
-                    <td><input type="text" class="receive-header-input" value="${rowData.ReceiveHeader || ''}" 
-                        placeholder="Optional Receive Header" maxlength="8"></td>
-                </tr>
-                <tr>
-                    <td>Period(ms):</td>
-                    <td><input type="number" class="period-input" value="${rowData.Period || '1000'}" 
-                        min="100" max="120000"></td>
-                </tr>
-            </table>
-        </div>
-    `;
-
-
-    const style = document.createElement('style');
-    style.textContent = pidEntryStyles;
-    document.head.appendChild(style);
-    const header = entry.querySelector('.pid-header');
-    const deleteBtn = entry.querySelector('.delete-btn');
-    const testBtn = entry.querySelector('.test-btn');
-    const collapseBtn = entry.querySelector('.collapse-btn');
-    const content = entry.querySelector('.pid-content');
-    const enabledChk = entry.querySelector('.enabled-chk');
-
-    if (enabledChk) {
-        enabledChk.addEventListener('click', (e) => e.stopPropagation());
-        enabledChk.addEventListener('change', enableAutoStoreButton);
-    }
-
-    deleteBtn.addEventListener('click', () => {
-        entry.remove();
-        enableAutoStoreButton();
-    });
-
-    testBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        runPidTest('std', entry);
-    });
-
-    const toggleCollapse = (e) => {
-        e.stopPropagation();
-        const isHidden = content.style.display === 'none';
-        content.style.display = isHidden ? 'block' : 'none';
-        collapseBtn.textContent = isHidden ? '▲' : '▼';
-    };
-
-    header.addEventListener('click', toggleCollapse);
-    collapseBtn.addEventListener('click', toggleCollapse);
-
-    entry.querySelectorAll('input, select').forEach(input => {
-        input.addEventListener('input', enableAutoStoreButton);
-    });
-
-    container.appendChild(entry);
-    enableAutoStoreButton();
-}
 }
 
 function normalizeFrameIdInputToNumber(v) {
@@ -1140,7 +913,7 @@ function loadAutoTable(jsonData) {
 
         const automateTable = document.getElementById("automate_table");
         if (!automateTable) {
-            console.error("Automate table not found");
+            console.error("PID table not found");
             return;
         }
 
@@ -1156,8 +929,10 @@ function loadAutoTable(jsonData) {
         const pidMinVoltEl = document.getElementById("pid_polling_min_voltage");
         const pidMinVoltValEl = document.getElementById("pid_polling_min_voltage_value");
         if (pidMinVoltEl && pidMinVoltValEl) pidMinVoltValEl.textContent = pidMinVoltEl.value;
-        setElementValue("standard_pids", data.standard_pids, 'disable');
-        setElementValue("ecu_protocol", data.ecu_protocol, '6');
+        // Standard-PIDs keys have no UI after the streamline (issue #21); capture them so
+        // storeAutoTableData re-emits the stored values verbatim instead of defaults.
+        loadedStandardPids = data.standard_pids || 'disable';
+        loadedEcuProtocol = data.ecu_protocol || '6';
 
         if (data.pids && Array.isArray(data.pids)) {
             data.pids.forEach((pidData, index) => {
@@ -1205,17 +980,7 @@ function loadAutoTable(jsonData) {
             });
         }
 
-        if (data.std_pids && Array.isArray(data.std_pids)) {
-            data.std_pids.forEach((pidData, index) => {
-                console.log(`Loading Standard PID ${index}:`, pidData);
-                addSelectedPID({
-                    Name: pidData.Name || '',
-                    ReceiveHeader: pidData.ReceiveHeader || '',
-                    Period: pidData.Period || '',
-                    enabled: pidData.enabled
-                });
-            });
-        }
+        loadedStdPids = Array.isArray(data.std_pids) ? data.std_pids : [];
 
         // Calculated channels (Task #17, source CALC)
         if (Array.isArray(data.calculated)) {
@@ -1231,19 +996,8 @@ function loadAutoTable(jsonData) {
 
         requestAnimationFrame(() => {
             try {
-                const ecuProtocolElement = document.getElementById("ecu_protocol");
-                if (ecuProtocolElement) {
-                    ecuProtocolElement.dispatchEvent(new Event('change'));
-                }
-
-                const standardPidsElement = document.getElementById("standard_pids");
-                if (standardPidsElement) {
-                    standardPidsElement.dispatchEvent(new Event('change'));
-                }
-
                 if (typeof toggleCarModel === 'function') toggleCarModel();
                 if (typeof toggleGroupApiToken === 'function') toggleGroupApiToken();
-                if (typeof toggleStandardPIDOptions === 'function') toggleStandardPIDOptions();
 
                 togglePidPollingMinVoltageRow();
             } catch (error) {
@@ -1284,11 +1038,9 @@ function enableAutoStoreButton() {
 async function storeAutoTableData() {
     try {
         const custom_pid_data = [];
-        const std_pid_data = [];
         const custom_can_filters = [];
 
         const entries = document.querySelectorAll('.pid-entry');
-        const standardEntries = document.querySelectorAll('.std-pid-entry');
 
         const initialisationValue = document.getElementById("initialisation")?.value || '';
         const disableOnSleepVoltageValue = document.getElementById("disable_on_sleep_voltage")?.value || 'automate_threshold';
@@ -1297,8 +1049,6 @@ async function storeAutoTableData() {
             const n = parseFloat(pidPollingMinVoltageValueRaw);
             return Number.isFinite(n) ? n : 12.0;
         })();
-        const standard_pidsValue = document.getElementById("standard_pids")?.value || 'disable';
-        const ecu_protocolValue = document.getElementById("ecu_protocol")?.value || '6';
         if(entries?.length) {
             entries.forEach((entry, index) => {
                 const pidData = {
@@ -1329,25 +1079,6 @@ async function storeAutoTableData() {
                 custom_pid_data.push(pidData);
             });
         }
-
-        if(standardEntries?.length) {
-            standardEntries.forEach((entry, index) => {
-                const stdPIDData = {
-                    Name: entry.querySelector('.name-input')?.value || '',
-                    ReceiveHeader: entry.querySelector('.receive-header-input')?.value || '',
-                    Period: entry.querySelector('.period-input')?.value || '',
-                    enabled: entry.querySelector('.enabled-chk')?.checked !== false
-                };
-
-                if (stdPIDData.Name.length === 0 || stdPIDData.Name.length >= 32) {
-                    throw new Error("Name must not be empty and must be less than 32 characters");
-                }
-                if (!/^\d+$/.test(stdPIDData.Period) || (parseInt(stdPIDData.Period) < 1000 && parseInt(stdPIDData.Period) != 0)) {
-                    throw new Error("Period must be a number greater than 1000");
-                }
-                std_pid_data.push(stdPIDData);
-            });
-        }            
 
         // Custom CAN filters (group by frame_id)
         const customFilterEntries = document.querySelectorAll('.custom-canfilter-entry');
@@ -1398,11 +1129,13 @@ async function storeAutoTableData() {
             disable_on_sleep_voltage: disableOnSleepVoltageValue,
             pid_polling_min_voltage: pidPollingMinVoltageValue,
             pids: custom_pid_data,
-            std_pids: std_pid_data,
+            // Standard-PIDs keys are passthrough (no UI after issue #21): re-emit the
+            // values captured by loadAutoTable so a Store never silently drops them.
+            std_pids: loadedStdPids,
             can_filters: custom_can_filters,
             calculated: calculated_data,
-            standard_pids: standard_pidsValue,
-            ecu_protocol: ecu_protocolValue
+            standard_pids: loadedStandardPids,
+            ecu_protocol: loadedEcuProtocol
         };
 
         await fetch('store_auto_data', {
@@ -1745,42 +1478,15 @@ function openTab(evt, tabName) {
     if (typeof closeDrawer === 'function') closeDrawer();
     if (evt.currentTarget.scrollIntoView) evt.currentTarget.scrollIntoView({ block: 'nearest' });
 
-    if (tabName === 'automate') {
-        try { ensureAutomateSubTabInitialized(); } catch(_) {}
-    }
-    
     if (tabName === 'files_tab') {
         filesCwd = '';
         filesLoad('');
-    } else if (tabName === 'logger') {
-        csv_status_poll_start();
     } else if (tabName === 'console_tab') {
         csv_status_poll_start();
         consoleRefresh();
     }
 }
 
-function openAutomateSubTab(evt, tabName) {
-    var i, tabcontent, tablinks;
-    tabcontent = document.getElementsByClassName("automate-subtabcontent");
-    for (i = 0; i < tabcontent.length; i++) {
-        tabcontent[i].style.display = "none";
-    }
-    tablinks = document.getElementsByClassName("automate-subtablinks");
-    for (i = 0; i < tablinks.length; i++) {
-        tablinks[i].className = tablinks[i].className.replace(" active", "");
-    }
-    var panel = document.getElementById(tabName);
-    if (panel) panel.style.display = "block";
-    if (evt && evt.currentTarget) evt.currentTarget.className += " active";
-}
-
-function ensureAutomateSubTabInitialized() {
-    var defaultButton = document.getElementById('automateSubDefaultOpen');
-    if (!defaultButton) return;
-    if (defaultButton.className.indexOf('active') !== -1) return;
-    defaultButton.click();
-}
 function sta_enable() {}
 
 // Helper function to get DOM elements efficiently
@@ -1861,43 +1567,31 @@ function submit_enable() {
 function configureWifiModeSettings(elements, wifiMode) {
     const isAP = wifiMode === "AP";
     const isAPStation = wifiMode === "APStation";
-    const isSmartConnect = wifiMode === "SmartConnect";
-    const isBLEStation = wifiMode === "BLEStation";
     const isStation = wifiMode === "Station";
     const usesAP = isAP || isAPStation;
     const apChValue = document.getElementById("ap_ch_value");
-    
+
     // Set station fields
     elements.ssidValue.disabled = isAP;
     elements.passValue.disabled = isAP;
     elements.staSecurity.disabled = isAP;
     elements.wifiScanButton.disabled = isAP;
 
-    // Set AP fields (Station-only/BLE+Station do not run AP)
+    // Set AP fields (Station-only does not run AP)
     if (apChValue) apChValue.disabled = !usesAP;
     if (elements.apPassValue) elements.apPassValue.disabled = !usesAP;
 
     // Auto-disable AP only applies to AP+Station
     elements.apAutoDisable.disabled = !isAPStation;
-    
-    // Set BLE settings based on mode
+
+    // BLE element state (the BLE section is hidden but still round-trips) + station info note
     if (isAP) {
         elements.bleStatus.disabled = false;
         elements.blePassValue.disabled = false;
         elements.sta_ble_info.style.display = "none";
-    } else if (isBLEStation) {
-        elements.bleStatus.disabled = true;
-        elements.bleStatus.value = "enable";
-        elements.bleStatus.selectedIndex = 0;
-        elements.blePassValue.disabled = false;
-        elements.sta_ble_info.style.display = "block";
     } else if (isStation) {
         elements.sta_ble_info.style.display = "block";
-    }
-    else if (isSmartConnect) {
-        elements.bleStatus.disabled = true;
-        elements.blePassValue.disabled = true;
-    } else {
+    } else {   // APStation
         elements.bleStatus.disabled = true;
         elements.bleStatus.value = "disable";
         elements.bleStatus.selectedIndex = 1;
@@ -1908,9 +1602,8 @@ function configureWifiModeSettings(elements, wifiMode) {
 
 function handleBleStatus(elements) {
     const isBleEnabled = elements.bleStatus.value === "enable";
-    const isBLEStation = elements.wifiMode.value === "BLEStation";
 
-    elements.bleWarningDiv.style.display = (isBleEnabled && !isBLEStation) ? "block" : "none";
+    elements.bleWarningDiv.style.display = isBleEnabled ? "block" : "none";
     // Enable BLE passkey input only when BLE is enabled
     elements.blePassValue.disabled = !isBleEnabled;
     
@@ -1982,29 +1675,6 @@ function validateForm(elements, wifiMode) {
     // Sleep disable agreement validation
     if (elements.sleepStatus.value === "disable" && elements.sleepDisableAgree.value === "no") {
         return disableSubmitWithError("You must agree to disable sleep mode", 5000);
-    }
-    
-    // SmartConnect validation
-    if (wifiMode === "SmartConnect") {
-        return validateSmartConnect();
-    }
-    
-    return true;
-}
-
-function validateSmartConnect() {
-    const homeSSID = document.getElementById("home_ssid").value.trim();
-    const homePassword = document.getElementById("home_password").value.trim();
-    const driveConnectionType = document.getElementById("drive_connection_type").value;
-    const driveSSID = document.getElementById("drive_ssid").value.trim();
-    const drivePassword = document.getElementById("drive_password").value.trim();
-    
-    if (!homeSSID || !homePassword) {
-        return disableSubmitWithError("SmartConnect: Home SSID and Password are required", 5000);
-    }
-    
-    if (driveConnectionType === "wifi" && (!driveSSID || !drivePassword)) {
-        return disableSubmitWithError("SmartConnect: Drive SSID and Password are required when WiFi is selected", 5000);
     }
     
     return true;
@@ -2091,11 +1761,15 @@ function checkStatus() {
             document.getElementById("port_type_status").innerHTML = "UDP";
         }
         document.getElementById("port_status").innerHTML = obj.port;
-        document.getElementById("fw_version").innerHTML = obj.fw_version;
+        // The git-describe tag IS the firmware version (issue #21): the old MeatPi
+        // major.minor fw_version means nothing on this fork.
+        document.getElementById("fw_version").innerHTML = obj.git_version;
         document.getElementById("hw_version").innerHTML = obj.hw_version;
-        document.getElementById("git_version").innerHTML = obj.git_version;
         document.getElementById("protocol").value = obj.protocol;
-        if(obj.protocol != "auto_pid") {
+        // PID polling works under auto_pid (legacy ELM poller) and poll_log (native
+        // poller); fast_log records only CAN-filter/calculated channels. Warn only when
+        // the protocol can't record PIDs at all.
+        if (["auto_pid", "poll_log", "fast_log"].indexOf(obj.protocol) === -1) {
             document.getElementById("autopid_warning_div").style.display = "block";
         }else {
             document.getElementById("autopid_warning_div").style.display = "none";
@@ -2161,13 +1835,8 @@ function applyLoggerXor() {
     if (!masterEl || !cs) { return; }
     var csvShow = (masterEl.value === "enable");
     cs.value = csvShow ? "enable" : "disable";
-    // CSV runtime Start/Stop button + live status line: shown only when logging is on.
-    var csvRow = document.getElementById("csv_runtime_row");
-    var csvStatRow = document.getElementById("csv_status_row");
-    if (csvRow) csvRow.style.display = csvShow ? "" : "none";
-    if (csvStatRow) csvStatRow.style.display = csvShow ? "" : "none";
-    // Wide CSV (Task #11) controls, progressive: Grid Mode shown when CSV is active; Grid Rate
-    // only when Fixed-rate. (Format toggle removed in Task #16 -- output is always Wide.)
+    // Wide CSV (Task #11) controls, progressive: Polling Mode shown when CSV is active; Polling
+    // Rate only when Fixed-rate. (Format toggle removed in Task #16 -- output is always Wide.)
     var gmEl = document.getElementById("csv_grid_mode");
     var gmRow = document.getElementById("csv_grid_mode_row");
     var hzRow = document.getElementById("csv_grid_hz_row");
@@ -2215,18 +1884,9 @@ async function postConfig() {
     obj["sta_ssid"] = document.getElementById("ssid_value").value;
     obj["sta_pass"] = document.getElementById("pass_value").value;
     obj["sta_security"] = document.getElementById("sta_security").value;
-    obj["home_ssid"] = document.getElementById("home_ssid").value;
-    obj["home_password"] = document.getElementById("home_password").value;
-    obj["home_security"] = document.getElementById("home_security").value;
-    obj["drive_ssid"] = document.getElementById("drive_ssid").value;
-    obj["drive_password"] = document.getElementById("drive_password").value;
-    obj["drive_security"] = document.getElementById("drive_security").value;
-    obj["home_protocol"] = document.getElementById("home_protocol").value;
-    obj["drive_protocol"] = document.getElementById("drive_protocol").value;
-    obj["drive_connection_type"] = document.getElementById("drive_connection_type").value;
-    obj["drive_mode_timeout"] = document.getElementById("drive_mode_timeout").value;
-    obj["can_datarate"] = document.getElementById("can_datarate").value;
-    obj["can_mode"] = document.getElementById("can_mode").value;
+    // Keys with no UI (CAN, IMU, log period, SmartConnect leftovers): re-send the
+    // stored values verbatim so they survive a Submit (see loadedPassthrough).
+    Object.assign(obj, loadedPassthrough);
     obj["port_type"] = document.getElementById("port_type").value;
     obj["port"] = document.getElementById("tcp_port_value").value;
     obj["ap_pass"] = document.getElementById("ap_pass_value").value;
@@ -2256,13 +1916,13 @@ async function postConfig() {
     obj["batt_mqtt_pass"] = document.getElementById("batt_mqtt_pass").value;
     applyLoggerXor();   // compose the real csv_log key from the master widget
     obj["csv_log"] = document.getElementById("csv_log").value;
-    obj["log_filesystem"] = document.getElementById("log_filesystem").value;
-    obj["log_storage"] = document.getElementById("log_storage").value;
+    // Single-option selects removed from the UI (SD card / FATFS are the only
+    // supported values) -- send the constants the firmware expects.
+    obj["log_filesystem"] = "fatfs";
+    obj["log_storage"] = "sdcard";
     obj["csv_grid_mode"] = document.getElementById("csv_grid_mode").value;
     obj["csv_grid_hz"] = document.getElementById("csv_grid_hz").value;
     obj["csv_require_engine"] = document.getElementById("csv_require_engine").value;
-    obj["log_period"] = loadedLogPeriod;   // preserve persisted datalog period (no UI element after trim)
-    obj["imu_threshold"] = document.getElementById("imu_threshold").value;
     obj["led_blink_ms"] = String(ledBlinkMsFromSlider());
 
     // Collect fallback networks (max 5)
@@ -2652,7 +2312,25 @@ async function uploadCfg() {
     }
 }
 
-var loadedLogPeriod = "10";   // last persisted datalog period; re-sent by postConfig (no UI element after trim)
+// Config keys with no UI after the streamline: captured from /load_config in Load(),
+// re-sent verbatim by postConfig() so config-file edits survive a Submit. The four
+// pre-seeded defaults are mandatory keys -- /store_config rejects the whole POST when
+// any of them is missing, so they must always be sent even if /load_config omits them.
+// The home_*/drive_* SmartConnect keys are optional and captured only when present.
+var loadedPassthrough = {
+    can_datarate: "500K",   // NC platform is always 500K
+    can_mode: "normal",
+    imu_threshold: "8",     // IMU only feeds the removed SmartConnect logic
+    log_period: "10",       // datalog period (no UI element after the trim)
+};
+var PASSTHROUGH_KEYS = ["can_datarate", "can_mode", "imu_threshold", "log_period",
+    "home_ssid", "home_password", "home_security", "home_protocol",
+    "drive_ssid", "drive_password", "drive_security", "drive_protocol",
+    "drive_connection_type", "drive_mode_timeout"];
+// Same idea for /store_auto_data (separate endpoint/lifecycle, captured in loadAutoTable):
+var loadedStdPids = [];             // re-sent by storeAutoTableData
+var loadedStandardPids = "disable"; // re-sent by storeAutoTableData
+var loadedEcuProtocol = "6";        // re-sent by storeAutoTableData
 
 async function Load() {
     const xhttp = new XMLHttpRequest();
@@ -2668,19 +2346,10 @@ xhttp.onload = async function() {
             }
         }
 
-        // Load SmartConnect configuration
-        document.getElementById("home_ssid").value = obj.home_ssid || "";
-        document.getElementById("home_password").value = obj.home_password || "";
-        document.getElementById("home_security").value = obj.home_security || "wpa3";
-        document.getElementById("home_protocol").value = obj.home_protocol || "elm327";
-        document.getElementById("drive_ssid").value = obj.drive_ssid || "";
-        document.getElementById("drive_password").value = obj.drive_password || "";
-        document.getElementById("drive_security").value = obj.drive_security || "wpa3";
-        document.getElementById("drive_protocol").value = obj.drive_protocol || "elm327";
-        document.getElementById("drive_connection_type").value = obj.drive_connection_type || "wifi";
-        // Load drive mode timeout value and update display
-        document.getElementById("drive_mode_timeout").value = obj.drive_mode_timeout || "60";
-        document.getElementById("drive_mode_timeout_value").textContent = obj.drive_mode_timeout || "60";
+        // Capture every UI-less passthrough key for postConfig (see loadedPassthrough).
+        PASSTHROUGH_KEYS.forEach(function(k) {
+            if (obj[k] !== undefined && obj[k] !== null) loadedPassthrough[k] = obj[k];
+        });
 
         
         if(obj.ap_auto_disable == "enable") {
@@ -2710,36 +2379,6 @@ xhttp.onload = async function() {
         document.getElementById("ssid_value").value = obj.sta_ssid;
         document.getElementById("pass_value").value = obj.sta_pass;
         document.getElementById("sta_security").value = obj.sta_security || "wpa3";			
-        if(obj.can_datarate == "5K") {
-            document.getElementById("can_datarate").selectedIndex = "0";
-        } else if(obj.can_datarate == "10K") {
-            document.getElementById("can_datarate").selectedIndex = "1";
-        } else if(obj.can_datarate == "20K") {
-            document.getElementById("can_datarate").selectedIndex = "2";
-        } else if(obj.can_datarate == "25K") {
-            document.getElementById("can_datarate").selectedIndex = "3";
-        } else if(obj.can_datarate == "50K") {
-            document.getElementById("can_datarate").selectedIndex = "4";
-        } else if(obj.can_datarate == "100K") {
-            document.getElementById("can_datarate").selectedIndex = "5";
-        } else if(obj.can_datarate == "125K") {
-            document.getElementById("can_datarate").selectedIndex = "6";
-        } else if(obj.can_datarate == "250K") {
-            document.getElementById("can_datarate").selectedIndex = "7";
-        } else if(obj.can_datarate == "500K") {
-            document.getElementById("can_datarate").selectedIndex = "8";
-        } else if(obj.can_datarate == "800K") {
-            document.getElementById("can_datarate").selectedIndex = "9";
-        } else if(obj.can_datarate == "1000K") {
-            document.getElementById("can_datarate").selectedIndex = "10";
-        } else if(obj.can_datarate == "auto") {
-            document.getElementById("can_datarate").selectedIndex = "11";
-        }
-        if(obj.can_mode == "normal") {
-            document.getElementById("can_mode").selectedIndex = "0";
-        } else if(obj.can_mode == "silent") {
-            document.getElementById("can_mode").selectedIndex = "1";
-        }
         if(obj.port_type == "tcp") {
             document.getElementById("port_type").selectedIndex = "0";
         } else if(obj.port_type == "udp") {
@@ -2798,13 +2437,6 @@ xhttp.onload = async function() {
         document.getElementById("csv_require_engine").value = (obj.csv_require_engine === "disable") ? "disable" : "enable";
         applyLoggerXor();
 
-        // SD card is the only storage option after the trim ("internal" was removed);
-        // the select has a single option, so pin it to index 0.
-        document.getElementById("log_storage").selectedIndex = 0;
-
-        // IMU wake threshold (raw LSB; displayed in mg at 3.9 mg/LSB).
-        document.getElementById("imu_threshold").value = obj.imu_threshold || "8";
-        document.getElementById("imu_threshold_value").textContent = ((obj.imu_threshold || 8) * 3.9).toFixed(1) + ' mg';
         {   // LED activity-indicator blink rate: config stores ms, the slider stores an index
             const slider = document.getElementById("led_blink_rate");
             slider.max = LED_BLINK_STEPS.length - 1;   // the table owns the range, not the HTML
@@ -2840,11 +2472,6 @@ xhttp.onload = async function() {
         document.getElementById("batt_alert_url").value = obj.batt_alert_url.slice(7);
         document.getElementById("batt_alert_port").value = obj.batt_alert_port;
         document.getElementById("batt_alert_topic").value = obj.batt_alert_topic;
-        // Preserve the persisted datalog period (no UI element after the trim; feeds
-        // poll_log_init/fast_log_init). Re-sent verbatim by postConfig so Submit never pins it to 10.
-        if (obj.log_period !== undefined && obj.log_period !== null) {
-            loadedLogPeriod = obj.log_period;
-        }
         loadautoPID();
 
         // Load fallback networks if present
@@ -2856,7 +2483,6 @@ xhttp.onload = async function() {
         }
 
         // Apply mode-dependent enable/disable rules after values are loaded
-        try { toggleSmartConnectConfig(); } catch(_) {}
         try { toggleApStationWarning(); } catch(_) {}
         try { submit_enable(); } catch(_) {}
 
@@ -2867,14 +2493,11 @@ xhttp.onload = async function() {
     xhttp.open("GET", "/load_config");
     xhttp.send();
 
-    
-    // Initialize SmartConnect configuration visibility
-    toggleSmartConnectConfig();
 
     // Initialize AP+Station warning visibility
     try { toggleApStationWarning(); } catch(_) {}
 
-    // Initialize Automate low-voltage defaults before auto_pid.json is loaded.
+    // Initialize the logger low-voltage defaults before auto_pid.json is loaded.
     try { togglePidPollingMinVoltageRow(); } catch(_) {}
 
     // Initialize AP SSID input state
@@ -2886,38 +2509,17 @@ xhttp.onload = async function() {
     }
 }
 
-// ---- CSV datalogger runtime Start/Stop (POST /csv_logger) + live status poll ----
-// The button is a runtime action (NOT part of the config form / Submit). Firmware status
-// is the source of truth: after each POST and on every poll we reconcile the button label
-// from /csv_status (manual_override || session_active), robust to cross-core latency and
-// to start/stop happening from another client or from ignition.
+// ---- CSV datalogger live status poll (renders the Console recorder card) ----
+// The Console's Start Trip button is the only start/stop UI (issue #21 removed the
+// Logger page's Start button). Firmware status is the source of truth: on every poll
+// we reconcile from /csv_status (manual_override || session_active), robust to
+// cross-core latency and to start/stop happening from another client or from ignition.
 function csv_notify(m, c) {
     if (typeof showNotification === 'function') showNotification(m, c); else console.log(m);
 }
-function csv_log_button_en(b) {
-    // b==1 => idle/Start, b==0 => active/Stop (mirror mon_button_en; no sibling inputs)
-    var btn = document.getElementById('csv_log_button');
-    if (btn) btn.value = (b == 1) ? 'Start' : 'Stop';
-}
 function csv_status_render(j) {
-    // Firmware status is the source of truth (robust to cross-core latency + external
-    // start/stop). "on" => button shows Stop; otherwise Start.
     var on = !!(j && (j.manual_mode === 'on' || j.session_active));
-    csv_log_button_en(on ? 0 : 1);
     console_status_render(j, on);
-    var line = document.getElementById('csv_status_line');
-    if (!line) return;
-    if (j && j.session_active) {
-        line.textContent = 'logging • ' + (j.file || '') + ' • ' + (j.rows_written || 0) + ' rows';
-    } else if (j && j.manual_mode === 'on' && j.sd_mounted === false) {
-        line.textContent = 'waiting for SD card…';
-    } else if (j && j.manual_mode === 'on') {
-        line.textContent = 'armed — waiting for data…';
-    } else if (j && j.manual_mode === 'off') {
-        line.textContent = 'stopped';
-    } else {
-        line.textContent = 'idle';
-    }
 }
 function csv_status_tick() {
     if (window._csvStatusInFlight) return;
@@ -2935,25 +2537,6 @@ function csv_status_poll_start() {
 function csv_status_poll_stop() {
     if (window._csvStatusTimer) { clearInterval(window._csvStatusTimer); window._csvStatusTimer = null; }
 }
-function csv_log_control() {
-    var btn = document.getElementById('csv_log_button');
-    if (!btn) return;
-    var op = (btn.value === 'Start') ? 'start' : 'stop';
-    fetch('/csv_logger?op=' + op, { method: 'POST' })
-        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-        .then(function(j) {
-            csv_status_render(j);
-            if (op === 'start') {
-                csv_notify(j.session_active ? 'Datalogging started' : 'Datalogging armed — waiting for data',
-                           j.session_active ? 'green' : 'orange');
-            } else {
-                csv_notify('Datalogging stopped', 'blue');
-            }
-            csv_status_poll_start();
-        })
-        .catch(function(e) { csv_notify('CSV control failed: ' + e.message, 'red'); });
-}
-
 function isNameUnique(name) {
     return canData.every((item) => item["Name"] !== name);
 }
@@ -3201,7 +2784,7 @@ function consoleLoadChips() {
             // (runbooks reference the raw names) and fall back to it for unknowns.
             // Compact chip labels; match the leading words of the protocol <select> options
             // (homepage_full.html ~1495) so the two stay a single friendly-name source.
-            var MODE_NAMES = {poll_log:'Datalogger', fast_log:'Passive Logger', elm327:'OBD App', auto_pid:'AutoPID', slcan:'Bench SLCAN'};
+            var MODE_NAMES = {poll_log:'Datalogger', fast_log:'Passive Logger', elm327:'OBD App', auto_pid:'Legacy AutoPID', slcan:'Bench SLCAN'};
             if (proto) {
                 var p = (d && d.protocol) || '';
                 proto.textContent = MODE_NAMES[p] || p || '\u2013';

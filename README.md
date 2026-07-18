@@ -36,8 +36,11 @@ NC Flash (desktop app)  ⇄  Wi-Fi  ⇄  WiCAN PRO (this firmware)  ⇄  OBD-II 
 - **CSV datalogger + Field Console.** One-tap trip logging from a mobile-friendly web
   console; logs are written to microSD and downloadable right from the console's trip
   list (or the Files tab), also scriptable via `/csv_list` + `/download_csv`.
-- **Five selectable CAN modes:** Datalogger (`poll_log`), Passive Logger (`fast_log`),
-  OBD App (`elm327`), `auto_pid`, and Bench SLCAN (`slcan`).
+- **Single-purpose by default:** the device always runs the Datalogger (`poll_log`)
+  protocol; NC Flash talks to the always-on port 35001 regardless. Other protocols
+  (`fast_log`, `elm327`, `auto_pid`, `slcan`) remain available via the stored
+  configuration (`protocol` key) for bench/debug use — the selector is hidden in
+  the web UI.
 - **Built-in web UI** — status, settings, automation, power saving, logger, file
   manager, and OTA — responsive down to phones (hamburger navigation).
 - **OTA firmware updates** from the web UI.
@@ -65,11 +68,11 @@ NC Flash (desktop app)  ⇄  Wi-Fi  ⇄  WiCAN PRO (this firmware)  ⇄  OBD-II 
 - The OBD-II adapter is **not** designed to be powered from the USB connector for
   normal use. USB can power the adapter to **flash custom firmware** or **hard-reset**
   the device, and is also useful for **debugging**.
-- It is strongly recommended to **turn BLE off when it isn't in use** — leaving it on
-  can degrade performance.
-- **When BLE is connected, the configuration access point is disabled.** You won't be
-  able to configure the device until you disconnect BLE (turn BLE off on your phone or
-  other device).
+- **BLE settings are hidden in the web UI for now.** This build is Wi-Fi-only: BLE
+  degrades Wi-Fi performance, and when BLE is connected the configuration access
+  point is disabled. BLE support remains in the firmware (the `ble_*` config keys
+  still round-trip), and the UI may come back if a real need appears — e.g. phones
+  whose Wi-Fi is captive to CarPlay/Android Auto while driving.
 - In **AP+Station** mode, use the **station IP** to communicate with the device; the
   **access point is for configuration only**.
 - **Expect ~0.7–0.8 MB/s on file downloads** (a 27 MB day-log ≈ 35 s). That's the
