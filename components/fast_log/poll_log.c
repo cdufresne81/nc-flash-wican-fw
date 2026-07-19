@@ -99,15 +99,16 @@ static const char *TAG = "poll_log";
 #define POLLLOG_RESUME_FRAMES    1        /* an RX frame triggers a PROBE-resume; confirmed only by a real OK */
 #define POLLLOG_FLASH_PARK_MS    20       /* interlock park sleep while a flash owns the bus (task #36) */
 
-/* ---- Hybrid broadcast capture (STAGED -- OFF by default) ----------------- */
-/* Flip POLLLOG_HYBRID to 1, then rebuild + OTA, to fold the passive broadcast decode back into
- * poll_log: every non-response frame poll_log already drains while waiting (and currently throws
- * away) is matched against the configured can_filters and logged with source "CANFLT". Result:
- * RPM/VSS/ECT/IAT/TPS/APP fill at bus rate ALONGSIDE their polled copies, so "RPM [CANFLT]" and
- * "RPM [PID]" sit side by side for direct validation -- and it's ~free, the frames are in hand.
- * Kept at 0 for now so the poll-only validation run stays pure (broadcast columns empty). When 0,
- * neither the decoder nor its call sites are compiled, so behaviour is bit-identical to today. */
-#define POLLLOG_HYBRID           0
+/* ---- Hybrid broadcast capture (ENABLED -- issue #7) ---------------------- */
+/* Folds the passive broadcast decode into poll_log: every non-response frame poll_log already
+ * drains while waiting (and previously threw away) is matched against the configured can_filters
+ * and logged with source "CANFLT". Result: RPM/VSS/ECT/IAT/TPS/APP fill at bus rate ALONGSIDE
+ * their polled copies, so "RPM [CANFLT]" and "RPM [PID]" sit side by side -- and it's ~free, the
+ * frames are in hand. Runs inside the existing drain loop: no new task, no new TWAI consumer, so
+ * the brick invariants are untouched. Enabled after the poll-only validation run confirmed polled
+ * values on the vehicle (~325 req/s, 0 timeouts). Set to 0 to compile it back out entirely
+ * (bit-identical poll-only behaviour) if a capture ever needs to isolate the polled path. */
+#define POLLLOG_HYBRID           1
 #define POLLLOG_BCAST_PERIOD_MS  20      /* per-broadcast-channel record throttle (~50 Hz/ch) */
 
 /* ---- Independent one-shot RTC crash-guard ------------------------------- */
@@ -152,6 +153,16 @@ static volatile bool     s_active = false;
 static volatile uint32_t s_cum_ok = 0, s_cum_timeout = 0, s_cum_txfail = 0;
 static volatile uint32_t s_win_ok = 0, s_win_timeout = 0, s_win_txfail = 0;
 static volatile float    s_win_rtt_avg_ms = 0, s_win_rtt_min_ms = 0, s_win_rtt_max_ms = 0, s_win_req_s = 0;
+
+/* Measured full-sweep rate (issue #23): wall time of one complete round-robin over all polled
+ * PIDs plus the calculated-channel pass, EMA-smoothed (alpha 1/8). This is the fastest rate at
+ * which every polled channel can deliver a FRESH value -- the "Auto" CSV grid tracks it via
+ * poll_log_sweep_hz(). Only sweeps with >=1 OK are folded in, so probe sweeps against a silent
+ * ECU (every PID timing out at 30 ms) can't poison the average; the value freezes at the last
+ * good measurement across a quiesce and recovers within ~8 sweeps of a resume. Single-writer
+ * (the poll task); 32-bit aligned floats -> atomic enough for lock-free readers, same contract
+ * as the status snapshot above (deliberately NOT the 64-bit us value, which would tear). */
+static volatile float s_sweep_hz = 0, s_sweep_ms = 0;
 
 /* Engine-off quiesce state (Stage 1). Single-writer (the poll task) aligned fields, same no-mutex
  * contract as the status snapshot above; the getters below do plain reads. */
@@ -234,17 +245,29 @@ static void polllog_decode_broadcast(const twai_message_t *msg)
 {
     if (s_cfg == NULL || msg == NULL || msg->rtr)
         return;
-    if (!autopid_lock(20))
+    /* Try-lock (0): broadcast decode is opportunistic -- the next frame is ~20 ms away, so
+     * skipping under contention is free. A blocking wait here would multiply per drained frame
+     * inside the pre-send drain loop: an HTTP Test-PID/Test-filter handler holds this lock for
+     * seconds, and at real bus rates that would stall ALL polling for the whole hold. */
+    if (!autopid_lock(0))
         return;
 
     const bool extd = (msg->extd != 0);
-    const int64_t now = esp_timer_get_time();
 
     for (uint32_t fi = 0; fi < s_cfg->can_filters_count; fi++)
     {
         can_filter_t *f = &s_cfg->can_filters[fi];
         if (f->frame_id != msg->identifier || f->is_extended != extd)
             continue;
+        /* Mirror the producer/column-provider gate (autopid.c): vehicle-profile filters decode
+         * only while "Vehicle Specific PIDs" is enabled. Without this, every match would be a
+         * column-less CSV record (cols_unmatched) burning record-queue slots at up to 50 Hz. */
+        if (f->is_vehicle_specific && !s_cfg->pid_specific_en)
+            continue;
+
+        /* Timer read deferred to here: this function runs per drained frame at bus rate,
+         * and most frames match no filter. */
+        const int64_t now = esp_timer_get_time();
 
         /* evaluate_expression() does NOT bounds-check B0..B7: feed a full zero-padded 8-byte buf. */
         uint8_t buf[8] = {0};
@@ -432,6 +455,9 @@ static void polllog_rx_task(void *arg)
 
         if (s_engine_running)
         {
+            const uint32_t sweep_ok_before = s_cum_ok;
+            const int64_t  sweep_t0 = now;
+
             /* One single-PID round-robin sweep over all configured polled PIDs. */
             for (uint32_t i = 0; i < s_cfg->pid_count; i++)
             {
@@ -448,6 +474,17 @@ static void polllog_rx_task(void *arg)
              * channel's p->value is freshest -- evaluate calc expressions over those and record each
              * as source "CALC". No-op when none configured; takes autopid_lock itself (we hold none here). */
             autopid_eval_calculated_channels();
+
+            /* Sweep-rate measurement (issue #23): fold this sweep into the EMA only if at least
+             * one PID answered -- see the s_sweep_hz block comment for the freeze/poison rules. */
+            if (s_cum_ok != sweep_ok_before)
+            {
+                static float ema_us = 0;   /* poll-task-local; the volatiles below are the readers' view */
+                const float sweep_us = (float)(esp_timer_get_time() - sweep_t0);
+                ema_us = (ema_us > 0) ? (ema_us * 0.875f + sweep_us * 0.125f) : sweep_us;
+                s_sweep_ms = ema_us / 1000.0f;
+                s_sweep_hz = (ema_us > 0) ? (1e6f / ema_us) : 0;
+            }
 
             /* Quiesce decision -> flip the bus to LISTEN_ONLY so we stop holding it awake. Two cases,
              * so we never spin-transmit onto a dead bus:
@@ -627,6 +664,10 @@ void poll_log_init(char *id, uint32_t log_period)
      * csv_logger, not the reverse. */
     csv_logger_set_engine_state_fn(poll_log_engine_running);
 
+    /* Same registration pattern for the measured sweep rate (issue #23): the CSV writer's
+     * "Auto" fixed-rate grid tracks poll_log's real sweep frequency with no reverse dep. */
+    csv_logger_set_rate_fn(poll_log_sweep_hz);
+
     ESP_LOGI(TAG, "Phase B (measure-first) up: %lu polled PID(s), NORMAL/on-bus, single-PID round-robin",
              (unsigned long)s_cfg->pid_count);
 }
@@ -649,6 +690,13 @@ bool poll_log_quiesced(void)
     return s_active ? s_quiesced : false;
 }
 
+float poll_log_sweep_hz(void)
+{
+    /* 0 = no measurement (POLL_LOG inactive, or no sweep has completed with an OK yet);
+     * callers (the CSV auto-grid) fall back to their own default on 0. */
+    return s_active ? s_sweep_hz : 0.0f;
+}
+
 uint32_t poll_log_bus_idle_ms(void)
 {
     if (!s_active || s_engine_running)
@@ -668,18 +716,21 @@ uint32_t poll_log_bus_idle_ms(void)
  */
 char *poll_log_get_status_json(void)
 {
-    char *buf = malloc(320);
+    char *buf = malloc(400);
     if (buf == NULL)
         return NULL;
-    snprintf(buf, 320,
+    snprintf(buf, 400,
              "{\"active\":%s,\"ok\":%u,\"timeout\":%u,\"txfail\":%u,"
              "\"rtt_avg_ms\":%.2f,\"rtt_min_ms\":%.2f,\"rtt_max_ms\":%.2f,\"req_s\":%.1f,"
+             "\"sweep_ms\":%.1f,\"sweep_hz\":%.2f,\"pids\":%u,"
              "\"win_ok\":%u,\"win_timeout\":%u,\"win_txfail\":%u,"
              "\"engine_running\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u}",
              s_active ? "true" : "false",
              (unsigned)s_cum_ok, (unsigned)s_cum_timeout, (unsigned)s_cum_txfail,
              (double)s_win_rtt_avg_ms, (double)s_win_rtt_min_ms, (double)s_win_rtt_max_ms,
              (double)s_win_req_s,
+             (double)s_sweep_ms, (double)s_sweep_hz,
+             (unsigned)(s_cfg ? s_cfg->pid_count : 0),
              (unsigned)s_win_ok, (unsigned)s_win_timeout, (unsigned)s_win_txfail,
              poll_log_engine_running() ? "true" : "false",
              s_quiesced ? "true" : "false",

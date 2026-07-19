@@ -34,9 +34,18 @@ void poll_log_init(char *id, uint32_t log_period);
  * Live poll metrics for GET /poll_status, as a malloc'd JSON string the caller must free().
  * Safe to call in any protocol mode -- returns {"active":false,...} when POLL_LOG isn't running.
  * Shape: {active, ok, timeout, txfail (cumulative), rtt_avg_ms/min/max, req_s (last 3 s window),
+ * sweep_ms/sweep_hz (measured full-sweep EMA), pids (polled PID count),
  * win_ok/win_timeout/win_txfail (that window's counts)}.
  */
 char *poll_log_get_status_json(void);
+
+/*
+ * Measured full round-robin sweep rate in Hz (EMA), i.e. the fastest rate at which every polled
+ * channel delivers a fresh value (issue #23). 0 when POLL_LOG is inactive or nothing has been
+ * measured yet -- callers fall back to their own default. Registered with the CSV logger as its
+ * rate provider (csv_logger_set_rate_fn) to drive the "Auto" fixed-rate grid.
+ */
+float poll_log_sweep_hz(void);
 
 /*
  * Engine/quiesce state, derived purely from whether the ECU is answering polls (Stage 1).

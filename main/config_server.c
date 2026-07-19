@@ -2707,11 +2707,15 @@ static void config_server_load_cfg(char *cfg)
 	else
 	{
 		strlcpy(device_config.csv_grid_hz, key->valuestring, sizeof(device_config.csv_grid_hz));
-		char *gh_end;
-		long gh = strtol(device_config.csv_grid_hz, &gh_end, 10);
-		if(*gh_end != '\0' || gh_end == device_config.csv_grid_hz || gh < 1 || gh > 50)
+		//***** "auto" (issue #23): grid tracks the measured poll sweep rate; otherwise 1-50 Hz.
+		if(strcmp(device_config.csv_grid_hz, "auto") != 0)
 		{
-			strlcpy(device_config.csv_grid_hz, "10", sizeof(device_config.csv_grid_hz));
+			char *gh_end;
+			long gh = strtol(device_config.csv_grid_hz, &gh_end, 10);
+			if(*gh_end != '\0' || gh_end == device_config.csv_grid_hz || gh < 1 || gh > 50)
+			{
+				strlcpy(device_config.csv_grid_hz, "10", sizeof(device_config.csv_grid_hz));
+			}
 		}
 	}
 	ESP_LOGI(TAG, "device_config.csv_grid_hz: %s", device_config.csv_grid_hz);
@@ -3498,6 +3502,13 @@ int8_t config_server_get_csv_require_engine(void)
 
 int8_t config_server_get_csv_grid_hz(uint32_t *hz)
 {
+	//***** "auto" (issue #23) reports as hz=0: the CSV writer derives the grid period from
+	//      the measured poll sweep rate instead of a fixed value.
+	if(strcmp(device_config.csv_grid_hz, "auto") == 0)
+	{
+		*hz = 0;
+		return 1;
+	}
 	char *endptr;
 	long v = strtol(device_config.csv_grid_hz, &endptr, 10);
 

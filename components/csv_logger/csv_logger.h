@@ -106,6 +106,17 @@ typedef bool (*csv_engine_state_fn_t)(void);
 void csv_logger_set_engine_state_fn(csv_engine_state_fn_t fn);
 
 /**
+ * @brief Measured sample-rate provider for the "Auto" fixed-rate grid (issue #23).
+ *
+ * Returns the current fastest meaningful logging rate in Hz (poll_log registers its measured
+ * full-sweep EMA), or 0 when unknown -- the writer then falls back to its default rate. Same
+ * no-circular-dependency registration pattern as the engine-state predicate. Must be cheap and
+ * lock-free (called from the writer task on every grid tick).
+ */
+typedef float (*csv_rate_fn_t)(void);
+void csv_logger_set_rate_fn(csv_rate_fn_t fn);
+
+/**
  * @brief Start the CSV datalogger AFTER boot settles (deferred ~20s).
  *
  * Call this at boot instead of csv_logger_init(); it spawns a small task that waits,

@@ -567,9 +567,14 @@ function addCollapsibleRow(rowData = {}) {
                     <td><input type="text" class="unit-input" value="${rowData.Unit || ''}" 
                         placeholder="e.g. V, °C, kPa"></td>
                 </tr>
-                <tr>
+                <!-- Class + Period hidden: Class is upstream HA/MQTT sensor metadata nothing
+                     in this firmware consumes, and Period is honored only by the Legacy
+                     AutoPID scheduler -- the Datalogger (poll_log) protocol polls every PID
+                     each sweep regardless. Inputs stay in the DOM so storeAutoTableData()
+                     keeps round-tripping the auto_pid.json keys. -->
+                <tr style="display:none">
                     <td>Class:</td>
-                    <td><input type="text" class="class-input" value="${rowData.Class || ''}" 
+                    <td><input type="text" class="class-input" value="${rowData.Class || ''}"
                         placeholder="e.g. voltage, temp"></td>
                 </tr>
                 <tr>
@@ -582,9 +587,9 @@ function addCollapsibleRow(rowData = {}) {
                     <td><input type="number" class="max-value-input" value="${rowData.MaxValue || ''}" 
                         step="0.01" placeholder="Maximum value"></td>
                 </tr>
-                <tr>
+                <tr style="display:none">
                     <td>Period(ms):</td>
-                    <td><input type="number" class="period-input" value="${rowData.Period || ''}" 
+                    <td><input type="number" class="period-input" value="${rowData.Period || ''}"
                         placeholder="ms"></td>
                 </tr>
             </table>
@@ -718,7 +723,11 @@ function addCustomCanFilterEntry(rowData = {}) {
                     <td>Unit:</td>
                     <td><input type="text" class="unit-input" value="${safe(p.unit)}" placeholder="Unit"></td>
                 </tr>
-                <tr>
+                <!-- Class + Period hidden here too: only the Legacy AutoPID ATMA monitor
+                     (process_can_filter_frame) honors a filter parameter's period; poll_log
+                     and fast_log decode broadcasts with their own fixed throttles. Inputs
+                     stay in the DOM for the auto_pid.json round-trip. -->
+                <tr style="display:none">
                     <td>Class:</td>
                     <td><input type="text" class="class-input" value="${safe(p.class)}" placeholder="Class"></td>
                 </tr>
@@ -730,7 +739,7 @@ function addCustomCanFilterEntry(rowData = {}) {
                     <td>Max Value:</td>
                     <td><input type="number" class="max-input" value="${safe(p.max)}" step="0.01" placeholder="Max"></td>
                 </tr>
-                <tr>
+                <tr style="display:none">
                     <td>Period(ms):</td>
                     <td><input type="number" class="period-input" value="${safe(p.period || '5000')}" min="100" max="60000"></td>
                 </tr>
@@ -1842,6 +1851,11 @@ function applyLoggerXor() {
     var hzRow = document.getElementById("csv_grid_hz_row");
     if (gmRow) gmRow.style.display = csvShow ? "" : "none";
     if (hzRow) hzRow.style.display = (csvShow && gmEl && gmEl.value === "fixed") ? "" : "none";
+    // Auto rate (issue #23): the manual Hz input is inert while the device tracks the
+    // measured polling sweep, so grey it out.
+    var hzAuto = document.getElementById("csv_grid_auto");
+    var hzEl = document.getElementById("csv_grid_hz");
+    if (hzAuto && hzEl) hzEl.disabled = hzAuto.checked;
     var reRow = document.getElementById("csv_require_engine_row");
     if (reRow) reRow.style.display = csvShow ? "" : "none";
 }
@@ -1921,7 +1935,9 @@ async function postConfig() {
     obj["log_filesystem"] = "fatfs";
     obj["log_storage"] = "sdcard";
     obj["csv_grid_mode"] = document.getElementById("csv_grid_mode").value;
-    obj["csv_grid_hz"] = document.getElementById("csv_grid_hz").value;
+    // "auto" (issue #23): the grid tracks the measured polling sweep instead of a fixed Hz.
+    obj["csv_grid_hz"] = document.getElementById("csv_grid_auto").checked
+        ? "auto" : document.getElementById("csv_grid_hz").value;
     obj["csv_require_engine"] = document.getElementById("csv_require_engine").value;
     obj["led_blink_ms"] = String(ledBlinkMsFromSlider());
 
@@ -2432,7 +2448,8 @@ xhttp.onload = async function() {
         document.getElementById("csv_log").value = _cs_on ? "enable" : "disable";
         document.getElementById("logging_master").value = _cs_on ? "enable" : "disable";
         document.getElementById("csv_grid_mode").value = (obj.csv_grid_mode === "event") ? "event" : "fixed";
-        var _hz = parseInt(obj.csv_grid_hz, 10);
+        document.getElementById("csv_grid_auto").checked = (obj.csv_grid_hz === "auto");
+        var _hz = parseInt(obj.csv_grid_hz, 10);   // NaN when "auto" -> input keeps the 10 default
         document.getElementById("csv_grid_hz").value = (_hz >= 1 && _hz <= 50) ? _hz : 10;
         document.getElementById("csv_require_engine").value = (obj.csv_require_engine === "disable") ? "disable" : "enable";
         applyLoggerXor();

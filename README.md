@@ -36,6 +36,10 @@ NC Flash (desktop app)  ⇄  Wi-Fi  ⇄  WiCAN PRO (this firmware)  ⇄  OBD-II 
 - **CSV datalogger + Field Console.** One-tap trip logging from a mobile-friendly web
   console; logs are written to microSD and downloadable right from the console's trip
   list (or the Files tab), also scriptable via `/csv_list` + `/download_csv`.
+  Capture is **hybrid**: broadcast CAN frames are decoded at bus rate alongside the
+  actively polled PIDs, and the logging rate can be set to **Auto** — the device
+  measures its real polling round-trip and logs at the fastest rate that still gives
+  every row fresh values (Tactrix-style, live in `/poll_status` as `sweep_hz`).
 - **Single-purpose by default:** the device always runs the Datalogger (`poll_log`)
   protocol; NC Flash talks to the always-on port 35001 regardless. Other protocols
   (`fast_log`, `elm327`, `auto_pid`, `slcan`) remain available via the stored
@@ -91,6 +95,9 @@ idf.py build
 Web UI changes: edit `main/web/homepage_full.html`, then regenerate the embedded bundle
 with `python tools/build_web.py` (never hand-edit `main/web/src/homepage.html`).
 Firmware version is derived from `git describe`, so only `v*` tags are valid.
+
+Architecture and under-the-hood documentation lives in [`docs/internals/`](docs/internals/README.md)
+(datalogger polling model, hybrid capture, Auto rate, CSV grid, UI conventions).
 
 ## Credits & license
 
