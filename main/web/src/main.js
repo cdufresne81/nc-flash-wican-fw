@@ -567,9 +567,14 @@ function addCollapsibleRow(rowData = {}) {
                     <td><input type="text" class="unit-input" value="${rowData.Unit || ''}" 
                         placeholder="e.g. V, °C, kPa"></td>
                 </tr>
-                <tr>
+                <!-- Class + Period hidden: Class is upstream HA/MQTT sensor metadata nothing
+                     in this firmware consumes, and Period is honored only by the Legacy
+                     AutoPID scheduler -- the Datalogger (poll_log) protocol polls every PID
+                     each sweep regardless. Inputs stay in the DOM so storeAutoTableData()
+                     keeps round-tripping the auto_pid.json keys. -->
+                <tr style="display:none">
                     <td>Class:</td>
-                    <td><input type="text" class="class-input" value="${rowData.Class || ''}" 
+                    <td><input type="text" class="class-input" value="${rowData.Class || ''}"
                         placeholder="e.g. voltage, temp"></td>
                 </tr>
                 <tr>
@@ -582,9 +587,9 @@ function addCollapsibleRow(rowData = {}) {
                     <td><input type="number" class="max-value-input" value="${rowData.MaxValue || ''}" 
                         step="0.01" placeholder="Maximum value"></td>
                 </tr>
-                <tr>
+                <tr style="display:none">
                     <td>Period(ms):</td>
-                    <td><input type="number" class="period-input" value="${rowData.Period || ''}" 
+                    <td><input type="number" class="period-input" value="${rowData.Period || ''}"
                         placeholder="ms"></td>
                 </tr>
             </table>
