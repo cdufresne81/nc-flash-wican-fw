@@ -218,9 +218,23 @@ static esp_err_t csv_open_new_file(void)
         time_t now = time(NULL);
         struct tm tm_now;
         localtime_r(&now, &tm_now);
-        snprintf(csv_file_path, sizeof(csv_file_path), CSV_LOGGER_DIR "/%04d%02d%02d_%02dh%02dm%02ds.csv",
-                 tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
-                 tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+        // Local-time names can repeat in the DST fall-back hour (issue #32); never reuse
+        // a name -- the fopen("w") below would silently truncate the earlier trip.
+        for (int dup = 0; ; dup++)
+        {
+            char dup_suffix[8] = "";
+            if (dup > 0)
+            {
+                snprintf(dup_suffix, sizeof(dup_suffix), "_%d", dup);
+            }
+            snprintf(csv_file_path, sizeof(csv_file_path), CSV_LOGGER_DIR "/%04d%02d%02d_%02dh%02dm%02ds%s.csv",
+                     tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+                     tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec, dup_suffix);
+            if (dup >= 99 || stat(csv_file_path, &st) != 0)
+            {
+                break;
+            }
+        }
     }
     else
     {

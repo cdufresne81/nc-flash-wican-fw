@@ -32,6 +32,12 @@
 
 #define TAG "SYNC_SYS_TIME"
 
+void sync_sys_time_apply_tz(void)
+{
+    setenv("TZ", SYNC_SYS_TIME_LOCAL_TZ, 1);
+    tzset();
+}
+
 /**
  * @brief Convert decimal to BCD (Binary Coded Decimal)
  */
@@ -87,10 +93,9 @@ static void sync_sys_time(void *pvParameters)
 
     dev_status_wait_for_any_bits(DEV_STA_CONNECTED_BIT, portMAX_DELAY);
 
-    // Initialize SNTP with multiple servers for redundancy
-    // Explicitly set timezone to UTC to prevent any local timezone conversions
-    setenv("TZ", "UTC0", 1);
-    tzset();
+    // Initialize SNTP with multiple servers for redundancy.
+    // TZ is owned by sync_sys_time_apply_tz() at boot (issue #32) -- SNTP sets the
+    // UTC epoch and is unaffected by it.
 
     // Build config explicitly; some IDF versions expect unused entries to be NULL
     esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.windows.com");
@@ -128,7 +133,7 @@ static void sync_sys_time(void *pvParameters)
             {
                 struct tm timeinfo;
                 localtime_r(&now, &timeinfo);
-                ESP_LOGI(TAG, "Time sync successful: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                ESP_LOGI(TAG, "Time sync successful: %04d-%02d-%02d %02d:%02d:%02d local",
                          timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
                 // Publish system time synced for other subsystems

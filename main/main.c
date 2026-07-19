@@ -558,6 +558,9 @@ void app_main(void)
 {
 	void* internal_buf = NULL;
 	// internal_buf = heap_caps_malloc(75 * 1024, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	// Local wall-clock rendering (issue #32) -- must precede the RTC restore
+	// (rtcm_sync_system_time_from_rtc), event_log_init and the CSV logger.
+	sync_sys_time_apply_tz();
 	dev_status_init();
 	dev_status_set_bits(DEV_AWAKE_BIT);
 	dev_status_clear_bits(DEV_SLEEP_BIT);

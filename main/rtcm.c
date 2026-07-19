@@ -21,15 +21,11 @@
 #include "rtcm.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
-#include "esp_http_client.h"
-#include "cJSON.h"
 #include <string.h>
-#include <sys/param.h>
 #include <stdlib.h>
-#include "esp_netif_sntp.h"
-#include "lwip/ip_addr.h"
-#include "esp_sntp.h"
-#include "esp_heap_caps.h"
+#include <time.h>
+#include <sys/time.h>
+#include "dev_status.h"
 
 #define TAG "rtcm"
 
@@ -51,8 +47,6 @@
 #define RX8130_REG_MONTH        0x15
 #define RX8130_REG_YEAR         0x16
 #define RX8130_REG_ID           0x17
-
-#define MAX_HTTP_OUTPUT_BUFFER 4096
 
 static i2c_port_t rtcm_i2c = I2C_NUM_MAX;
 
@@ -174,7 +168,28 @@ esp_err_t rtcm_get_iso8601_time(char *timestamp, size_t max_len)
     }
 }
 
-time_t rtcm_bcd_to_unix_timestamp(uint8_t hour, uint8_t min, uint8_t sec, 
+/*
+ * The RX8130 stores UTC, but mktime() interprets struct tm in the local zone
+ * (TZ is local wall-clock since issue #32), so UTC->epoch needs TZ-independent
+ * civil-date arithmetic. Exact for the 2000-2100 range the RTC can express.
+ */
+static time_t rtcm_utc_tm_to_epoch(const struct tm *timeinfo)
+{
+    int year = timeinfo->tm_year + 1900;
+    int month = timeinfo->tm_mon + 1;
+    int day = timeinfo->tm_mday;
+
+    year -= month <= 2;
+    const int era = year / 400;
+    const int yoe = year - era * 400;
+    const int doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    const int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const int64_t days = (int64_t)era * 146097 + doe - 719468;
+
+    return (time_t)(days * 86400 + timeinfo->tm_hour * 3600 + timeinfo->tm_min * 60 + timeinfo->tm_sec);
+}
+
+time_t rtcm_bcd_to_unix_timestamp(uint8_t hour, uint8_t min, uint8_t sec,
                                  uint8_t year, uint8_t month, uint8_t day)
 {
     // Convert BCD format to decimal
@@ -185,9 +200,6 @@ time_t rtcm_bcd_to_unix_timestamp(uint8_t hour, uint8_t min, uint8_t sec,
     uint8_t month_dec = ((month >> 4) & 0x0F) * 10 + (month & 0x0F);
     uint8_t day_dec = ((day >> 4) & 0x0F) * 10 + (day & 0x0F);
     
-    // Calculate Unix timestamp
-    // Note: This is a simplified calculation that doesn't account for leap years perfectly
-    // but is sufficient for most applications
     struct tm timeinfo;
     timeinfo.tm_year = 100 + year_dec; // Years since 1900 (assuming 20xx)
     timeinfo.tm_mon = month_dec - 1;   // Months are 0-based
@@ -209,13 +221,7 @@ time_t rtcm_bcd_to_unix_timestamp(uint8_t hour, uint8_t min, uint8_t sec,
         return 0;
     }
     
-    time_t unix_timestamp = mktime(&timeinfo);
-    if (unix_timestamp < 0) {
-        ESP_LOGE(TAG, "Failed to convert time to Unix timestamp");
-        return 0;
-    }
-    
-    return unix_timestamp;
+    return rtcm_utc_tm_to_epoch(&timeinfo);
 }
 
 time_t rtcm_get_unix_timestamp(void)
@@ -233,144 +239,14 @@ time_t rtcm_get_unix_timestamp(void)
     return rtcm_bcd_to_unix_timestamp(hour, min, sec, year, month, day);
 }
 
-esp_err_t _http_event_handler(esp_http_client_event_t *evt)
-{
-    static int output_len;
-
-    switch(evt->event_id)
-    {
-        case HTTP_EVENT_ERROR:
-            ESP_LOGE(TAG, "HTTP_EVENT_ERROR");
-            break;
-        case HTTP_EVENT_ON_CONNECTED:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_CONNECTED");
-            break;
-        case HTTP_EVENT_HEADER_SENT:
-            ESP_LOGI(TAG, "HTTP_EVENT_HEADER_SENT");
-            break;
-        case HTTP_EVENT_ON_HEADER:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-            break;
-        case HTTP_EVENT_REDIRECT:
-            ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
-            esp_http_client_set_header(evt->client, "From", "user@example.com");
-            esp_http_client_set_header(evt->client, "Accept", "text/html");
-            esp_http_client_set_redirection(evt->client);
-            break;
-        case HTTP_EVENT_ON_DATA:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-            if (output_len == 0 && evt->user_data)
-            {
-                memset(evt->user_data, 0, MAX_HTTP_OUTPUT_BUFFER);
-            }
-
-            if (!esp_http_client_is_chunked_response(evt->client))
-            {
-                int copy_len = 0;
-                if (evt->user_data)
-                {
-                    copy_len = MIN(evt->data_len, (MAX_HTTP_OUTPUT_BUFFER - output_len));
-                    if (copy_len)
-                    {
-                        memcpy(evt->user_data + output_len, evt->data, copy_len);
-                    }
-                }
-                output_len += copy_len;
-            }
-            break;
-
-        case HTTP_EVENT_ON_FINISH:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_FINISH");
-            output_len = 0;
-            break;
-
-        case HTTP_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
-            output_len = 0;
-            break;
-    }
-    return ESP_OK;
-}
-
-static esp_err_t rtcm_set_time_zone(void) 
-{
-    ESP_LOGI(TAG, "Getting timezone from worldtimeapi.org");
-
-    char *local_response_buffer = heap_caps_malloc(MAX_HTTP_OUTPUT_BUFFER + 1, MALLOC_CAP_SPIRAM);
-    if (local_response_buffer == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to allocate response buffer in PSRAM");
-        return ESP_ERR_NO_MEM;
-    }
-
-    memset(local_response_buffer, 0, MAX_HTTP_OUTPUT_BUFFER + 1);
-    
-    esp_http_client_config_t config = {
-        .url = "http://worldtimeapi.org/api/ip",
-        .event_handler = _http_event_handler,
-        .user_data = local_response_buffer,
-    };
-    
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    ESP_LOGI(TAG, "Performing HTTP request");
-    esp_err_t err = esp_http_client_perform(client);
-    
-    if (err == ESP_OK)
-    {
-        ESP_LOGI(TAG, "HTTP request successful");
-        ESP_LOG_BUFFER_HEXDUMP(TAG, local_response_buffer, strlen(local_response_buffer), ESP_LOG_INFO);
-        cJSON *root = cJSON_Parse(local_response_buffer);
-        if (root)
-        {
-            ESP_LOGI(TAG, "JSON parsed successfully");
-            
-            // Get raw_offset and dst_offset from worldtimeapi
-            cJSON *raw_offset = cJSON_GetObjectItem(root, "raw_offset");
-            cJSON *dst_offset = cJSON_GetObjectItem(root, "dst_offset");
-            
-            if (raw_offset && dst_offset)
-            {
-                int total_offset = (raw_offset->valueint + dst_offset->valueint) / 3600; // Convert to hours
-                char tz_buf[32];
-                snprintf(tz_buf, sizeof(tz_buf), "UTC%+d", -total_offset);
-                ESP_LOGI(TAG, "Setting timezone offset: %s", tz_buf);
-                setenv("TZ", tz_buf, 1);
-                tzset();
-            }
-            else
-            {
-                ESP_LOGE(TAG, "No offset found in JSON response");
-            }
-            cJSON_Delete(root);
-        }
-        else
-        {
-            ESP_LOGE(TAG, "Failed to parse JSON response");
-        }
-    }
-    else
-    {
-        ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
-    }
-    
-    esp_http_client_cleanup(client);
-    heap_caps_free(local_response_buffer);
-    return err;
-}
-
-static void time_sync_notification_cb(struct timeval *tv)
-{
-    ESP_LOGI(TAG, "Time synchronized from SNTP");
-}
-
 static esp_err_t update_rtc_from_system_time(void)
 {
     time_t now;
     struct tm timeinfo;
-    
+
     time(&now);
-    localtime_r(&now, &timeinfo);
-    
+    gmtime_r(&now, &timeinfo); // RX8130 stores UTC; TZ is local wall-clock (issue #32)
+
     // Convert to BCD format for RX8130
     uint8_t hour = ((timeinfo.tm_hour / 10) << 4) | (timeinfo.tm_hour % 10);
     uint8_t min = ((timeinfo.tm_min / 10) << 4) | (timeinfo.tm_min % 10);
@@ -393,43 +269,23 @@ static esp_err_t update_rtc_from_system_time(void)
 
 esp_err_t rtcm_sync_internet_time(void)
 {
-    // First get timezone from internet
-    esp_err_t ret = rtcm_set_time_zone();
-    if (ret != ESP_OK)
+    // TZ is fixed at boot (sync_sys_time_apply_tz, issue #32) and the boot
+    // sync_sys_time task owns the esp_netif_sntp singleton (SNTP sync + hourly RTC
+    // refresh). Running a second init/wait/deinit here would tear that instance
+    // down and kill periodic re-sync until reboot, so just push the already-synced
+    // system time into the RTC. (The worldtimeapi.org offset lookup is gone too:
+    // it froze TZ to a DST-less offset and failed whenever that API was down.)
+    if (!dev_status_is_time_synced())
     {
-        ESP_LOGE(TAG, "Failed to get timezone");
-        return ret;
+        ESP_LOGE(TAG, "System time not SNTP-synced yet; RTC not updated");
+        return ESP_ERR_INVALID_STATE;
     }
 
-    // Initialize SNTP
-    static esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    config.sync_cb = time_sync_notification_cb;
-    config.smooth_sync = true;
-    esp_netif_sntp_init(&config);
-
-    // Wait for time to be set
-    int retry = 0;
-    const int retry_count = 15;
-    while (esp_netif_sntp_sync_wait(2000 / portTICK_PERIOD_MS) == ESP_ERR_TIMEOUT && ++retry < retry_count)
-    {
-        ESP_LOGI(TAG, "Waiting for SNTP sync... (%d/%d)", retry, retry_count);
-    }
-
-    if (retry == retry_count)
-    {
-        ESP_LOGE(TAG, "SNTP sync failed");
-        esp_netif_sntp_deinit();
-        return ESP_FAIL;
-    }
-
-    // Update RTC with synchronized time
-    ret = update_rtc_from_system_time();
+    esp_err_t ret = update_rtc_from_system_time();
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to update RTC with synchronized time");
     }
-
-    esp_netif_sntp_deinit();
     return ret;
 }
 
@@ -459,27 +315,16 @@ esp_err_t rtcm_sync_system_time_from_rtc(void)
     uint8_t year_dec = ((year >> 4) & 0x0F) * 10 + (year & 0x0F);
     uint8_t month_dec = ((month >> 4) & 0x0F) * 10 + (month & 0x0F);
     uint8_t day_dec = ((day >> 4) & 0x0F) * 10 + (day & 0x0F);
-    
-    // Set up the timespec structure
-    struct timeval tv;
-    struct tm timeinfo = {
-        .tm_sec = sec_dec,
-        .tm_min = min_dec,
-        .tm_hour = hour_dec,
-        .tm_mday = day_dec,
-        .tm_mon = month_dec - 1,  // tm_mon is 0-based (0-11)
-        .tm_year = 100 + year_dec, // Years since 1900, assuming 20xx
-        .tm_isdst = -1            // Let the system determine DST
-    };
-    
-    // Convert to timestamp
-    time_t timestamp = mktime(&timeinfo);
-    if (timestamp == -1) {
+
+    // The RTC holds UTC -- convert with the UTC-aware path, never mktime (issue #32)
+    time_t timestamp = rtcm_bcd_to_unix_timestamp(hour, min, sec, year, month, day);
+    if (timestamp == 0) {
         ESP_LOGE(TAG, "Failed to convert RTC time to timestamp");
         return ESP_FAIL;
     }
-    
+
     // Set system time
+    struct timeval tv;
     tv.tv_sec = timestamp;
     tv.tv_usec = 0;
     ret = settimeofday(&tv, NULL);
