@@ -96,6 +96,9 @@ Web UI changes: edit `main/web/homepage_full.html`, then regenerate the embedded
 with `python tools/build_web.py` (never hand-edit `main/web/src/homepage.html`).
 Firmware version is derived from `git describe`, so only `v*` tags are valid.
 
+Architecture and under-the-hood documentation lives in [`docs/internals/`](docs/internals/README.md)
+(datalogger polling model, hybrid capture, Auto rate, CSV grid, UI conventions).
+
 ## Credits & license
 
 This project is a fork of **[meatpiHQ/wican-fw](https://github.com/meatpiHQ/wican-fw)**
