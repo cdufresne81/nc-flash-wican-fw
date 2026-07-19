@@ -1842,6 +1842,11 @@ function applyLoggerXor() {
     var hzRow = document.getElementById("csv_grid_hz_row");
     if (gmRow) gmRow.style.display = csvShow ? "" : "none";
     if (hzRow) hzRow.style.display = (csvShow && gmEl && gmEl.value === "fixed") ? "" : "none";
+    // Auto rate (issue #23): the manual Hz input is inert while the device tracks the
+    // measured polling sweep, so grey it out.
+    var hzAuto = document.getElementById("csv_grid_auto");
+    var hzEl = document.getElementById("csv_grid_hz");
+    if (hzAuto && hzEl) hzEl.disabled = hzAuto.checked;
     var reRow = document.getElementById("csv_require_engine_row");
     if (reRow) reRow.style.display = csvShow ? "" : "none";
 }
@@ -1921,7 +1926,9 @@ async function postConfig() {
     obj["log_filesystem"] = "fatfs";
     obj["log_storage"] = "sdcard";
     obj["csv_grid_mode"] = document.getElementById("csv_grid_mode").value;
-    obj["csv_grid_hz"] = document.getElementById("csv_grid_hz").value;
+    // "auto" (issue #23): the grid tracks the measured polling sweep instead of a fixed Hz.
+    obj["csv_grid_hz"] = document.getElementById("csv_grid_auto").checked
+        ? "auto" : document.getElementById("csv_grid_hz").value;
     obj["csv_require_engine"] = document.getElementById("csv_require_engine").value;
     obj["led_blink_ms"] = String(ledBlinkMsFromSlider());
 
@@ -2432,7 +2439,8 @@ xhttp.onload = async function() {
         document.getElementById("csv_log").value = _cs_on ? "enable" : "disable";
         document.getElementById("logging_master").value = _cs_on ? "enable" : "disable";
         document.getElementById("csv_grid_mode").value = (obj.csv_grid_mode === "event") ? "event" : "fixed";
-        var _hz = parseInt(obj.csv_grid_hz, 10);
+        document.getElementById("csv_grid_auto").checked = (obj.csv_grid_hz === "auto");
+        var _hz = parseInt(obj.csv_grid_hz, 10);   // NaN when "auto" -> input keeps the 10 default
         document.getElementById("csv_grid_hz").value = (_hz >= 1 && _hz <= 50) ? _hz : 10;
         document.getElementById("csv_require_engine").value = (obj.csv_require_engine === "disable") ? "disable" : "enable";
         applyLoggerXor();

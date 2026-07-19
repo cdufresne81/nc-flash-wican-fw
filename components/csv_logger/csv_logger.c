@@ -153,6 +153,7 @@ typedef struct {
 // Latched ONCE per session by the writer task (single-writer thereafter -> no torn reads).
 static csv_grid_mode_t csv_grid_mode  = CSV_GRID_EVENT;
 static uint32_t        csv_grid_hz    = CSV_GRID_HZ_DEFAULT;
+static bool            csv_grid_auto  = false;   // csv_grid_hz=="auto": track the measured rate (issue #23)
 static csv_wide_col_t *csv_cols       = NULL;   // [csv_col_count], INTERNAL RAM, session-scoped
 static int             csv_col_count  = 0;
 static char           *csv_line_buf   = NULL;   // CSV_WIDE_LINE_BUF, INTERNAL RAM, alloc'd once
@@ -163,6 +164,11 @@ static csv_column_provider_t csv_col_provider = NULL;
 // Engine-running predicate (registered by poll_log). NULL = no provider -> gate degrades to the
 // voltage ignition gate. Written once at boot before the writer runs; read lock-free in the gate.
 static csv_engine_state_fn_t csv_engine_state_fn = NULL;
+
+// Measured-rate provider for the Auto grid (registered by poll_log, issue #23). NULL or a 0
+// return -> the Auto grid falls back to CSV_GRID_HZ_DEFAULT. Written once at boot; read
+// lock-free on grid ticks.
+static csv_rate_fn_t csv_rate_fn = NULL;
 
 // Distinct diagnostics -- do NOT overload csv_rows_dropped (which means "queue full"):
 static uint32_t csv_cols_unmatched = 0;   // WIDE record whose (source,name) isn't a column
@@ -505,6 +511,35 @@ void csv_logger_set_engine_state_fn(csv_engine_state_fn_t fn)
     csv_engine_state_fn = fn;
 }
 
+void csv_logger_set_rate_fn(csv_rate_fn_t fn)
+{
+    csv_rate_fn = fn;
+}
+
+// Current FIXED-grid period in ms. Manual mode derives it from the latched csv_grid_hz; Auto
+// mode (issue #23) re-derives it from the provider's live measured rate on EVERY call, clamped
+// to the same 1-50 Hz envelope as the manual range, so the grid follows the real sweep rate as
+// it settles (the EMA needs a few sweeps after engine start). No provider / no measurement yet
+// -> CSV_GRID_HZ_DEFAULT. Called only from the writer task (grid ticks + queue-timeout sizing).
+static uint32_t csv_grid_period_ms(void)
+{
+    if (csv_grid_auto)
+    {
+        const float hz = csv_rate_fn ? csv_rate_fn() : 0.0f;
+        if (hz > 0.0f)
+        {
+            uint32_t gp = (uint32_t)(1000.0f / hz + 0.5f);
+            if (gp < 20u)   { gp = 20u; }     // 50 Hz cap (matches the manual range)
+            if (gp > 1000u) { gp = 1000u; }   // 1 Hz floor
+            return gp;
+        }
+        return 1000u / CSV_GRID_HZ_DEFAULT;
+    }
+    uint32_t gp = (csv_grid_hz > 0) ? (1000u / csv_grid_hz) : 100u;
+    if (gp < 1) { gp = 1; }
+    return gp;
+}
+
 static void csv_logger_task(void *pvParameters)
 {
     csv_record_t rec;
@@ -537,8 +572,7 @@ static void csv_logger_task(void *pvParameters)
         TickType_t rx_to = pdMS_TO_TICKS(250);
         if (csv_session_active && csv_grid_mode == CSV_GRID_FIXED)
         {
-            uint32_t gp = (csv_grid_hz > 0) ? (1000u / csv_grid_hz) : 100u;
-            if (gp < 1) gp = 1;
+            uint32_t gp = csv_grid_period_ms();
             if (gp < 250u) rx_to = pdMS_TO_TICKS(gp);
         }
         bool got_record = (xQueueReceive(csv_queue, &rec, rx_to) == pdPASS);
@@ -607,9 +641,7 @@ static void csv_logger_task(void *pvParameters)
         if (csv_session_active && csv_grid_mode == CSV_GRID_FIXED &&
             wc_timer_is_expired(&grid_timer))
         {
-            uint32_t gp = (csv_grid_hz > 0) ? (1000u / csv_grid_hz) : 100u;
-            if (gp < 1) gp = 1;
-            wc_timer_set(&grid_timer, gp);
+            wc_timer_set(&grid_timer, csv_grid_period_ms());
             if (!csv_emit_wide_row(esp_timer_get_time() / 1000))
             {
                 ESP_LOGE(TAG, "Wide row write failed on %s, closing", csv_file_path);
@@ -661,9 +693,13 @@ static void csv_logger_task(void *pvParameters)
 
             // Latch the grid config ONCE for this session (a snapshot of device_config;
             // single-writer thereafter so no torn cross-core read). A reboot/new session re-reads.
+            // hz==0 is the "auto" sentinel (issue #23): the period is then re-derived from the
+            // measured rate on every tick instead of this latched value.
             csv_grid_mode = (config_server_get_csv_grid_mode() == 0) ? CSV_GRID_EVENT : CSV_GRID_FIXED;
-            uint32_t hz;
-            csv_grid_hz = (config_server_get_csv_grid_hz(&hz) == 1) ? hz : CSV_GRID_HZ_DEFAULT;
+            uint32_t hz = 0;
+            int8_t hz_ok = config_server_get_csv_grid_hz(&hz);
+            csv_grid_auto = (hz_ok == 1 && hz == 0);
+            csv_grid_hz = (hz_ok == 1 && hz >= 1) ? hz : CSV_GRID_HZ_DEFAULT;
             if (csv_grid_hz < 1) csv_grid_hz = 1;
             if (csv_grid_hz > 50) csv_grid_hz = 50;
 
@@ -694,9 +730,7 @@ static void csv_logger_task(void *pvParameters)
             wc_timer_set(&flush_timer, CSV_LOGGER_FLUSH_PERIOD_MS);
             if (csv_grid_mode == CSV_GRID_FIXED)
             {
-                uint32_t gp = (csv_grid_hz > 0) ? (1000u / csv_grid_hz) : 100u;
-                if (gp < 1) gp = 1;
-                wc_timer_set(&grid_timer, gp);
+                wc_timer_set(&grid_timer, csv_grid_period_ms());
             }
         }
 
