@@ -283,6 +283,9 @@ static esp_err_t sdfm_list(httpd_req_t *req, const char *abspath)
             if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) { continue; }
             if (n >= SDFM_LIST_CAP) { truncated = true; break; }
             if (snprintf(child, sizeof(child), "%s/%s", abspath, e->d_name) >= (int)sizeof(child)) { continue; }
+            /* Device-managed roots are hidden from the Files page entirely (issue #26); they
+             * stay fully protected either way (sdfm_is_protected blocks delete/rename). */
+            if (strcmp(child, SDFM_SVI_DIR) == 0 || strcmp(child, SDFM_WICAN_DIR) == 0) { continue; }
             cJSON *item = cJSON_CreateObject();
             cJSON_AddStringToObject(item, "name", e->d_name);
             /* Tell the UI to hide rename/delete for reserved roots and anything
@@ -428,6 +431,13 @@ static esp_err_t sdfm_op_mkdir(httpd_req_t *req, const char *parent_rel, const c
     {
         return sdfm_reply(req, "400 Bad Request", "{\"error\":\"path too long\"}");
     }
+    /* Never let a user CREATE a device-managed name: the protected roots are hidden from
+     * listings (issue #26), so a folder minted here would instantly vanish from the UI and
+     * be undeletable (sdfm_is_protected) -- an irrecoverable trap through the product surface. */
+    if (sdfm_is_reserved(target) || sdfm_is_protected(target))
+    {
+        return sdfm_reply(req, "403 Forbidden", "{\"error\":\"reserved name\"}");
+    }
     struct stat st;
     if (stat(target, &st) == 0) { return sdfm_reply(req, "409 Conflict", "{\"error\":\"already exists\"}"); }
     if (mkdir(target, 0775) != 0)
@@ -489,6 +499,12 @@ static esp_err_t sdfm_op_rename(httpd_req_t *req, const char *rel, const char *n
     if (snprintf(slash + 1, sizeof(dest) - (slash + 1 - dest), "%s", name) >= (int)(sizeof(dest) - (slash + 1 - dest)))
     {
         return sdfm_reply(req, "400 Bad Request", "{\"error\":\"path too long\"}");
+    }
+    /* Same trap-guard as mkdir: renaming ONTO a device-managed name would make the user's
+     * folder vanish from listings (issue #26) yet stay delete/rename-protected forever. */
+    if (sdfm_is_reserved(dest) || sdfm_is_protected(dest))
+    {
+        return sdfm_reply(req, "403 Forbidden", "{\"error\":\"reserved name\"}");
     }
     if (stat(dest, &st) == 0) { return sdfm_reply(req, "409 Conflict", "{\"error\":\"destination exists\"}"); }
     if (rename(src, dest) != 0)
