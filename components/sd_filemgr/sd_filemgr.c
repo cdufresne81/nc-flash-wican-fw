@@ -179,6 +179,15 @@ static bool sdfm_is_protected(const char *abspath)
     return false;
 }
 
+/* Device-managed roots hidden from the Files page entirely (issue #26). Anything hidden
+ * MUST also be refused by the mkdir/rename guards below: a user folder minted under a
+ * hidden name would vanish from the UI yet stay delete/rename-protected forever.
+ * (EVENT_LOG_DIR is protected but deliberately NOT hidden -- it stays listed.) */
+static bool sdfm_is_hidden(const char *abspath)
+{
+    return strcmp(abspath, SDFM_SVI_DIR) == 0 || strcmp(abspath, SDFM_WICAN_DIR) == 0;
+}
+
 /* ---------------- small response helpers ---------------- */
 
 static esp_err_t sdfm_reply(httpd_req_t *req, const char *status, const char *json)
@@ -283,9 +292,7 @@ static esp_err_t sdfm_list(httpd_req_t *req, const char *abspath)
             if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) { continue; }
             if (n >= SDFM_LIST_CAP) { truncated = true; break; }
             if (snprintf(child, sizeof(child), "%s/%s", abspath, e->d_name) >= (int)sizeof(child)) { continue; }
-            /* Device-managed roots are hidden from the Files page entirely (issue #26); they
-             * stay fully protected either way (sdfm_is_protected blocks delete/rename). */
-            if (strcmp(child, SDFM_SVI_DIR) == 0 || strcmp(child, SDFM_WICAN_DIR) == 0) { continue; }
+            if (sdfm_is_hidden(child)) { continue; }
             cJSON *item = cJSON_CreateObject();
             cJSON_AddStringToObject(item, "name", e->d_name);
             /* Tell the UI to hide rename/delete for reserved roots and anything
@@ -431,10 +438,9 @@ static esp_err_t sdfm_op_mkdir(httpd_req_t *req, const char *parent_rel, const c
     {
         return sdfm_reply(req, "400 Bad Request", "{\"error\":\"path too long\"}");
     }
-    /* Never let a user CREATE a device-managed name: the protected roots are hidden from
-     * listings (issue #26), so a folder minted here would instantly vanish from the UI and
-     * be undeletable (sdfm_is_protected) -- an irrecoverable trap through the product surface. */
-    if (sdfm_is_reserved(target) || sdfm_is_protected(target))
+    /* Never let a user CREATE a reserved/protected/hidden name -- creating a hidden one
+     * would be an irrecoverable trap through the product surface (invisible + undeletable). */
+    if (sdfm_is_reserved(target) || sdfm_is_protected(target) || sdfm_is_hidden(target))
     {
         return sdfm_reply(req, "403 Forbidden", "{\"error\":\"reserved name\"}");
     }
@@ -500,9 +506,8 @@ static esp_err_t sdfm_op_rename(httpd_req_t *req, const char *rel, const char *n
     {
         return sdfm_reply(req, "400 Bad Request", "{\"error\":\"path too long\"}");
     }
-    /* Same trap-guard as mkdir: renaming ONTO a device-managed name would make the user's
-     * folder vanish from listings (issue #26) yet stay delete/rename-protected forever. */
-    if (sdfm_is_reserved(dest) || sdfm_is_protected(dest))
+    /* Same trap-guard as mkdir. */
+    if (sdfm_is_reserved(dest) || sdfm_is_protected(dest) || sdfm_is_hidden(dest))
     {
         return sdfm_reply(req, "403 Forbidden", "{\"error\":\"reserved name\"}");
     }

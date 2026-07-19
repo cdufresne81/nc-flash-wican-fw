@@ -535,9 +535,7 @@ static uint32_t csv_grid_period_ms(void)
         }
         return 1000u / CSV_GRID_HZ_DEFAULT;
     }
-    uint32_t gp = (csv_grid_hz > 0) ? (1000u / csv_grid_hz) : 100u;
-    if (gp < 1) { gp = 1; }
-    return gp;
+    return 1000u / csv_grid_hz;   /* latched to [1,50] at session open, so 20..1000 ms */
 }
 
 static void csv_logger_task(void *pvParameters)
@@ -700,7 +698,6 @@ static void csv_logger_task(void *pvParameters)
             int8_t hz_ok = config_server_get_csv_grid_hz(&hz);
             csv_grid_auto = (hz_ok == 1 && hz == 0);
             csv_grid_hz = (hz_ok == 1 && hz >= 1) ? hz : CSV_GRID_HZ_DEFAULT;
-            if (csv_grid_hz < 1) csv_grid_hz = 1;
             if (csv_grid_hz > 50) csv_grid_hz = 50;
 
             // Build the fixed column set from the AutoPID config. May briefly defer if the autopid

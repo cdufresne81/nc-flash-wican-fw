@@ -253,7 +253,6 @@ static void polllog_decode_broadcast(const twai_message_t *msg)
         return;
 
     const bool extd = (msg->extd != 0);
-    const int64_t now = esp_timer_get_time();
 
     for (uint32_t fi = 0; fi < s_cfg->can_filters_count; fi++)
     {
@@ -265,6 +264,10 @@ static void polllog_decode_broadcast(const twai_message_t *msg)
          * column-less CSV record (cols_unmatched) burning record-queue slots at up to 50 Hz. */
         if (f->is_vehicle_specific && !s_cfg->pid_specific_en)
             continue;
+
+        /* Timer read deferred to here: this function runs per drained frame at bus rate,
+         * and most frames match no filter. */
+        const int64_t now = esp_timer_get_time();
 
         /* evaluate_expression() does NOT bounds-check B0..B7: feed a full zero-padded 8-byte buf. */
         uint8_t buf[8] = {0};
