@@ -723,7 +723,11 @@ function addCustomCanFilterEntry(rowData = {}) {
                     <td>Unit:</td>
                     <td><input type="text" class="unit-input" value="${safe(p.unit)}" placeholder="Unit"></td>
                 </tr>
-                <tr>
+                <!-- Class + Period hidden here too: only the Legacy AutoPID ATMA monitor
+                     (process_can_filter_frame) honors a filter parameter's period; poll_log
+                     and fast_log decode broadcasts with their own fixed throttles. Inputs
+                     stay in the DOM for the auto_pid.json round-trip. -->
+                <tr style="display:none">
                     <td>Class:</td>
                     <td><input type="text" class="class-input" value="${safe(p.class)}" placeholder="Class"></td>
                 </tr>
@@ -735,7 +739,7 @@ function addCustomCanFilterEntry(rowData = {}) {
                     <td>Max Value:</td>
                     <td><input type="number" class="max-input" value="${safe(p.max)}" step="0.01" placeholder="Max"></td>
                 </tr>
-                <tr>
+                <tr style="display:none">
                     <td>Period(ms):</td>
                     <td><input type="number" class="period-input" value="${safe(p.period || '5000')}" min="100" max="60000"></td>
                 </tr>
