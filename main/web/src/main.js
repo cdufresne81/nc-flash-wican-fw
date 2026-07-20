@@ -563,6 +563,14 @@ function promoteNewEntry(entry) {
     content?.querySelector('input')?.focus();
 }
 
+// Delete drops the row (and, on the next Store, its CSV column) with no undo,
+// so guard it behind a confirm that names the row by its title. Shared by all
+// three list builders — each row carries a .pid-title.
+function confirmDeleteRow(entry) {
+    const label = entry.querySelector('.pid-title')?.textContent.trim();
+    return confirm(label ? `Delete "${label}"?` : 'Delete this entry?');
+}
+
 // issue #33: moving the DOM row IS the reorder — storeAutoTableData walks the DOM
 // in document order, so the saved array order (and the CSV column order that
 // follows from it) tracks the rows with no serialization change. The handle
@@ -759,6 +767,7 @@ if (enabledChk) {
 }
 
 deleteBtn.addEventListener('click', () => {
+    if (!confirmDeleteRow(entry)) return;
     entry.remove();
     enableAutoStoreButton();
 });
@@ -920,6 +929,7 @@ function addCustomCanFilterEntry(rowData = {}) {
     }
 
     deleteBtn.addEventListener('click', () => {
+        if (!confirmDeleteRow(entry)) return;
         entry.remove();
         enableAutoStoreButton();
     });
@@ -1030,6 +1040,7 @@ function addCalculatedChannelEntry(rowData = {}) {
     }
 
     deleteBtn.addEventListener('click', () => {
+        if (!confirmDeleteRow(entry)) return;
         entry.remove();
         enableAutoStoreButton();
     });
