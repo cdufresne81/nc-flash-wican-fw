@@ -526,6 +526,9 @@ async function runCanFilterTest(kind, entry) {
     }
 }
 
+// Attribute-safe HTML escaper shared by the three row builders' innerHTML templates.
+const safe = (v)=>String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
 // The three "New ..." buttons land the fresh row at the TOP of its list, expanded,
 // with the first field focused (issue #36). Only the button path promotes;
 // loadAutoTable keeps appending, so a stored config loads back in array order.
@@ -535,8 +538,13 @@ function promoteNewEntry(entry) {
     if (container.firstElementChild !== entry) {
         container.insertBefore(entry, container.firstElementChild);
     }
-    entry.querySelector('.collapse-btn')?.click();
-    entry.querySelector('.pid-content input')?.focus();
+    // .click() on the collapse control is a TOGGLE — expand only when the builder
+    // emitted the row collapsed, so an already-expanded row is never re-collapsed.
+    const content = entry.querySelector('.pid-content');
+    if (content && getComputedStyle(content).display === 'none') {
+        entry.querySelector('.collapse-btn')?.click();
+    }
+    content?.querySelector('input')?.focus();
 }
 
 // issue #33: moving the DOM row IS the reorder — storeAutoTableData walks the DOM
@@ -568,7 +576,6 @@ function addCollapsibleRow(rowData = {}) {
     const container = document.querySelector('.pid-entries');
     const entry = document.createElement('div');
     entry.className = 'pid-entry';
-    const safe = (v)=>String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
     const enabledChecked = (rowData.enabled === false || rowData.Enabled === false) ? '' : 'checked';
 
@@ -749,7 +756,6 @@ function addCustomCanFilterEntry(rowData = {}) {
     const entry = document.createElement('div');
     entry.className = 'custom-canfilter-entry';
 
-    const safe = (v)=>String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     const titleText = `${frameIdValue || 'Frame'} - ${(p.name || rowData.name || 'New Parameter')}`;
 
     entry.innerHTML = `
@@ -890,7 +896,6 @@ function addCalculatedChannelEntry(rowData = {}) {
     const container = document.querySelector('.calculated-entries');
     if (!container) return;
 
-    const safe = (v)=>String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     const name = (rowData.name !== undefined && rowData.name !== null) ? String(rowData.name) : 'New Channel';
     const expr = (rowData.expression !== undefined && rowData.expression !== null) ? String(rowData.expression) : '';
     const unit = (rowData.unit !== undefined && rowData.unit !== null) ? String(rowData.unit) : '';
@@ -1129,6 +1134,19 @@ function enableAutoStoreButton() {
     document.getElementById("custom_pid_store").disabled = false;
 }
     
+// Pure metadata (issue #34): description/comment are never read by the engine, and
+// an empty field emits no key at all, so no-note configs stay byte-identical.
+function emitOptionalNotes(target, entry) {
+    const description = entry.querySelector('.description-input')?.value || '';
+    if (description) {
+        target.description = description;
+    }
+    const comment = entry.querySelector('.comment-input')?.value || '';
+    if (comment) {
+        target.comment = comment;
+    }
+}
+
 async function storeAutoTableData() {
     try {
         const custom_pid_data = [];
@@ -1157,16 +1175,7 @@ async function storeAutoTableData() {
                     Period: entry.querySelector('.period-input')?.value || '',
                     enabled: entry.querySelector('.enabled-chk')?.checked !== false
                 };
-                // Pure metadata (issue #34): the engine never reads these, and an empty
-                // field emits no key at all, so no-note configs stay byte-identical.
-                const pidDescription = entry.querySelector('.description-input')?.value || '';
-                if (pidDescription) {
-                    pidData.description = pidDescription;
-                }
-                const pidComment = entry.querySelector('.comment-input')?.value || '';
-                if (pidComment) {
-                    pidData.comment = pidComment;
-                }
+                emitOptionalNotes(pidData, entry);
 
                 if (pidData.Name.length === 0 || pidData.Name.length >= 32) {
                     throw new Error("Name must not be empty and must be less than 32 characters");
@@ -1217,15 +1226,7 @@ async function storeAutoTableData() {
                     max: entry.querySelector('.max-input')?.value || '',
                     enabled: entry.querySelector('.enabled-chk')?.checked !== false
                 };
-                // Same omit-when-empty contract as the PID metadata (issue #34).
-                const filterDescription = entry.querySelector('.description-input')?.value || '';
-                if (filterDescription) {
-                    filterParam.description = filterDescription;
-                }
-                const filterComment = entry.querySelector('.comment-input')?.value || '';
-                if (filterComment) {
-                    filterParam.comment = filterComment;
-                }
+                emitOptionalNotes(filterParam, entry);
                 runGroup.parameters.push(filterParam);
             });
         }
