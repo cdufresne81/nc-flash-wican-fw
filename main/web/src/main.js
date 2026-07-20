@@ -549,6 +549,7 @@ function wireRowReorder(entry) {
         const prev = entry.previousElementSibling;
         if (prev) {
             entry.parentNode.insertBefore(entry, prev);
+            e.currentTarget.focus();   // reinsertion blurs the button; keep keyboard flow
             enableAutoStoreButton();
         }
     });
@@ -557,6 +558,7 @@ function wireRowReorder(entry) {
         const next = entry.nextElementSibling;
         if (next) {
             entry.parentNode.insertBefore(entry, next.nextSibling);
+            e.currentTarget.focus();   // reinsertion blurs the button; keep keyboard flow
             enableAutoStoreButton();
         }
     });
@@ -1182,10 +1184,16 @@ async function storeAutoTableData() {
             });
         }
 
-        // Custom CAN filters (group by frame_id)
+        // Custom CAN filters: group CONTIGUOUS runs of the same frame_id, not a global
+        // Map — a global merge cannot represent an interleaved row order, which made
+        // some ▲/▼ moves save byte-identical JSON and silently revert on reload
+        // (issue #33). The firmware parses can_filters[] by array index and every
+        // matcher walks all entries, so a frame_id split across two runs decodes
+        // identically to one merged entry.
         const customFilterEntries = document.querySelectorAll('.custom-canfilter-entry');
         if (customFilterEntries.length > 0) {
-            const grouped = new Map();
+            let runKey = null;
+            let runGroup = null;
             customFilterEntries.forEach(entry => {
                 const fidRaw = entry.querySelector('.frame-id-input')?.value || '';
                 const fidNum = normalizeFrameIdInputToNumber(fidRaw);
@@ -1194,8 +1202,10 @@ async function storeAutoTableData() {
                     throw new Error('Broadcast PID Frame ID is required');
                 }
                 const key = (fidNum !== null) ? `n:${fidNum}` : `s:${String(fidRaw).trim().toLowerCase()}`;
-                if (!grouped.has(key)) {
-                    grouped.set(key, { frame_id: frameIdOut, parameters: [] });
+                if (key !== runKey) {
+                    runKey = key;
+                    runGroup = { frame_id: frameIdOut, parameters: [] };
+                    custom_can_filters.push(runGroup);
                 }
                 const filterParam = {
                     name: entry.querySelector('.name-input')?.value || '',
@@ -1216,9 +1226,8 @@ async function storeAutoTableData() {
                 if (filterComment) {
                     filterParam.comment = filterComment;
                 }
-                grouped.get(key).parameters.push(filterParam);
+                runGroup.parameters.push(filterParam);
             });
-            custom_can_filters.push(...Array.from(grouped.values()));
         }
 
         // Calculated channels (Task #17): collect name/expression/unit/enabled rows. Carried
