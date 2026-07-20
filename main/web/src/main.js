@@ -305,7 +305,8 @@ async function checkFirmwareUpdate() {
 
 const pidEntryStyles = `
     .pid-entry,
-    .custom-canfilter-entry {
+    .custom-canfilter-entry,
+    .calculated-entry {
         border: 1px solid #e2e8f0;
         background: #fff;
         border-radius: 6px;
