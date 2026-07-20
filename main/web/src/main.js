@@ -299,13 +299,14 @@ async function checkFirmwareUpdate() {
     }
 
     function addRowAutoTable() {
-        addCollapsibleRow();
+        promoteNewEntry(addCollapsibleRow());
         enableAutoStoreButton();
     }
 
 const pidEntryStyles = `
     .pid-entry,
-    .custom-canfilter-entry {
+    .custom-canfilter-entry,
+    .calculated-entry {
         border: 1px solid #e2e8f0;
         background: #fff;
         border-radius: 6px;
@@ -354,7 +355,31 @@ const pidEntryStyles = `
         padding: 2px 4px;
         color: #334155;
     }
-    
+
+    .drag-handle {
+        border: none;
+        background: transparent;
+        font-size: 0.75rem;
+        letter-spacing: -2px;
+        cursor: grab;
+        padding: 2px 6px 2px 2px;
+        color: #64748b;
+        touch-action: none;   /* the handle owns the touch gesture; without this the page scrolls instead of dragging */
+        user-select: none;
+        -webkit-user-select: none;
+    }
+
+    .dragging {
+        opacity: 0.9;
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.25);
+        position: relative;
+        z-index: 10;
+    }
+
+    .dragging .drag-handle {
+        cursor: grabbing;
+    }
+
     .pid-content {
         padding: 8px 10px;
     }
@@ -393,128 +418,244 @@ const pidEntryStyles = `
     }
 `;
 
-async function runPidTest(entry) {
-    const resultEl = entry.querySelector('.test-result');
-    const buttonEl = entry.querySelector('.test-btn');
-    if (!resultEl || !buttonEl) return;
-
-    const payload = { kind: 'custom' };
-    const init = document.getElementById('initialisation')?.value || '';
-    const pid = entry.querySelector('.pid-input')?.value || '';
-    const pidInit = entry.querySelector('.init-input')?.value || '';
-    const expr = entry.querySelector('.expression-input')?.value || '';
-    if (init.trim()) payload.init = init;
-    payload.pid = pid.trim();
-    if (pidInit.trim()) payload.pid_init = pidInit;
-    payload.expr = expr;
-
-    buttonEl.disabled = true;
-    resultEl.style.display = 'inline-flex';
-    resultEl.classList.add('status-indicator');
-    resultEl.classList.remove('status-connected', 'status-disconnected');
-    resultEl.textContent = 'Testing…';
-
-    try {
-        const res = await fetch('/autopid/test_pid', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data) {
-            resultEl.classList.add('status-disconnected');
-            resultEl.textContent = `Error (${res.status})`;
-            return;
-        }
-        if (data.ok) {
-            resultEl.classList.add('status-connected');
-            resultEl.classList.remove('status-disconnected');
-            let unit = (data.unit || '').trim();
-            if (!unit) {
-                unit = (entry.querySelector('.unit-input')?.value || '').trim();
-            }
-            const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
-            resultEl.textContent = unit ? `${valueText} ${unit}` : valueText;
-        } else {
-            resultEl.classList.add('status-disconnected');
-            resultEl.classList.remove('status-connected');
-            resultEl.textContent = data.error ? `Error: ${data.error}` : 'Error';
-        }
-    } catch (e) {
-        resultEl.classList.add('status-disconnected');
-        resultEl.classList.remove('status-connected');
-        resultEl.textContent = 'Error';
-    } finally {
-        buttonEl.disabled = false;
+// Test results are shown two ways: a compact colored chip on the row (a persistent
+// pass/fail marker) and the shared toast (showNotification) carrying the full
+// message — the chip is only wide enough for a word and would ellipsize a real
+// error, which was the "doesn't display the message fully" bug.
+function showTestOutcome(resultEl, ok, chipText, detail, toastColor) {
+    if (resultEl) {
+        resultEl.style.display = 'inline-flex';
+        resultEl.classList.add('status-indicator');
+        resultEl.classList.toggle('status-connected', ok);
+        resultEl.classList.toggle('status-disconnected', !ok);
+        resultEl.textContent = chipText;
     }
+    showNotification(safe(detail), toastColor || (ok ? 'green' : 'red'), ok ? 4000 : 7000);
 }
 
-async function runCanFilterTest(kind, entry) {
+// A calculated channel is derived on-device from OTHER channels' values, so there
+// is nothing to poll from the ECU to "test" — instead validate the expression the
+// way the firmware parser reads it: check the syntax, then that every name it
+// references is a channel configured on this page. Pure client-side, so it works
+// regardless of the running protocol (the live PID/filter tests need AutoPID).
+function runCalcTest(entry) {
     const resultEl = entry.querySelector('.test-result');
-    const buttonEl = entry.querySelector('.test-btn');
-    if (!resultEl || !buttonEl) return;
-
-    const frameIdStr = entry.querySelector('.frame-id-input')?.value || '';
-    const expr = entry.querySelector('.expression-input')?.value || '';
-    const unit = (entry.querySelector('.unit-input')?.value || '').trim();
-
-    const frameIdNum = normalizeFrameIdInputToNumber(frameIdStr);
-    if (frameIdNum === null) {
-        resultEl.style.display = 'inline-flex';
-        resultEl.classList.add('status-indicator', 'status-disconnected');
-        resultEl.classList.remove('status-connected');
-        resultEl.textContent = 'Invalid Frame ID';
+    const expr = (entry.querySelector('.expression-input')?.value || '').trim();
+    if (!expr) {
+        showTestOutcome(resultEl, false, 'Empty', 'Missing expression — enter something like "MAP - BARO".');
         return;
     }
-    if (!expr.trim()) {
-        resultEl.style.display = 'inline-flex';
-        resultEl.classList.add('status-indicator', 'status-disconnected');
-        resultEl.classList.remove('status-connected');
-        resultEl.textContent = 'Missing Expression';
+    const parsed = parseCalcExpression(expr);
+    if (!parsed.ok) {
+        showTestOutcome(resultEl, false, 'Invalid', `Invalid expression: ${parsed.error}`);
         return;
     }
+    const selfName = (entry.querySelector('.name-input')?.value || '').trim();
+    const known = collectChannelNames(entry);
+    const unknown = parsed.names.filter((n) => n !== selfName && !known.has(n));
+    if (unknown.length) {
+        // Syntax is fine; the names may be built-in channels the editor doesn't
+        // list, so warn (yellow) rather than fail the test.
+        showTestOutcome(resultEl, true, 'Check refs',
+            `Expression parses, but no configured channel is named: ${unknown.join(', ')}. Ignore this if they are built-in channels.`,
+            'yellow');
+        return;
+    }
+    const note = parsed.names.length
+        ? ` (references ${parsed.names.length} channel${parsed.names.length > 1 ? 's' : ''})`
+        : ' (constant value)';
+    showTestOutcome(resultEl, true, 'Valid', `Expression is valid${note}.`);
+}
 
-    const payload = {
-        kind,
-        frame_id: frameIdNum,
-        expr: expr,
-    };
+// Recursive-descent validator for calculated-channel expressions, mirroring the
+// firmware grammar: numbers, channel identifiers, + - * /, parentheses and unary
+// minus. No eval — every token is matched explicitly, so a malformed expression
+// returns a clean error instead of throwing. Returns the referenced names on ok.
+function parseCalcExpression(src) {
+    const raw = src.match(/[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|[-+*/()]|\S/g) || [];
+    const tokens = [];
+    for (const t of raw) {
+        if (/^[A-Za-z_]/.test(t)) tokens.push({ type: 'name', text: t });
+        else if (/^\d/.test(t)) tokens.push({ type: 'num', text: t });
+        else if (t.length === 1 && '+-*/()'.includes(t)) tokens.push({ type: t, text: t });
+        else return { ok: false, error: `unexpected "${t}"` };
+    }
+    if (!tokens.length) return { ok: false, error: 'empty expression' };
 
-    buttonEl.disabled = true;
-    resultEl.style.display = 'inline-flex';
-    resultEl.classList.add('status-indicator');
-    resultEl.classList.remove('status-connected', 'status-disconnected');
-    resultEl.textContent = 'Testing…';
+    let pos = 0;
+    const names = new Set();
+    const peek = () => tokens[pos];
 
-    try {
-        const res = await fetch('/autopid/test_can_filter', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data) {
-            resultEl.classList.add('status-disconnected');
-            resultEl.textContent = `Error (${res.status})`;
-            return;
+    function parseExpr() {
+        let r = parseTerm();
+        if (!r.ok) return r;
+        while (peek() && (peek().type === '+' || peek().type === '-')) {
+            pos++;
+            r = parseTerm();
+            if (!r.ok) return r;
         }
-        if (data.ok) {
-            resultEl.classList.add('status-connected');
-            resultEl.classList.remove('status-disconnected');
-            const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
-            resultEl.textContent = unit ? `${valueText} ${unit}` : valueText;
+        return { ok: true };
+    }
+    function parseTerm() {
+        let r = parseFactor();
+        if (!r.ok) return r;
+        while (peek() && (peek().type === '*' || peek().type === '/')) {
+            pos++;
+            r = parseFactor();
+            if (!r.ok) return r;
+        }
+        return { ok: true };
+    }
+    function parseFactor() {
+        const t = peek();
+        if (!t) return { ok: false, error: 'expression ends early' };
+        if (t.type === '+' || t.type === '-') { pos++; return parseFactor(); }
+        if (t.type === 'num') { pos++; return { ok: true }; }
+        if (t.type === 'name') { names.add(t.text); pos++; return { ok: true }; }
+        if (t.type === '(') {
+            pos++;
+            const inner = parseExpr();
+            if (!inner.ok) return inner;
+            if (!peek() || peek().type !== ')') return { ok: false, error: 'missing ")"' };
+            pos++;
+            return { ok: true };
+        }
+        return { ok: false, error: `unexpected "${t.text}"` };
+    }
+
+    const r = parseExpr();
+    if (!r.ok) return r;
+    if (pos !== tokens.length) return { ok: false, error: `unexpected "${tokens[pos].text}"` };
+    return { ok: true, names: [...names] };
+}
+
+// The names a calculated expression may reference: the output name of every
+// configured channel — polled PIDs, broadcast filters and other calculated
+// channels — except the row being tested.
+function collectChannelNames(selfEntry) {
+    const names = new Set();
+    document.querySelectorAll('.pid-entry, .custom-canfilter-entry, .calculated-entry').forEach((row) => {
+        if (row === selfEntry) return;
+        const n = (row.querySelector('.name-input')?.value || '').trim();
+        if (n) names.add(n);
+    });
+    return names;
+}
+
+// Attribute-safe HTML escaper shared by the three row builders' innerHTML templates.
+const safe = (v)=>String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// The three "New ..." buttons land the fresh row at the TOP of its list, expanded,
+// with the first field focused (issue #36). Only the button path promotes;
+// loadAutoTable keeps appending, so a stored config loads back in array order.
+function promoteNewEntry(entry) {
+    if (!entry || !entry.parentNode) return;
+    const container = entry.parentNode;
+    if (container.firstElementChild !== entry) {
+        container.insertBefore(entry, container.firstElementChild);
+    }
+    // .click() on the collapse control is a TOGGLE — expand only when the builder
+    // emitted the row collapsed, so an already-expanded row is never re-collapsed.
+    const content = entry.querySelector('.pid-content');
+    if (content && getComputedStyle(content).display === 'none') {
+        entry.querySelector('.collapse-btn')?.click();
+    }
+    content?.querySelector('input')?.focus();
+}
+
+// Delete drops the row (and, on the next Store, its CSV column) with no undo,
+// so guard it behind a confirm that names the row by its title. Shared by all
+// three list builders — each row carries a .pid-title.
+function confirmDeleteRow(entry) {
+    const label = entry.querySelector('.pid-title')?.textContent.trim();
+    return confirm(label ? `Delete "${label}"?` : 'Delete this entry?');
+}
+
+// issue #33: moving the DOM row IS the reorder — storeAutoTableData walks the DOM
+// in document order, so the saved array order (and the CSV column order that
+// follows from it) tracks the rows with no serialization change. The handle
+// drags via pointer events (its touch-action:none makes the same code work on
+// phones), and ArrowUp/ArrowDown move one slot while it has focus, so reorder
+// stays keyboard-accessible without dedicated ▲/▼ buttons.
+function wireRowDrag(entry) {
+    const handle = entry.querySelector('.drag-handle');
+    if (!handle) return;
+
+    // The whole .pid-header click toggles collapse; the handle must not.
+    handle.addEventListener('click', (e) => e.stopPropagation());
+
+    handle.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.key === 'ArrowUp') {
+            const prev = entry.previousElementSibling;
+            if (!prev) return;
+            entry.parentNode.insertBefore(entry, prev);
         } else {
-            resultEl.classList.add('status-disconnected');
-            resultEl.classList.remove('status-connected');
-            resultEl.textContent = data.error ? `Error: ${data.error}` : 'Error';
+            const next = entry.nextElementSibling;
+            if (!next) return;
+            entry.parentNode.insertBefore(entry, next.nextSibling);
         }
-    } catch (e) {
-        resultEl.classList.add('status-disconnected');
-        resultEl.classList.remove('status-connected');
-        resultEl.textContent = 'Error';
-    } finally {
-        buttonEl.disabled = false;
-    }
+        handle.focus();   // reinsertion blurs the handle; keep keyboard flow
+        enableAutoStoreButton();
+    });
+
+    handle.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const container = entry.parentNode;
+        const startNext = entry.nextElementSibling;
+        const pointerId = e.pointerId;
+        let lastY = e.clientY;
+        let raf = 0;
+
+        // Capture on document.body, NOT the handle: insertBefore disconnects the
+        // row for an instant, and the browser silently releases pointer capture
+        // on a disconnected element — captured on the handle, the drag froze
+        // after the first swap. body is never disconnected, and the move/up
+        // listeners sit on window so delivery never depends on what's under
+        // the pointer.
+        try { document.body.setPointerCapture(pointerId); } catch (_) {}
+        entry.classList.add('dragging');
+
+        // Reorder runs on a rAF loop rather than in pointermove: edge-autoscroll
+        // must keep scrolling (and re-picking the drop slot) while the finger
+        // holds still at the viewport edge, where no move events arrive.
+        const tick = () => {
+            const EDGE = 56;
+            if (lastY < EDGE) {
+                window.scrollBy(0, -Math.ceil((EDGE - lastY) / 4));
+            } else if (lastY > window.innerHeight - EDGE) {
+                window.scrollBy(0, Math.ceil((lastY - (window.innerHeight - EDGE)) / 4));
+            }
+            let before = null;
+            for (const sib of container.children) {
+                if (sib === entry) continue;
+                const r = sib.getBoundingClientRect();
+                if (lastY < r.top + r.height / 2) { before = sib; break; }
+            }
+            if (before !== entry.nextElementSibling) {
+                container.insertBefore(entry, before);
+            }
+            raf = requestAnimationFrame(tick);
+        };
+        const onMove = (ev) => { if (ev.pointerId === pointerId) lastY = ev.clientY; };
+        const finish = (ev) => {
+            if (ev.pointerId !== pointerId) return;
+            cancelAnimationFrame(raf);
+            entry.classList.remove('dragging');
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', finish);
+            window.removeEventListener('pointercancel', finish);
+            if (entry.nextElementSibling !== startNext) enableAutoStoreButton();
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', finish);
+        window.addEventListener('pointercancel', finish);
+        raf = requestAnimationFrame(tick);
+    });
 }
 
 function addCollapsibleRow(rowData = {}) {
@@ -527,12 +668,11 @@ function addCollapsibleRow(rowData = {}) {
     entry.innerHTML = `
         <div class="pid-header">
             <div class="header-left">
-                <button type="button" class="collapse-btn">▼</button>
+                <button type="button" class="collapse-btn">▸</button>
                 <span class="pid-title">New PID</span>
             </div>
             <div class="header-right">
-                <span class="test-result status-indicator" style="display:none"></span>
-                <button type="button" class="test-btn">Test</button>
+                <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
                     <input type="checkbox" class="enabled-chk" ${enabledChecked}>
                     Enabled
@@ -544,27 +684,27 @@ function addCollapsibleRow(rowData = {}) {
             <table class="compact-form-table">
                 <tr>
                     <td>Name:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td>
-                    <td><input type="text" class="name-input" value="${rowData.Name || ''}" 
+                    <td><input type="text" class="name-input" value="${safe(rowData.Name || '')}"
                         placeholder="Parameter Name"></td>
                 </tr>
                 <tr>
                     <td>Init:</td>
-                    <td><input type="text" class="init-input" value="${rowData.Init || ''}" 
+                    <td><input type="text" class="init-input" value="${safe(rowData.Init || '')}"
                         placeholder="PID Init"></td>
                 </tr>
                 <tr>
                     <td>PID:</td>
-                    <td><input type="text" class="pid-input" value="${rowData.PID || ''}" 
+                    <td><input type="text" class="pid-input" value="${safe(rowData.PID || '')}"
                         placeholder="PID"></td>
                 </tr>
                 <tr>
                     <td>Expression:</td>
-                    <td><input type="text" class="expression-input" value="${rowData.Expression || ''}" 
+                    <td><input type="text" class="expression-input" value="${safe(rowData.Expression || '')}"
                         placeholder="Enter expression"></td>
                 </tr>
                 <tr>
                     <td>Unit:</td>
-                    <td><input type="text" class="unit-input" value="${rowData.Unit || ''}" 
+                    <td><input type="text" class="unit-input" value="${safe(rowData.Unit || '')}"
                         placeholder="e.g. V, °C, kPa"></td>
                 </tr>
                 <!-- Class + Period hidden: Class is upstream HA/MQTT sensor metadata nothing
@@ -574,22 +714,32 @@ function addCollapsibleRow(rowData = {}) {
                      keeps round-tripping the auto_pid.json keys. -->
                 <tr style="display:none">
                     <td>Class:</td>
-                    <td><input type="text" class="class-input" value="${rowData.Class || ''}"
+                    <td><input type="text" class="class-input" value="${safe(rowData.Class || '')}"
                         placeholder="e.g. voltage, temp"></td>
                 </tr>
                 <tr>
                     <td>Min Value:</td>
-                    <td><input type="number" class="min-value-input" value="${rowData.MinValue || ''}" 
+                    <td><input type="number" class="min-value-input" value="${safe(rowData.MinValue || '')}"
                         step="0.01" placeholder="Minimum value"></td>
                 </tr>
                 <tr>
                     <td>Max Value:</td>
-                    <td><input type="number" class="max-value-input" value="${rowData.MaxValue || ''}" 
+                    <td><input type="number" class="max-value-input" value="${safe(rowData.MaxValue || '')}"
                         step="0.01" placeholder="Maximum value"></td>
+                </tr>
+                <tr>
+                    <td>Description:</td>
+                    <td><input type="text" class="description-input" value="${safe(rowData.description || '')}"
+                        placeholder="What this PID measures"></td>
+                </tr>
+                <tr>
+                    <td>Comment:</td>
+                    <td><input type="text" class="comment-input" value="${safe(rowData.comment || '')}"
+                        placeholder="Optional note (never sent to the ECU)"></td>
                 </tr>
                 <tr style="display:none">
                     <td>Period(ms):</td>
-                    <td><input type="number" class="period-input" value="${rowData.Period || ''}"
+                    <td><input type="number" class="period-input" value="${safe(rowData.Period || '')}"
                         placeholder="ms"></td>
                 </tr>
             </table>
@@ -601,7 +751,6 @@ style.textContent = pidEntryStyles;
 document.head.appendChild(style);
 const header = entry.querySelector('.pid-header');
 const deleteBtn = entry.querySelector('.delete-btn');
-const testBtn = entry.querySelector('.test-btn');
 const collapseBtn = entry.querySelector('.collapse-btn');
 const content = entry.querySelector('.pid-content');
 const parameterTitle = entry.querySelector('.pid-title');
@@ -615,20 +764,16 @@ if (enabledChk) {
 }
 
 deleteBtn.addEventListener('click', () => {
+    if (!confirmDeleteRow(entry)) return;
     entry.remove();
     enableAutoStoreButton();
-});
-
-testBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    runPidTest(entry);
 });
 
 const toggleCollapse = (e) => {
     e.stopPropagation();
     const isHidden = content.style.display === 'none' || getComputedStyle(content).display === 'none';
     content.style.display = isHidden ? 'block' : 'none';
-    collapseBtn.textContent = isHidden ? '▲' : '▼';
+    collapseBtn.textContent = isHidden ? '▾' : '▸';
 };
 
 header.addEventListener('click', toggleCollapse);
@@ -646,7 +791,10 @@ entry.querySelectorAll('input, select').forEach(input => {
     input.addEventListener('input', enableAutoStoreButton);
 });
 
+wireRowDrag(entry);
+
 container.appendChild(entry);
+return entry;
 }
 
 function normalizeFrameIdInputToNumber(v) {
@@ -686,18 +834,16 @@ function addCustomCanFilterEntry(rowData = {}) {
     const entry = document.createElement('div');
     entry.className = 'custom-canfilter-entry';
 
-    const safe = (v)=>String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     const titleText = `${frameIdValue || 'Frame'} - ${(p.name || rowData.name || 'New Parameter')}`;
 
     entry.innerHTML = `
         <div class="pid-header">
             <div class="header-left">
-                <button type="button" class="collapse-btn">▼</button>
+                <button type="button" class="collapse-btn">▸</button>
                 <span class="pid-title">${safe(titleText)}</span>
             </div>
             <div class="header-right">
-                <span class="test-result status-indicator" style="display:none"></span>
-                <button type="button" class="test-btn">Test</button>
+                <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
                     <input type="checkbox" class="enabled-chk" ${(p.enabled === false || rowData.enabled === false) ? '' : 'checked'}>
                     Enabled
@@ -739,6 +885,14 @@ function addCustomCanFilterEntry(rowData = {}) {
                     <td>Max Value:</td>
                     <td><input type="number" class="max-input" value="${safe(p.max)}" step="0.01" placeholder="Max"></td>
                 </tr>
+                <tr>
+                    <td>Description:</td>
+                    <td><input type="text" class="description-input" value="${safe(p.description)}" placeholder="What this parameter measures"></td>
+                </tr>
+                <tr>
+                    <td>Comment:</td>
+                    <td><input type="text" class="comment-input" value="${safe(p.comment)}" placeholder="Optional note (never sent to the ECU)"></td>
+                </tr>
                 <tr style="display:none">
                     <td>Period(ms):</td>
                     <td><input type="number" class="period-input" value="${safe(p.period || '5000')}" min="100" max="60000"></td>
@@ -753,7 +907,6 @@ function addCustomCanFilterEntry(rowData = {}) {
 
     const header = entry.querySelector('.pid-header');
     const deleteBtn = entry.querySelector('.delete-btn');
-    const testBtn = entry.querySelector('.test-btn');
     const collapseBtn = entry.querySelector('.collapse-btn');
     const content = entry.querySelector('.pid-content');
     const titleEl = entry.querySelector('.pid-title');
@@ -765,22 +918,16 @@ function addCustomCanFilterEntry(rowData = {}) {
     }
 
     deleteBtn.addEventListener('click', () => {
+        if (!confirmDeleteRow(entry)) return;
         entry.remove();
         enableAutoStoreButton();
     });
-
-    if (testBtn) {
-        testBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            runCanFilterTest('custom', entry);
-        });
-    }
 
     const toggleCollapse = (e) => {
         e.stopPropagation();
         const isHidden = content.style.display === 'none';
         content.style.display = isHidden ? 'block' : 'none';
-        collapseBtn.textContent = isHidden ? '▲' : '▼';
+        collapseBtn.textContent = isHidden ? '▾' : '▸';
     };
     header.addEventListener('click', toggleCollapse);
     collapseBtn.addEventListener('click', toggleCollapse);
@@ -796,15 +943,18 @@ function addCustomCanFilterEntry(rowData = {}) {
         input.addEventListener('change', () => { updateTitle(); enableAutoStoreButton(); });
     });
 
+    wireRowDrag(entry);
+
     container.appendChild(entry);
     enableAutoStoreButton();
+    return entry;
 }
 
 function addCustomFilterRow() {
-    addCustomCanFilterEntry({
+    promoteNewEntry(addCustomCanFilterEntry({
         frame_id: '',
         parameter: { name: 'New Parameter', expression: '', unit: '', class: '', period: '5000', min: '', max: '' }
-    });
+    }));
 }
 
 // Calculated channels (Task #17): a derived channel computed on-device from OTHER channel
@@ -814,7 +964,6 @@ function addCalculatedChannelEntry(rowData = {}) {
     const container = document.querySelector('.calculated-entries');
     if (!container) return;
 
-    const safe = (v)=>String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     const name = (rowData.name !== undefined && rowData.name !== null) ? String(rowData.name) : 'New Channel';
     const expr = (rowData.expression !== undefined && rowData.expression !== null) ? String(rowData.expression) : '';
     const unit = (rowData.unit !== undefined && rowData.unit !== null) ? String(rowData.unit) : '';
@@ -826,10 +975,13 @@ function addCalculatedChannelEntry(rowData = {}) {
     entry.innerHTML = `
         <div class="pid-header">
             <div class="header-left">
-                <button type="button" class="collapse-btn">▼</button>
+                <button type="button" class="collapse-btn">▸</button>
                 <span class="pid-title">${safe(name)}</span>
             </div>
             <div class="header-right">
+                <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
+                <span class="test-result status-indicator" style="display:none"></span>
+                <button type="button" class="test-btn">Test</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
                     <input type="checkbox" class="enabled-chk" ${enabled ? 'checked' : ''}>
                     Enabled
@@ -872,15 +1024,24 @@ function addCalculatedChannelEntry(rowData = {}) {
     }
 
     deleteBtn.addEventListener('click', () => {
+        if (!confirmDeleteRow(entry)) return;
         entry.remove();
         enableAutoStoreButton();
     });
+
+    const testBtn = entry.querySelector('.test-btn');
+    if (testBtn) {
+        testBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            runCalcTest(entry);
+        });
+    }
 
     const toggleCollapse = (e) => {
         e.stopPropagation();
         const isHidden = content.style.display === 'none';
         content.style.display = isHidden ? 'block' : 'none';
-        collapseBtn.textContent = isHidden ? '▲' : '▼';
+        collapseBtn.textContent = isHidden ? '▾' : '▸';
     };
     header.addEventListener('click', toggleCollapse);
     collapseBtn.addEventListener('click', toggleCollapse);
@@ -894,12 +1055,15 @@ function addCalculatedChannelEntry(rowData = {}) {
         input.addEventListener('change', () => { updateTitle(); enableAutoStoreButton(); });
     });
 
+    wireRowDrag(entry);
+
     container.appendChild(entry);
     enableAutoStoreButton();
+    return entry;
 }
 
 function addCalculatedRow() {
-    addCalculatedChannelEntry({ name: 'New Channel', expression: '', unit: '', enabled: true });
+    promoteNewEntry(addCalculatedChannelEntry({ name: 'New Channel', expression: '', unit: '', enabled: true }));
 }
 
 function loadAutoTable(jsonData) {
@@ -956,6 +1120,8 @@ function loadAutoTable(jsonData) {
                     MinValue: pidData.MinValue || '',
                     MaxValue: pidData.MaxValue || '',
                     Period: pidData.Period || '',
+                    description: pidData.description || '',
+                    comment: pidData.comment || '',
                     enabled: pidData.enabled
                 });
             });
@@ -979,6 +1145,8 @@ function loadAutoTable(jsonData) {
                                 type: param.type,
                                 min: param.min,
                                 max: param.max,
+                                description: param.description,
+                                comment: param.comment,
                                 enabled: param.enabled
                             }
                         });
@@ -1044,6 +1212,19 @@ function enableAutoStoreButton() {
     document.getElementById("custom_pid_store").disabled = false;
 }
     
+// Pure metadata (issue #34): description/comment are never read by the engine, and
+// an empty field emits no key at all, so no-note configs stay byte-identical.
+function emitOptionalNotes(target, entry) {
+    const description = entry.querySelector('.description-input')?.value || '';
+    if (description) {
+        target.description = description;
+    }
+    const comment = entry.querySelector('.comment-input')?.value || '';
+    if (comment) {
+        target.comment = comment;
+    }
+}
+
 async function storeAutoTableData() {
     try {
         const custom_pid_data = [];
@@ -1072,6 +1253,7 @@ async function storeAutoTableData() {
                     Period: entry.querySelector('.period-input')?.value || '',
                     enabled: entry.querySelector('.enabled-chk')?.checked !== false
                 };
+                emitOptionalNotes(pidData, entry);
 
                 if (pidData.Name.length === 0 || pidData.Name.length >= 32) {
                     throw new Error("Name must not be empty and must be less than 32 characters");
@@ -1089,22 +1271,30 @@ async function storeAutoTableData() {
             });
         }
 
-        // Custom CAN filters (group by frame_id)
+        // Custom CAN filters: group CONTIGUOUS runs of the same frame_id, not a global
+        // Map — a global merge cannot represent an interleaved row order, which made
+        // some ▲/▼ moves save byte-identical JSON and silently revert on reload
+        // (issue #33). The firmware parses can_filters[] by array index and every
+        // matcher walks all entries, so a frame_id split across two runs decodes
+        // identically to one merged entry.
         const customFilterEntries = document.querySelectorAll('.custom-canfilter-entry');
         if (customFilterEntries.length > 0) {
-            const grouped = new Map();
+            let runKey = null;
+            let runGroup = null;
             customFilterEntries.forEach(entry => {
                 const fidRaw = entry.querySelector('.frame-id-input')?.value || '';
                 const fidNum = normalizeFrameIdInputToNumber(fidRaw);
                 const frameIdOut = (fidNum !== null) ? fidNum : String(fidRaw).trim();
                 if (!frameIdOut) {
-                    throw new Error('Custom filter frame_id is required');
+                    throw new Error('Broadcast PID Frame ID is required');
                 }
                 const key = (fidNum !== null) ? `n:${fidNum}` : `s:${String(fidRaw).trim().toLowerCase()}`;
-                if (!grouped.has(key)) {
-                    grouped.set(key, { frame_id: frameIdOut, parameters: [] });
+                if (key !== runKey) {
+                    runKey = key;
+                    runGroup = { frame_id: frameIdOut, parameters: [] };
+                    custom_can_filters.push(runGroup);
                 }
-                grouped.get(key).parameters.push({
+                const filterParam = {
                     name: entry.querySelector('.name-input')?.value || '',
                     expression: entry.querySelector('.expression-input')?.value || '',
                     unit: entry.querySelector('.unit-input')?.value || '',
@@ -1113,9 +1303,10 @@ async function storeAutoTableData() {
                     min: entry.querySelector('.min-input')?.value || '',
                     max: entry.querySelector('.max-input')?.value || '',
                     enabled: entry.querySelector('.enabled-chk')?.checked !== false
-                });
+                };
+                emitOptionalNotes(filterParam, entry);
+                runGroup.parameters.push(filterParam);
             });
-            custom_can_filters.push(...Array.from(grouped.values()));
         }
 
         // Calculated channels (Task #17): collect name/expression/unit/enabled rows. Carried
@@ -1128,7 +1319,7 @@ async function storeAutoTableData() {
             const enabled = entry.querySelector('.enabled-chk')?.checked !== false;
             if (!name) return;  // skip unnamed rows
             if (name.length > 47) {
-                throw new Error("Calculated channel name must be less than 48 characters");
+                throw new Error("Calculated PID name must be less than 48 characters");
             }
             calculated_data.push({ name, expression, unit, enabled });
         });
