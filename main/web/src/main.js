@@ -418,56 +418,6 @@ const pidEntryStyles = `
     }
 `;
 
-async function runPidTest(entry) {
-    const resultEl = entry.querySelector('.test-result');
-    const buttonEl = entry.querySelector('.test-btn');
-    if (!resultEl || !buttonEl) return;
-
-    const payload = { kind: 'custom' };
-    const init = document.getElementById('initialisation')?.value || '';
-    const pid = entry.querySelector('.pid-input')?.value || '';
-    const pidInit = entry.querySelector('.init-input')?.value || '';
-    const expr = entry.querySelector('.expression-input')?.value || '';
-    if (init.trim()) payload.init = init;
-    payload.pid = pid.trim();
-    if (pidInit.trim()) payload.pid_init = pidInit;
-    payload.expr = expr;
-
-    buttonEl.disabled = true;
-    resultEl.style.display = 'inline-flex';
-    resultEl.classList.add('status-indicator');
-    resultEl.classList.remove('status-connected', 'status-disconnected');
-    resultEl.textContent = 'Testing…';
-
-    try {
-        const res = await fetch('/autopid/test_pid', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data) {
-            showTestOutcome(resultEl, false, 'Error', `Test request failed (HTTP ${res.status}).`);
-            return;
-        }
-        if (data.ok) {
-            let unit = (data.unit || '').trim();
-            if (!unit) {
-                unit = (entry.querySelector('.unit-input')?.value || '').trim();
-            }
-            const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
-            const shown = (unit ? `${valueText} ${unit}` : valueText).trim();
-            showTestOutcome(resultEl, true, shown || 'OK', `Test OK — read ${shown || 'no value'}.`);
-        } else {
-            showTestOutcome(resultEl, false, 'Error', data.error ? `Test failed: ${data.error}` : 'Test failed.');
-        }
-    } catch (e) {
-        showTestOutcome(resultEl, false, 'Error', `Test failed: ${e.message || e}`);
-    } finally {
-        buttonEl.disabled = false;
-    }
-}
-
 // Test results are shown two ways: a compact colored chip on the row (a persistent
 // pass/fail marker) and the shared toast (showNotification) carrying the full
 // message — the chip is only wide enough for a word and would ellipsize a real
@@ -590,62 +540,6 @@ function collectChannelNames(selfEntry) {
         if (n) names.add(n);
     });
     return names;
-}
-
-async function runCanFilterTest(kind, entry) {
-    const resultEl = entry.querySelector('.test-result');
-    const buttonEl = entry.querySelector('.test-btn');
-    if (!resultEl || !buttonEl) return;
-
-    const frameIdStr = entry.querySelector('.frame-id-input')?.value || '';
-    const expr = entry.querySelector('.expression-input')?.value || '';
-    const unit = (entry.querySelector('.unit-input')?.value || '').trim();
-
-    const frameIdNum = normalizeFrameIdInputToNumber(frameIdStr);
-    if (frameIdNum === null) {
-        showTestOutcome(resultEl, false, 'Bad ID', 'Invalid Frame ID — enter a hex value like 201 or 0x201.');
-        return;
-    }
-    if (!expr.trim()) {
-        showTestOutcome(resultEl, false, 'Empty', 'Missing expression.');
-        return;
-    }
-
-    const payload = {
-        kind,
-        frame_id: frameIdNum,
-        expr: expr,
-    };
-
-    buttonEl.disabled = true;
-    resultEl.style.display = 'inline-flex';
-    resultEl.classList.add('status-indicator');
-    resultEl.classList.remove('status-connected', 'status-disconnected');
-    resultEl.textContent = 'Testing…';
-
-    try {
-        const res = await fetch('/autopid/test_can_filter', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        const data = await res.json().catch(() => null);
-        if (!res.ok || !data) {
-            showTestOutcome(resultEl, false, 'Error', `Test request failed (HTTP ${res.status}).`);
-            return;
-        }
-        if (data.ok) {
-            const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
-            const shown = (unit ? `${valueText} ${unit}` : valueText).trim();
-            showTestOutcome(resultEl, true, shown || 'OK', `Test OK — read ${shown || 'no value'}.`);
-        } else {
-            showTestOutcome(resultEl, false, 'Error', data.error ? `Test failed: ${data.error}` : 'Test failed.');
-        }
-    } catch (e) {
-        showTestOutcome(resultEl, false, 'Error', `Test failed: ${e.message || e}`);
-    } finally {
-        buttonEl.disabled = false;
-    }
 }
 
 // Attribute-safe HTML escaper shared by the three row builders' innerHTML templates.
@@ -779,8 +673,6 @@ function addCollapsibleRow(rowData = {}) {
             </div>
             <div class="header-right">
                 <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
-                <span class="test-result status-indicator" style="display:none"></span>
-                <button type="button" class="test-btn">Test</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
                     <input type="checkbox" class="enabled-chk" ${enabledChecked}>
                     Enabled
@@ -859,7 +751,6 @@ style.textContent = pidEntryStyles;
 document.head.appendChild(style);
 const header = entry.querySelector('.pid-header');
 const deleteBtn = entry.querySelector('.delete-btn');
-const testBtn = entry.querySelector('.test-btn');
 const collapseBtn = entry.querySelector('.collapse-btn');
 const content = entry.querySelector('.pid-content');
 const parameterTitle = entry.querySelector('.pid-title');
@@ -876,11 +767,6 @@ deleteBtn.addEventListener('click', () => {
     if (!confirmDeleteRow(entry)) return;
     entry.remove();
     enableAutoStoreButton();
-});
-
-testBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    runPidTest(entry);
 });
 
 const toggleCollapse = (e) => {
@@ -958,8 +844,6 @@ function addCustomCanFilterEntry(rowData = {}) {
             </div>
             <div class="header-right">
                 <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
-                <span class="test-result status-indicator" style="display:none"></span>
-                <button type="button" class="test-btn">Test</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
                     <input type="checkbox" class="enabled-chk" ${(p.enabled === false || rowData.enabled === false) ? '' : 'checked'}>
                     Enabled
@@ -1023,7 +907,6 @@ function addCustomCanFilterEntry(rowData = {}) {
 
     const header = entry.querySelector('.pid-header');
     const deleteBtn = entry.querySelector('.delete-btn');
-    const testBtn = entry.querySelector('.test-btn');
     const collapseBtn = entry.querySelector('.collapse-btn');
     const content = entry.querySelector('.pid-content');
     const titleEl = entry.querySelector('.pid-title');
@@ -1039,13 +922,6 @@ function addCustomCanFilterEntry(rowData = {}) {
         entry.remove();
         enableAutoStoreButton();
     });
-
-    if (testBtn) {
-        testBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            runCanFilterTest('custom', entry);
-        });
-    }
 
     const toggleCollapse = (e) => {
         e.stopPropagation();
