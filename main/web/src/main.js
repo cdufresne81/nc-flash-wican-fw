@@ -447,31 +447,149 @@ async function runPidTest(entry) {
         });
         const data = await res.json().catch(() => null);
         if (!res.ok || !data) {
-            resultEl.classList.add('status-disconnected');
-            resultEl.textContent = `Error (${res.status})`;
+            showTestOutcome(resultEl, false, 'Error', `Test request failed (HTTP ${res.status}).`);
             return;
         }
         if (data.ok) {
-            resultEl.classList.add('status-connected');
-            resultEl.classList.remove('status-disconnected');
             let unit = (data.unit || '').trim();
             if (!unit) {
                 unit = (entry.querySelector('.unit-input')?.value || '').trim();
             }
             const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
-            resultEl.textContent = unit ? `${valueText} ${unit}` : valueText;
+            const shown = (unit ? `${valueText} ${unit}` : valueText).trim();
+            showTestOutcome(resultEl, true, shown || 'OK', `Test OK — read ${shown || 'no value'}.`);
         } else {
-            resultEl.classList.add('status-disconnected');
-            resultEl.classList.remove('status-connected');
-            resultEl.textContent = data.error ? `Error: ${data.error}` : 'Error';
+            showTestOutcome(resultEl, false, 'Error', data.error ? `Test failed: ${data.error}` : 'Test failed.');
         }
     } catch (e) {
-        resultEl.classList.add('status-disconnected');
-        resultEl.classList.remove('status-connected');
-        resultEl.textContent = 'Error';
+        showTestOutcome(resultEl, false, 'Error', `Test failed: ${e.message || e}`);
     } finally {
         buttonEl.disabled = false;
     }
+}
+
+// Test results are shown two ways: a compact colored chip on the row (a persistent
+// pass/fail marker) and the shared toast (showNotification) carrying the full
+// message — the chip is only wide enough for a word and would ellipsize a real
+// error, which was the "doesn't display the message fully" bug.
+function showTestOutcome(resultEl, ok, chipText, detail, toastColor) {
+    if (resultEl) {
+        resultEl.style.display = 'inline-flex';
+        resultEl.classList.add('status-indicator');
+        resultEl.classList.toggle('status-connected', ok);
+        resultEl.classList.toggle('status-disconnected', !ok);
+        resultEl.textContent = chipText;
+    }
+    showNotification(safe(detail), toastColor || (ok ? 'green' : 'red'), ok ? 4000 : 7000);
+}
+
+// A calculated channel is derived on-device from OTHER channels' values, so there
+// is nothing to poll from the ECU to "test" — instead validate the expression the
+// way the firmware parser reads it: check the syntax, then that every name it
+// references is a channel configured on this page. Pure client-side, so it works
+// regardless of the running protocol (the live PID/filter tests need AutoPID).
+function runCalcTest(entry) {
+    const resultEl = entry.querySelector('.test-result');
+    const expr = (entry.querySelector('.expression-input')?.value || '').trim();
+    if (!expr) {
+        showTestOutcome(resultEl, false, 'Empty', 'Missing expression — enter something like "MAP - BARO".');
+        return;
+    }
+    const parsed = parseCalcExpression(expr);
+    if (!parsed.ok) {
+        showTestOutcome(resultEl, false, 'Invalid', `Invalid expression: ${parsed.error}`);
+        return;
+    }
+    const selfName = (entry.querySelector('.name-input')?.value || '').trim();
+    const known = collectChannelNames(entry);
+    const unknown = parsed.names.filter((n) => n !== selfName && !known.has(n));
+    if (unknown.length) {
+        // Syntax is fine; the names may be built-in channels the editor doesn't
+        // list, so warn (yellow) rather than fail the test.
+        showTestOutcome(resultEl, true, 'Check refs',
+            `Expression parses, but no configured channel is named: ${unknown.join(', ')}. Ignore this if they are built-in channels.`,
+            'yellow');
+        return;
+    }
+    const note = parsed.names.length
+        ? ` (references ${parsed.names.length} channel${parsed.names.length > 1 ? 's' : ''})`
+        : ' (constant value)';
+    showTestOutcome(resultEl, true, 'Valid', `Expression is valid${note}.`);
+}
+
+// Recursive-descent validator for calculated-channel expressions, mirroring the
+// firmware grammar: numbers, channel identifiers, + - * /, parentheses and unary
+// minus. No eval — every token is matched explicitly, so a malformed expression
+// returns a clean error instead of throwing. Returns the referenced names on ok.
+function parseCalcExpression(src) {
+    const raw = src.match(/[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?|[-+*/()]|\S/g) || [];
+    const tokens = [];
+    for (const t of raw) {
+        if (/^[A-Za-z_]/.test(t)) tokens.push({ type: 'name', text: t });
+        else if (/^\d/.test(t)) tokens.push({ type: 'num', text: t });
+        else if (t.length === 1 && '+-*/()'.includes(t)) tokens.push({ type: t, text: t });
+        else return { ok: false, error: `unexpected "${t}"` };
+    }
+    if (!tokens.length) return { ok: false, error: 'empty expression' };
+
+    let pos = 0;
+    const names = new Set();
+    const peek = () => tokens[pos];
+
+    function parseExpr() {
+        let r = parseTerm();
+        if (!r.ok) return r;
+        while (peek() && (peek().type === '+' || peek().type === '-')) {
+            pos++;
+            r = parseTerm();
+            if (!r.ok) return r;
+        }
+        return { ok: true };
+    }
+    function parseTerm() {
+        let r = parseFactor();
+        if (!r.ok) return r;
+        while (peek() && (peek().type === '*' || peek().type === '/')) {
+            pos++;
+            r = parseFactor();
+            if (!r.ok) return r;
+        }
+        return { ok: true };
+    }
+    function parseFactor() {
+        const t = peek();
+        if (!t) return { ok: false, error: 'expression ends early' };
+        if (t.type === '+' || t.type === '-') { pos++; return parseFactor(); }
+        if (t.type === 'num') { pos++; return { ok: true }; }
+        if (t.type === 'name') { names.add(t.text); pos++; return { ok: true }; }
+        if (t.type === '(') {
+            pos++;
+            const inner = parseExpr();
+            if (!inner.ok) return inner;
+            if (!peek() || peek().type !== ')') return { ok: false, error: 'missing ")"' };
+            pos++;
+            return { ok: true };
+        }
+        return { ok: false, error: `unexpected "${t.text}"` };
+    }
+
+    const r = parseExpr();
+    if (!r.ok) return r;
+    if (pos !== tokens.length) return { ok: false, error: `unexpected "${tokens[pos].text}"` };
+    return { ok: true, names: [...names] };
+}
+
+// The names a calculated expression may reference: the output name of every
+// configured channel — polled PIDs, broadcast filters and other calculated
+// channels — except the row being tested.
+function collectChannelNames(selfEntry) {
+    const names = new Set();
+    document.querySelectorAll('.pid-entry, .custom-canfilter-entry, .calculated-entry').forEach((row) => {
+        if (row === selfEntry) return;
+        const n = (row.querySelector('.name-input')?.value || '').trim();
+        if (n) names.add(n);
+    });
+    return names;
 }
 
 async function runCanFilterTest(kind, entry) {
@@ -485,17 +603,11 @@ async function runCanFilterTest(kind, entry) {
 
     const frameIdNum = normalizeFrameIdInputToNumber(frameIdStr);
     if (frameIdNum === null) {
-        resultEl.style.display = 'inline-flex';
-        resultEl.classList.add('status-indicator', 'status-disconnected');
-        resultEl.classList.remove('status-connected');
-        resultEl.textContent = 'Invalid Frame ID';
+        showTestOutcome(resultEl, false, 'Bad ID', 'Invalid Frame ID — enter a hex value like 201 or 0x201.');
         return;
     }
     if (!expr.trim()) {
-        resultEl.style.display = 'inline-flex';
-        resultEl.classList.add('status-indicator', 'status-disconnected');
-        resultEl.classList.remove('status-connected');
-        resultEl.textContent = 'Missing Expression';
+        showTestOutcome(resultEl, false, 'Empty', 'Missing expression.');
         return;
     }
 
@@ -519,24 +631,18 @@ async function runCanFilterTest(kind, entry) {
         });
         const data = await res.json().catch(() => null);
         if (!res.ok || !data) {
-            resultEl.classList.add('status-disconnected');
-            resultEl.textContent = `Error (${res.status})`;
+            showTestOutcome(resultEl, false, 'Error', `Test request failed (HTTP ${res.status}).`);
             return;
         }
         if (data.ok) {
-            resultEl.classList.add('status-connected');
-            resultEl.classList.remove('status-disconnected');
             const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
-            resultEl.textContent = unit ? `${valueText} ${unit}` : valueText;
+            const shown = (unit ? `${valueText} ${unit}` : valueText).trim();
+            showTestOutcome(resultEl, true, shown || 'OK', `Test OK — read ${shown || 'no value'}.`);
         } else {
-            resultEl.classList.add('status-disconnected');
-            resultEl.classList.remove('status-connected');
-            resultEl.textContent = data.error ? `Error: ${data.error}` : 'Error';
+            showTestOutcome(resultEl, false, 'Error', data.error ? `Test failed: ${data.error}` : 'Test failed.');
         }
     } catch (e) {
-        resultEl.classList.add('status-disconnected');
-        resultEl.classList.remove('status-connected');
-        resultEl.textContent = 'Error';
+        showTestOutcome(resultEl, false, 'Error', `Test failed: ${e.message || e}`);
     } finally {
         buttonEl.disabled = false;
     }
@@ -998,6 +1104,8 @@ function addCalculatedChannelEntry(rowData = {}) {
             </div>
             <div class="header-right">
                 <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
+                <span class="test-result status-indicator" style="display:none"></span>
+                <button type="button" class="test-btn">Test</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
                     <input type="checkbox" class="enabled-chk" ${enabled ? 'checked' : ''}>
                     Enabled
@@ -1044,6 +1152,14 @@ function addCalculatedChannelEntry(rowData = {}) {
         entry.remove();
         enableAutoStoreButton();
     });
+
+    const testBtn = entry.querySelector('.test-btn');
+    if (testBtn) {
+        testBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            runCalcTest(entry);
+        });
+    }
 
     const toggleCollapse = (e) => {
         e.stopPropagation();
