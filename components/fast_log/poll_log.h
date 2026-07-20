@@ -60,4 +60,12 @@ bool     poll_log_engine_running(void);
 bool     poll_log_quiesced(void);
 uint32_t poll_log_bus_idle_ms(void);
 
+/*
+ * Request a live PID-table hot-swap (issue #39). Called on the httpd task after
+ * auto_pid.json is rewritten; sets a flag only -- the re-parse + atomic swap runs on the
+ * poll task at its safe point (deferred while a CSV trip is open). Returns true if queued,
+ * false when POLL_LOG isn't the active mode (caller must then require a reboot instead).
+ */
+bool     poll_log_request_reload(void);
+
 #endif /* POLL_LOG_H */

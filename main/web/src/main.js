@@ -1347,9 +1347,18 @@ async function storeAutoTableData() {
         })
         .then(response => response.text())
         .then(result => {
-            showNotification("Settings saved successfully. Rebooting...", "green", 10000);
-            document.querySelector(".store").disabled = true;
-            document.getElementById("custom_pid_store").disabled = true;
+            // Parse the honest envelope {reboot,applied,msg} (issue #39). Store never
+            // reboots the device on its own, so do NOT claim "Rebooting" and do NOT lock
+            // the buttons. Fall back to legacy plain text if the firmware predates this.
+            let msg = "PID table saved.", color = "green";
+            try {
+                const r = JSON.parse(result);
+                if (r && typeof r.msg === "string") msg = r.msg;
+                if (r && r.applied === "deferred") color = "yellow";
+            } catch (e) {
+                if (result) msg = result;   // legacy plain-text firmware
+            }
+            showNotification(msg, color, 6000);
         })
         .catch(error => {
             showNotification("Error saving settings: " + error.message, "red");
@@ -2159,11 +2168,33 @@ async function postConfig() {
     xhttp.open("POST", "/store_config");
     xhttp.setRequestHeader("Content-Type", "application/json");
     xhttp.onreadystatechange = function() {
-        if (xhttp.readyState === 4 && xhttp.status >= 200 && xhttp.status < 300) {
-            // POST was successful, reload after 8 seconds
-            setTimeout(function() {
-                window.location.reload();
-            }, 8000);
+        if (xhttp.readyState !== 4) return;
+        if (xhttp.status >= 200 && xhttp.status < 300) {
+            // Parse the honest envelope {reboot,applied,msg} (issue #39). Fall back to
+            // legacy plain text (assume reboot) so UI and firmware can ship independently.
+            let willReboot = true, msg = "";
+            try {
+                const r = JSON.parse(xhttp.responseText);
+                willReboot = !!(r && r.reboot);
+                if (r && typeof r.msg === "string") msg = r.msg;
+            } catch (e) {
+                willReboot = true;   // legacy firmware: plain-text "...Rebooting..."
+            }
+            if (willReboot) {
+                // Reboot in progress: keep the reconnect UX (reload once it's back up).
+                if (msg) showNotification(msg, "yellow", 9000);
+                setTimeout(function() {
+                    window.location.reload();
+                }, 8000);
+            } else {
+                // Applied live: stay connected, no countdown; STEP 6 kept /load_config
+                // fresh so the form is already correct. Re-enable Submit.
+                showNotification(msg || "Configuration applied (no reboot).", "green", 6000);
+                document.getElementById("submit_button").disabled = false;
+            }
+        } else {
+            showNotification("Error saving configuration (HTTP " + xhttp.status + ")", "red");
+            document.getElementById("submit_button").disabled = false;
         }
     };
     xhttp.send(configJSON);
