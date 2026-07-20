@@ -460,9 +460,12 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
     }
     autopid_config->pid_validation_en = true; 
 
-    // Load custom pids
+    // Load custom pids. Guard cJSON_IsArray: the sizing pass (count_auto_pid_pids) only
+    // counts arrays, but cJSON_ArrayForEach happily walks an OBJECT's children too -- a
+    // {"pids":{...}} payload would then parse more entries than were allocated and overflow
+    // pids[] on the poll task during the live hot-reload (issue #39).
     cJSON *pids = cJSON_GetObjectItem(root, "pids");
-    if (pids)
+    if (pids && cJSON_IsArray(pids))
     {
         cJSON *pid;
         cJSON_ArrayForEach(pid, pids)
@@ -528,9 +531,10 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
         }
     }
 
-    // Load standard pids
+    // Load standard pids (cJSON_IsArray guard: see the custom-pids note above -- count vs
+    // parse must agree on what is an array, or pids[] overflows).
     cJSON *std_pids = cJSON_GetObjectItem(root, "std_pids");
-    if (std_pids)
+    if (std_pids && cJSON_IsArray(std_pids))
     {
         cJSON *pid;
         cJSON_ArrayForEach(pid, std_pids)
@@ -865,7 +869,7 @@ static void parse_car_data_json(autopid_config_t *autopid_config, int *pid_index
             }
 
             cJSON *pids = cJSON_GetObjectItem(car, "pids");
-            if (pids)
+            if (pids && cJSON_IsArray(pids)) // match count_car_data_pids; non-array would overflow pids[]
             {
                 cJSON *pid;
                 cJSON_ArrayForEach(pid, pids)

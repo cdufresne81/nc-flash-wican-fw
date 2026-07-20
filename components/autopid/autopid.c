@@ -86,10 +86,10 @@ static EventGroupHandle_t xautopid_event_group = NULL;
 static StaticEventGroup_t xautopid_event_group_buffer;
 static autopid_config_t *autopid_config = NULL;
 // Config mutex hoisted out of the swappable autopid_config struct (issue #39): a live
-// PID-table hot-swap frees the old struct, so any lock op that dereferenced
-// s_autopid_mutex cross-task was a use-after-free. This handle is created once
-// and never destroyed, so it stays valid across swaps. s_autopid_mutex is kept
-// as a compat mirror for legacy field readers (e.g. autopid_data_update).
+// PID-table hot-swap frees the old struct, so a per-struct mutex handle (the former
+// autopid_config->mutex) was a use-after-free once locked cross-task after a swap.
+// This file-static handle is created once and never destroyed, so it stays valid
+// across swaps and is the single serialization point for the config pointer.
 static SemaphoreHandle_t s_autopid_mutex = NULL;
 // Serializes auto_pid.json file writes (store_auto_data_handler) against the live
 // reload's count+parse (P2 TOCTOU guard, issue #39). Created once at config load.
@@ -290,21 +290,18 @@ autopid_config_t *autopid_reload_config(void)
         return NULL;
     }
 
-    // 2. Known-good validation. cmd==NULL is a NORMAL state (disabled/std/tail pids) that
-    //    the poll loop already tolerates -> reject ONLY an enabled pid with no cmd, or an
-    //    inconsistent parameter array. A stricter reject would refuse a table a reboot
-    //    loads fine, breaking reboot-equivalence. On reject, keep the old table (never brick).
+    // 2. Known-good validation. cmd==NULL is a NORMAL, poll-loop-tolerated state -- not only
+    //    for disabled/std/tail pids but for an ENABLED pid whose name doesn't resolve to a
+    //    command (polllog_poll_one returns on !pid->cmd regardless of enabled). Rejecting on
+    //    enabled+cmd==NULL would refuse a table a reboot loads fine, breaking reboot-equivalence
+    //    and turning the handler's "live" reply into a lie. So validate only the shape that is
+    //    a real hazard: a parameter array whose count disagrees with its (NULL) base -> an
+    //    out-of-bounds read in the poll loop. On reject, keep the old table (never brick).
     if (new_cfg->pids)
     {
         for (uint32_t i = 0; i < new_cfg->pid_count; i++)
         {
             pid_data_t *p = &new_cfg->pids[i];
-            if (p->enabled && p->cmd == NULL)
-            {
-                ESP_LOGW(TAG, "reload: enabled pid %lu has no cmd, rejecting reload", (unsigned long)i);
-                autopid_config_deep_free(new_cfg);
-                return NULL;
-            }
             if (p->parameters_count > 0 && p->parameters == NULL)
             {
                 ESP_LOGW(TAG, "reload: pid %lu parameter array inconsistent, rejecting reload", (unsigned long)i);
