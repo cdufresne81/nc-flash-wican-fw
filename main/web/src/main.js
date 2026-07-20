@@ -598,10 +598,17 @@ function wireRowDrag(entry) {
         e.stopPropagation();
         const container = entry.parentNode;
         const startNext = entry.nextElementSibling;
+        const pointerId = e.pointerId;
         let lastY = e.clientY;
         let raf = 0;
 
-        handle.setPointerCapture(e.pointerId);
+        // Capture on document.body, NOT the handle: insertBefore disconnects the
+        // row for an instant, and the browser silently releases pointer capture
+        // on a disconnected element — captured on the handle, the drag froze
+        // after the first swap. body is never disconnected, and the move/up
+        // listeners sit on window so delivery never depends on what's under
+        // the pointer.
+        try { document.body.setPointerCapture(pointerId); } catch (_) {}
         entry.classList.add('dragging');
 
         // Reorder runs on a rAF loop rather than in pointermove: edge-autoscroll
@@ -625,18 +632,19 @@ function wireRowDrag(entry) {
             }
             raf = requestAnimationFrame(tick);
         };
-        const onMove = (ev) => { lastY = ev.clientY; };
-        const finish = () => {
+        const onMove = (ev) => { if (ev.pointerId === pointerId) lastY = ev.clientY; };
+        const finish = (ev) => {
+            if (ev.pointerId !== pointerId) return;
             cancelAnimationFrame(raf);
             entry.classList.remove('dragging');
-            handle.removeEventListener('pointermove', onMove);
-            handle.removeEventListener('pointerup', finish);
-            handle.removeEventListener('pointercancel', finish);
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', finish);
+            window.removeEventListener('pointercancel', finish);
             if (entry.nextElementSibling !== startNext) enableAutoStoreButton();
         };
-        handle.addEventListener('pointermove', onMove);
-        handle.addEventListener('pointerup', finish);
-        handle.addEventListener('pointercancel', finish);
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', finish);
+        window.addEventListener('pointercancel', finish);
         raf = requestAnimationFrame(tick);
     });
 }
