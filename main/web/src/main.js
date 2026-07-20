@@ -355,13 +355,28 @@ const pidEntryStyles = `
         color: #334155;
     }
 
-    .move-btn {
+    .drag-handle {
         border: none;
         background: transparent;
-        font-size: 0.7rem;
-        cursor: pointer;
-        padding: 2px 4px;
+        font-size: 0.75rem;
+        letter-spacing: -2px;
+        cursor: grab;
+        padding: 2px 6px 2px 2px;
         color: #64748b;
+        touch-action: none;   /* the handle owns the touch gesture; without this the page scrolls instead of dragging */
+        user-select: none;
+        -webkit-user-select: none;
+    }
+
+    .dragging {
+        opacity: 0.9;
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.25);
+        position: relative;
+        z-index: 10;
+    }
+
+    .dragging .drag-handle {
+        cursor: grabbing;
     }
 
     .pid-content {
@@ -549,26 +564,80 @@ function promoteNewEntry(entry) {
 
 // issue #33: moving the DOM row IS the reorder — storeAutoTableData walks the DOM
 // in document order, so the saved array order (and the CSV column order that
-// follows from it) tracks the rows with no serialization change. No-op at the
-// list ends, so no enabled/disabled state to keep in sync across add/delete/move.
-function wireRowReorder(entry) {
-    entry.querySelector('.move-up-btn')?.addEventListener('click', (e) => {
+// follows from it) tracks the rows with no serialization change. The handle
+// drags via pointer events (its touch-action:none makes the same code work on
+// phones), and ArrowUp/ArrowDown move one slot while it has focus, so reorder
+// stays keyboard-accessible without dedicated ▲/▼ buttons.
+function wireRowDrag(entry) {
+    const handle = entry.querySelector('.drag-handle');
+    if (!handle) return;
+
+    // The whole .pid-header click toggles collapse; the handle must not.
+    handle.addEventListener('click', (e) => e.stopPropagation());
+
+    handle.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+        e.preventDefault();
         e.stopPropagation();
-        const prev = entry.previousElementSibling;
-        if (prev) {
+        if (e.key === 'ArrowUp') {
+            const prev = entry.previousElementSibling;
+            if (!prev) return;
             entry.parentNode.insertBefore(entry, prev);
-            e.currentTarget.focus();   // reinsertion blurs the button; keep keyboard flow
-            enableAutoStoreButton();
-        }
-    });
-    entry.querySelector('.move-down-btn')?.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const next = entry.nextElementSibling;
-        if (next) {
+        } else {
+            const next = entry.nextElementSibling;
+            if (!next) return;
             entry.parentNode.insertBefore(entry, next.nextSibling);
-            e.currentTarget.focus();   // reinsertion blurs the button; keep keyboard flow
-            enableAutoStoreButton();
         }
+        handle.focus();   // reinsertion blurs the handle; keep keyboard flow
+        enableAutoStoreButton();
+    });
+
+    handle.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const container = entry.parentNode;
+        const startNext = entry.nextElementSibling;
+        let lastY = e.clientY;
+        let raf = 0;
+
+        handle.setPointerCapture(e.pointerId);
+        entry.classList.add('dragging');
+
+        // Reorder runs on a rAF loop rather than in pointermove: edge-autoscroll
+        // must keep scrolling (and re-picking the drop slot) while the finger
+        // holds still at the viewport edge, where no move events arrive.
+        const tick = () => {
+            const EDGE = 56;
+            if (lastY < EDGE) {
+                window.scrollBy(0, -Math.ceil((EDGE - lastY) / 4));
+            } else if (lastY > window.innerHeight - EDGE) {
+                window.scrollBy(0, Math.ceil((lastY - (window.innerHeight - EDGE)) / 4));
+            }
+            let before = null;
+            for (const sib of container.children) {
+                if (sib === entry) continue;
+                const r = sib.getBoundingClientRect();
+                if (lastY < r.top + r.height / 2) { before = sib; break; }
+            }
+            if (before !== entry.nextElementSibling) {
+                container.insertBefore(entry, before);
+            }
+            raf = requestAnimationFrame(tick);
+        };
+        const onMove = (ev) => { lastY = ev.clientY; };
+        const finish = () => {
+            cancelAnimationFrame(raf);
+            entry.classList.remove('dragging');
+            handle.removeEventListener('pointermove', onMove);
+            handle.removeEventListener('pointerup', finish);
+            handle.removeEventListener('pointercancel', finish);
+            if (entry.nextElementSibling !== startNext) enableAutoStoreButton();
+        };
+        handle.addEventListener('pointermove', onMove);
+        handle.addEventListener('pointerup', finish);
+        handle.addEventListener('pointercancel', finish);
+        raf = requestAnimationFrame(tick);
     });
 }
 
@@ -583,11 +652,10 @@ function addCollapsibleRow(rowData = {}) {
         <div class="pid-header">
             <div class="header-left">
                 <button type="button" class="collapse-btn">▸</button>
-                <button type="button" class="move-btn move-up-btn" title="Move up" aria-label="Move up">▲</button>
-                <button type="button" class="move-btn move-down-btn" title="Move down" aria-label="Move down">▼</button>
                 <span class="pid-title">New PID</span>
             </div>
             <div class="header-right">
+                <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
                 <span class="test-result status-indicator" style="display:none"></span>
                 <button type="button" class="test-btn">Test</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
@@ -713,7 +781,7 @@ entry.querySelectorAll('input, select').forEach(input => {
     input.addEventListener('input', enableAutoStoreButton);
 });
 
-wireRowReorder(entry);
+wireRowDrag(entry);
 
 container.appendChild(entry);
 return entry;
@@ -762,11 +830,10 @@ function addCustomCanFilterEntry(rowData = {}) {
         <div class="pid-header">
             <div class="header-left">
                 <button type="button" class="collapse-btn">▸</button>
-                <button type="button" class="move-btn move-up-btn" title="Move up" aria-label="Move up">▲</button>
-                <button type="button" class="move-btn move-down-btn" title="Move down" aria-label="Move down">▼</button>
                 <span class="pid-title">${safe(titleText)}</span>
             </div>
             <div class="header-right">
+                <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
                 <span class="test-result status-indicator" style="display:none"></span>
                 <button type="button" class="test-btn">Test</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
@@ -875,7 +942,7 @@ function addCustomCanFilterEntry(rowData = {}) {
         input.addEventListener('change', () => { updateTitle(); enableAutoStoreButton(); });
     });
 
-    wireRowReorder(entry);
+    wireRowDrag(entry);
 
     container.appendChild(entry);
     enableAutoStoreButton();
@@ -908,11 +975,10 @@ function addCalculatedChannelEntry(rowData = {}) {
         <div class="pid-header">
             <div class="header-left">
                 <button type="button" class="collapse-btn">▸</button>
-                <button type="button" class="move-btn move-up-btn" title="Move up" aria-label="Move up">▲</button>
-                <button type="button" class="move-btn move-down-btn" title="Move down" aria-label="Move down">▼</button>
                 <span class="pid-title">${safe(name)}</span>
             </div>
             <div class="header-right">
+                <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
                     <input type="checkbox" class="enabled-chk" ${enabled ? 'checked' : ''}>
                     Enabled
@@ -977,7 +1043,7 @@ function addCalculatedChannelEntry(rowData = {}) {
         input.addEventListener('change', () => { updateTitle(); enableAutoStoreButton(); });
     });
 
-    wireRowReorder(entry);
+    wireRowDrag(entry);
 
     container.appendChild(entry);
     enableAutoStoreButton();
