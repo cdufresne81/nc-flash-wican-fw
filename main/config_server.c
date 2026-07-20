@@ -712,6 +712,20 @@ static esp_err_t index_handler(httpd_req_t *req)
 	X(batt_alert_url) X(batt_alert_port) X(batt_alert_topic) \
 	X(batt_mqtt_user) X(batt_mqtt_pass)
 
+// Single authority for the honest apply-envelope wire contract (issue #39), shared by
+// /store_config and /store_auto_data. `applied` is one of "reboot"|"live"|"deferred";
+// `msg` is a fixed literal (never user input), so no JSON escaping is needed.
+static esp_err_t config_server_send_apply_envelope(httpd_req_t *req, bool reboot,
+						   const char *applied, const char *msg)
+{
+	char body[256];
+	snprintf(body, sizeof body,
+		 "{\"reboot\":%s,\"applied\":\"%s\",\"msg\":\"%s\"}",
+		 reboot ? "true" : "false", applied, msg);
+	httpd_resp_set_type(req, "application/json");
+	return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t store_config_handler(httpd_req_t *req)
 {
 	ESP_LOGI(TAG, "store_config_handler called: content_len=%d", req ? req->content_len : -1);
@@ -913,21 +927,18 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 	free(probe);
 
 	// Honest envelope: reboot only when a reboot-required field changed.
-	httpd_resp_set_type(req, "application/json");
 	if (do_reboot)
 	{
-		httpd_resp_send(req,
-			"{\"reboot\":true,\"applied\":\"reboot\",\"msg\":\"Configuration saved. Rebooting to apply.\"}",
-			HTTPD_RESP_USE_STRLEN);
+		config_server_send_apply_envelope(req, true, "reboot",
+			"Configuration saved. Rebooting to apply.");
 		config_server_schedule_reboot(RESTART_TRACKER_PLANNED_REASON_CONFIG_APPLY,
 							 RESTART_TRACKER_SOURCE_WEB_UI,
 							 RESTART_TRACKER_FLAG_SETTINGS_SAVED);
 	}
 	else
 	{
-		httpd_resp_send(req,
-			"{\"reboot\":false,\"applied\":\"live\",\"msg\":\"Configuration applied (no reboot).\"}",
-			HTTPD_RESP_USE_STRLEN);
+		config_server_send_apply_envelope(req, false, "live",
+			"Configuration applied (no reboot).");
 		ESP_LOGI(TAG, "config applied live (no reboot)");
 	}
 
@@ -1264,24 +1275,20 @@ static esp_err_t store_auto_data_handler(httpd_req_t *req)
 	//                         (its columns stay frozen mid-trip) or on reboot.
 	//   otherwise          -> live: the swap runs at the poll task's next safe point.
 	bool queued = poll_log_request_reload();
-	httpd_resp_set_type(req, "application/json");
 	if (!queued)
 	{
-		httpd_resp_send(req,
-			"{\"reboot\":true,\"applied\":\"reboot\",\"msg\":\"PID table saved; takes effect after reboot.\"}",
-			HTTPD_RESP_USE_STRLEN);
+		config_server_send_apply_envelope(req, true, "reboot",
+			"PID table saved; takes effect after reboot.");
 	}
 	else if (csv_logger_session_active())
 	{
-		httpd_resp_send(req,
-			"{\"reboot\":false,\"applied\":\"deferred\",\"msg\":\"Datalog trip in progress -- new PID table takes effect when this trip ends (or on reboot).\"}",
-			HTTPD_RESP_USE_STRLEN);
+		config_server_send_apply_envelope(req, false, "deferred",
+			"Datalog trip in progress -- new PID table takes effect when this trip ends (or on reboot).");
 	}
 	else
 	{
-		httpd_resp_send(req,
-			"{\"reboot\":false,\"applied\":\"live\",\"msg\":\"PID table applied. New logging columns start with the next trip.\"}",
-			HTTPD_RESP_USE_STRLEN);
+		config_server_send_apply_envelope(req, false, "live",
+			"PID table applied. New logging columns start with the next trip.");
 	}
 	ESP_LOGI(TAG, "store_auto_data_handler completed: written=%d bytes, queued=%d", received, (int)queued);
 

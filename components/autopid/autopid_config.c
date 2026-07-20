@@ -1011,7 +1011,6 @@ static void autopid_free_param_array(parameter_t *params, uint32_t count)
 // allocation set: pids[].cmd/init/rxheader + each pid's parameter strings+array,
 // can_filters[] parameter strings+array, calculated[] strings+array, the six
 // top-level char*, then the struct. Guards every array base (partial-alloc safe).
-// NEVER touches ->mutex (hoisted to s_autopid_mutex, created once, never destroyed).
 void autopid_config_deep_free(autopid_config_t *c)
 {
     if (!c)
@@ -1047,6 +1046,5 @@ void autopid_config_deep_free(autopid_config_t *c)
     free(c->std_ecu_protocol);
     free(c->vehicle_model);
 
-    // Do NOT vSemaphoreDelete(c->mutex): it mirrors the hoisted s_autopid_mutex.
     free(c);
 }

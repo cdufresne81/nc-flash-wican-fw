@@ -141,7 +141,8 @@ typedef struct
     char* vehicle_model;
     uint32_t cycle;     //To be removed when std pid gets its own period
     time_t last_successful_pid_time;  // Timestamp in seconds since epoch of last successful PID response
-    SemaphoreHandle_t mutex;
+    // NB: no per-config mutex -- serialization is via the file-static s_autopid_mutex in
+    // autopid.c (created once, never destroyed, so it stays valid across live table swaps).
 } autopid_config_t;
 
 typedef struct 

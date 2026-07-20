@@ -314,10 +314,7 @@ autopid_config_t *autopid_reload_config(void)
         }
     }
 
-    // 3. Preserve the compat mutex mirror (legacy ->mutex readers).
-    new_cfg->mutex = s_autopid_mutex;
-
-    // 4. Swap under the config lock (single aligned pointer store). Take s_autopid_mutex
+    // 3. Swap under the config lock (single aligned pointer store). Take s_autopid_mutex
     //    directly with portMAX_DELAY (a true infinite wait) -- autopid_lock() would run it
     //    through pdMS_TO_TICKS and overflow it to a finite timeout. Matches the file's other
     //    swap-critical sites. autopid_config is non-NULL here (the old table is still live).
@@ -330,7 +327,7 @@ autopid_config_t *autopid_reload_config(void)
     autopid_config_t *old_cfg = autopid_config;
     autopid_config = new_cfg;
 
-    // 5. Invalidate the /autopid_data cache (lazy rebuild from the new table). Two-generation
+    // 4. Invalidate the /autopid_data cache (lazy rebuild from the new table). Two-generation
     //    retirement: free the PREVIOUS stale string now, hold THIS one until the next reload
     //    so a concurrent get-then-send of the returned raw pointer isn't freed under it.
     free(s_prev_cfg_json);
@@ -338,7 +335,7 @@ autopid_config_t *autopid_reload_config(void)
     autopid_config_json = NULL;
     xSemaphoreGive(s_autopid_mutex);
 
-    // 6. Free the old table AFTER the global was republished under the lock and every
+    // 5. Free the old table AFTER the global was republished under the lock and every
     //    reader observes the new base (see the UAF-free proof in docs/goal-live-reconfigure.md).
     autopid_config_deep_free(old_cfg);
     return new_cfg;
@@ -1035,7 +1032,7 @@ esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint
 
 static void autopid_data_update(autopid_config_t *pids)
 {
-    if (!pids || !pids->mutex)
+    if (!pids || !s_autopid_mutex)
     {
         ESP_LOGE(TAG, "Invalid autopid_config or mutex");
         return;
@@ -2937,7 +2934,6 @@ autopid_config_t *autopid_load_config_only(void)
     }
 
     s_autopid_mutex = xSemaphoreCreateMutex();
-    autopid_config->mutex = s_autopid_mutex; // compat mirror (legacy ->mutex readers)
     if (s_autopid_mutex == NULL)
     {
         ESP_LOGE(TAG, "autopid_load_config_only: failed to create config mutex");
@@ -3043,7 +3039,6 @@ void autopid_init(char *id)
     if (autopid_config)
     {
         s_autopid_mutex = xSemaphoreCreateMutex();
-        autopid_config->mutex = s_autopid_mutex; // compat mirror (legacy ->mutex readers)
         if (s_autopid_file_lock == NULL)
         {
             s_autopid_file_lock = xSemaphoreCreateMutex();
