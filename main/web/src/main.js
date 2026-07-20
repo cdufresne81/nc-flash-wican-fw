@@ -299,7 +299,7 @@ async function checkFirmwareUpdate() {
     }
 
     function addRowAutoTable() {
-        addCollapsibleRow();
+        promoteNewEntry(addCollapsibleRow());
         enableAutoStoreButton();
     }
 
@@ -354,7 +354,16 @@ const pidEntryStyles = `
         padding: 2px 4px;
         color: #334155;
     }
-    
+
+    .move-btn {
+        border: none;
+        background: transparent;
+        font-size: 0.7rem;
+        cursor: pointer;
+        padding: 2px 4px;
+        color: #64748b;
+    }
+
     .pid-content {
         padding: 8px 10px;
     }
@@ -517,17 +526,56 @@ async function runCanFilterTest(kind, entry) {
     }
 }
 
+// The three "New ..." buttons land the fresh row at the TOP of its list, expanded,
+// with the first field focused (issue #36). Only the button path promotes;
+// loadAutoTable keeps appending, so a stored config loads back in array order.
+function promoteNewEntry(entry) {
+    if (!entry || !entry.parentNode) return;
+    const container = entry.parentNode;
+    if (container.firstElementChild !== entry) {
+        container.insertBefore(entry, container.firstElementChild);
+    }
+    entry.querySelector('.collapse-btn')?.click();
+    entry.querySelector('.pid-content input')?.focus();
+}
+
+// issue #33: moving the DOM row IS the reorder — storeAutoTableData walks the DOM
+// in document order, so the saved array order (and the CSV column order that
+// follows from it) tracks the rows with no serialization change. No-op at the
+// list ends, so no enabled/disabled state to keep in sync across add/delete/move.
+function wireRowReorder(entry) {
+    entry.querySelector('.move-up-btn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const prev = entry.previousElementSibling;
+        if (prev) {
+            entry.parentNode.insertBefore(entry, prev);
+            enableAutoStoreButton();
+        }
+    });
+    entry.querySelector('.move-down-btn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const next = entry.nextElementSibling;
+        if (next) {
+            entry.parentNode.insertBefore(entry, next.nextSibling);
+            enableAutoStoreButton();
+        }
+    });
+}
+
 function addCollapsibleRow(rowData = {}) {
     const container = document.querySelector('.pid-entries');
     const entry = document.createElement('div');
     entry.className = 'pid-entry';
+    const safe = (v)=>String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
     const enabledChecked = (rowData.enabled === false || rowData.Enabled === false) ? '' : 'checked';
 
     entry.innerHTML = `
         <div class="pid-header">
             <div class="header-left">
-                <button type="button" class="collapse-btn">▼</button>
+                <button type="button" class="collapse-btn">▸</button>
+                <button type="button" class="move-btn move-up-btn" title="Move up" aria-label="Move up">▲</button>
+                <button type="button" class="move-btn move-down-btn" title="Move down" aria-label="Move down">▼</button>
                 <span class="pid-title">New PID</span>
             </div>
             <div class="header-right">
@@ -544,27 +592,27 @@ function addCollapsibleRow(rowData = {}) {
             <table class="compact-form-table">
                 <tr>
                     <td>Name:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td>
-                    <td><input type="text" class="name-input" value="${rowData.Name || ''}" 
+                    <td><input type="text" class="name-input" value="${safe(rowData.Name || '')}"
                         placeholder="Parameter Name"></td>
                 </tr>
                 <tr>
                     <td>Init:</td>
-                    <td><input type="text" class="init-input" value="${rowData.Init || ''}" 
+                    <td><input type="text" class="init-input" value="${safe(rowData.Init || '')}"
                         placeholder="PID Init"></td>
                 </tr>
                 <tr>
                     <td>PID:</td>
-                    <td><input type="text" class="pid-input" value="${rowData.PID || ''}" 
+                    <td><input type="text" class="pid-input" value="${safe(rowData.PID || '')}"
                         placeholder="PID"></td>
                 </tr>
                 <tr>
                     <td>Expression:</td>
-                    <td><input type="text" class="expression-input" value="${rowData.Expression || ''}" 
+                    <td><input type="text" class="expression-input" value="${safe(rowData.Expression || '')}"
                         placeholder="Enter expression"></td>
                 </tr>
                 <tr>
                     <td>Unit:</td>
-                    <td><input type="text" class="unit-input" value="${rowData.Unit || ''}" 
+                    <td><input type="text" class="unit-input" value="${safe(rowData.Unit || '')}"
                         placeholder="e.g. V, °C, kPa"></td>
                 </tr>
                 <!-- Class + Period hidden: Class is upstream HA/MQTT sensor metadata nothing
@@ -574,22 +622,32 @@ function addCollapsibleRow(rowData = {}) {
                      keeps round-tripping the auto_pid.json keys. -->
                 <tr style="display:none">
                     <td>Class:</td>
-                    <td><input type="text" class="class-input" value="${rowData.Class || ''}"
+                    <td><input type="text" class="class-input" value="${safe(rowData.Class || '')}"
                         placeholder="e.g. voltage, temp"></td>
                 </tr>
                 <tr>
                     <td>Min Value:</td>
-                    <td><input type="number" class="min-value-input" value="${rowData.MinValue || ''}" 
+                    <td><input type="number" class="min-value-input" value="${safe(rowData.MinValue || '')}"
                         step="0.01" placeholder="Minimum value"></td>
                 </tr>
                 <tr>
                     <td>Max Value:</td>
-                    <td><input type="number" class="max-value-input" value="${rowData.MaxValue || ''}" 
+                    <td><input type="number" class="max-value-input" value="${safe(rowData.MaxValue || '')}"
                         step="0.01" placeholder="Maximum value"></td>
+                </tr>
+                <tr>
+                    <td>Description:</td>
+                    <td><input type="text" class="description-input" value="${safe(rowData.description || '')}"
+                        placeholder="What this PID measures"></td>
+                </tr>
+                <tr>
+                    <td>Comment:</td>
+                    <td><input type="text" class="comment-input" value="${safe(rowData.comment || '')}"
+                        placeholder="Optional note (never sent to the ECU)"></td>
                 </tr>
                 <tr style="display:none">
                     <td>Period(ms):</td>
-                    <td><input type="number" class="period-input" value="${rowData.Period || ''}"
+                    <td><input type="number" class="period-input" value="${safe(rowData.Period || '')}"
                         placeholder="ms"></td>
                 </tr>
             </table>
@@ -628,7 +686,7 @@ const toggleCollapse = (e) => {
     e.stopPropagation();
     const isHidden = content.style.display === 'none' || getComputedStyle(content).display === 'none';
     content.style.display = isHidden ? 'block' : 'none';
-    collapseBtn.textContent = isHidden ? '▲' : '▼';
+    collapseBtn.textContent = isHidden ? '▾' : '▸';
 };
 
 header.addEventListener('click', toggleCollapse);
@@ -646,7 +704,10 @@ entry.querySelectorAll('input, select').forEach(input => {
     input.addEventListener('input', enableAutoStoreButton);
 });
 
+wireRowReorder(entry);
+
 container.appendChild(entry);
+return entry;
 }
 
 function normalizeFrameIdInputToNumber(v) {
@@ -692,7 +753,9 @@ function addCustomCanFilterEntry(rowData = {}) {
     entry.innerHTML = `
         <div class="pid-header">
             <div class="header-left">
-                <button type="button" class="collapse-btn">▼</button>
+                <button type="button" class="collapse-btn">▸</button>
+                <button type="button" class="move-btn move-up-btn" title="Move up" aria-label="Move up">▲</button>
+                <button type="button" class="move-btn move-down-btn" title="Move down" aria-label="Move down">▼</button>
                 <span class="pid-title">${safe(titleText)}</span>
             </div>
             <div class="header-right">
@@ -739,6 +802,14 @@ function addCustomCanFilterEntry(rowData = {}) {
                     <td>Max Value:</td>
                     <td><input type="number" class="max-input" value="${safe(p.max)}" step="0.01" placeholder="Max"></td>
                 </tr>
+                <tr>
+                    <td>Description:</td>
+                    <td><input type="text" class="description-input" value="${safe(p.description)}" placeholder="What this parameter measures"></td>
+                </tr>
+                <tr>
+                    <td>Comment:</td>
+                    <td><input type="text" class="comment-input" value="${safe(p.comment)}" placeholder="Optional note (never sent to the ECU)"></td>
+                </tr>
                 <tr style="display:none">
                     <td>Period(ms):</td>
                     <td><input type="number" class="period-input" value="${safe(p.period || '5000')}" min="100" max="60000"></td>
@@ -780,7 +851,7 @@ function addCustomCanFilterEntry(rowData = {}) {
         e.stopPropagation();
         const isHidden = content.style.display === 'none';
         content.style.display = isHidden ? 'block' : 'none';
-        collapseBtn.textContent = isHidden ? '▲' : '▼';
+        collapseBtn.textContent = isHidden ? '▾' : '▸';
     };
     header.addEventListener('click', toggleCollapse);
     collapseBtn.addEventListener('click', toggleCollapse);
@@ -796,15 +867,18 @@ function addCustomCanFilterEntry(rowData = {}) {
         input.addEventListener('change', () => { updateTitle(); enableAutoStoreButton(); });
     });
 
+    wireRowReorder(entry);
+
     container.appendChild(entry);
     enableAutoStoreButton();
+    return entry;
 }
 
 function addCustomFilterRow() {
-    addCustomCanFilterEntry({
+    promoteNewEntry(addCustomCanFilterEntry({
         frame_id: '',
         parameter: { name: 'New Parameter', expression: '', unit: '', class: '', period: '5000', min: '', max: '' }
-    });
+    }));
 }
 
 // Calculated channels (Task #17): a derived channel computed on-device from OTHER channel
@@ -826,7 +900,9 @@ function addCalculatedChannelEntry(rowData = {}) {
     entry.innerHTML = `
         <div class="pid-header">
             <div class="header-left">
-                <button type="button" class="collapse-btn">▼</button>
+                <button type="button" class="collapse-btn">▸</button>
+                <button type="button" class="move-btn move-up-btn" title="Move up" aria-label="Move up">▲</button>
+                <button type="button" class="move-btn move-down-btn" title="Move down" aria-label="Move down">▼</button>
                 <span class="pid-title">${safe(name)}</span>
             </div>
             <div class="header-right">
@@ -880,7 +956,7 @@ function addCalculatedChannelEntry(rowData = {}) {
         e.stopPropagation();
         const isHidden = content.style.display === 'none';
         content.style.display = isHidden ? 'block' : 'none';
-        collapseBtn.textContent = isHidden ? '▲' : '▼';
+        collapseBtn.textContent = isHidden ? '▾' : '▸';
     };
     header.addEventListener('click', toggleCollapse);
     collapseBtn.addEventListener('click', toggleCollapse);
@@ -894,12 +970,15 @@ function addCalculatedChannelEntry(rowData = {}) {
         input.addEventListener('change', () => { updateTitle(); enableAutoStoreButton(); });
     });
 
+    wireRowReorder(entry);
+
     container.appendChild(entry);
     enableAutoStoreButton();
+    return entry;
 }
 
 function addCalculatedRow() {
-    addCalculatedChannelEntry({ name: 'New Channel', expression: '', unit: '', enabled: true });
+    promoteNewEntry(addCalculatedChannelEntry({ name: 'New Channel', expression: '', unit: '', enabled: true }));
 }
 
 function loadAutoTable(jsonData) {
@@ -956,6 +1035,8 @@ function loadAutoTable(jsonData) {
                     MinValue: pidData.MinValue || '',
                     MaxValue: pidData.MaxValue || '',
                     Period: pidData.Period || '',
+                    description: pidData.description || '',
+                    comment: pidData.comment || '',
                     enabled: pidData.enabled
                 });
             });
@@ -979,6 +1060,8 @@ function loadAutoTable(jsonData) {
                                 type: param.type,
                                 min: param.min,
                                 max: param.max,
+                                description: param.description,
+                                comment: param.comment,
                                 enabled: param.enabled
                             }
                         });
@@ -1072,6 +1155,16 @@ async function storeAutoTableData() {
                     Period: entry.querySelector('.period-input')?.value || '',
                     enabled: entry.querySelector('.enabled-chk')?.checked !== false
                 };
+                // Pure metadata (issue #34): the engine never reads these, and an empty
+                // field emits no key at all, so no-note configs stay byte-identical.
+                const pidDescription = entry.querySelector('.description-input')?.value || '';
+                if (pidDescription) {
+                    pidData.description = pidDescription;
+                }
+                const pidComment = entry.querySelector('.comment-input')?.value || '';
+                if (pidComment) {
+                    pidData.comment = pidComment;
+                }
 
                 if (pidData.Name.length === 0 || pidData.Name.length >= 32) {
                     throw new Error("Name must not be empty and must be less than 32 characters");
@@ -1098,13 +1191,13 @@ async function storeAutoTableData() {
                 const fidNum = normalizeFrameIdInputToNumber(fidRaw);
                 const frameIdOut = (fidNum !== null) ? fidNum : String(fidRaw).trim();
                 if (!frameIdOut) {
-                    throw new Error('Custom filter frame_id is required');
+                    throw new Error('Broadcast PID Frame ID is required');
                 }
                 const key = (fidNum !== null) ? `n:${fidNum}` : `s:${String(fidRaw).trim().toLowerCase()}`;
                 if (!grouped.has(key)) {
                     grouped.set(key, { frame_id: frameIdOut, parameters: [] });
                 }
-                grouped.get(key).parameters.push({
+                const filterParam = {
                     name: entry.querySelector('.name-input')?.value || '',
                     expression: entry.querySelector('.expression-input')?.value || '',
                     unit: entry.querySelector('.unit-input')?.value || '',
@@ -1113,7 +1206,17 @@ async function storeAutoTableData() {
                     min: entry.querySelector('.min-input')?.value || '',
                     max: entry.querySelector('.max-input')?.value || '',
                     enabled: entry.querySelector('.enabled-chk')?.checked !== false
-                });
+                };
+                // Same omit-when-empty contract as the PID metadata (issue #34).
+                const filterDescription = entry.querySelector('.description-input')?.value || '';
+                if (filterDescription) {
+                    filterParam.description = filterDescription;
+                }
+                const filterComment = entry.querySelector('.comment-input')?.value || '';
+                if (filterComment) {
+                    filterParam.comment = filterComment;
+                }
+                grouped.get(key).parameters.push(filterParam);
             });
             custom_can_filters.push(...Array.from(grouped.values()));
         }
@@ -1128,7 +1231,7 @@ async function storeAutoTableData() {
             const enabled = entry.querySelector('.enabled-chk')?.checked !== false;
             if (!name) return;  // skip unnamed rows
             if (name.length > 47) {
-                throw new Error("Calculated channel name must be less than 48 characters");
+                throw new Error("Calculated PID name must be less than 48 characters");
             }
             calculated_data.push({ name, expression, unit, enabled });
         });
