@@ -699,7 +699,8 @@ static esp_err_t index_handler(httpd_req_t *req)
 // reboot because every consumer re-reads them live (LED task each loop, smartconnect
 // per transition, batt-alert creds/protocol when an alert fires). Any change to a
 // field NOT listed here still forces a reboot via the memcmp(probe,shadow) backstop.
-// batt_alert (master) is inert: the parser force-disables it, so it can never diff.
+// batt_alert (master) and periodic_wakeup are inert: the parser force-disables both, so
+// neither can ever diff.
 // Deliberately EXCLUDED (stay reboot-required): batt_alert_volt, batt_alert_time
 // (cached once into adc_task statics). Keep this list in lockstep with
 // docs/goal-live-reconfigure.md (exactly 20 keys).
@@ -2874,18 +2875,25 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	ESP_LOGI(TAG, "dst->ap_auto_disable: %s", dst->ap_auto_disable);
 
 	//*****
-	key = cJSON_GetObjectItem(root,"periodic_wakeup");
-	if(key == 0)
-	{
-		strlcpy(dst->periodic_wakeup, "disable", sizeof(dst->periodic_wakeup));
-	}
-	else
-	{
-		strlcpy(dst->periodic_wakeup, key->valuestring, sizeof(dst->periodic_wakeup));
-	}
+	// Periodic wakeup is retired: the wake was only an esp_restart() that nothing
+	// distinguishes from a cold boot (nobody reads POWER_WAKE), and this build has no
+	// outbound client to report with -- so it just burned parked battery. Pinned here
+	// rather than in the UI alone so already-deployed devices with periodic_wakeup=enable
+	// stop waking at their next boot, and so a direct POST /store_config cannot re-arm it.
+	// Same treatment as batt_alert above. To revive for issue #24, restore the parse.
+	// key = cJSON_GetObjectItem(root,"periodic_wakeup");
+	// if(key == 0)
+	// {
+	// 	strlcpy(dst->periodic_wakeup, "disable", sizeof(dst->periodic_wakeup));
+	// }
+	// else
+	// {
+	// 	strlcpy(dst->periodic_wakeup, key->valuestring, sizeof(dst->periodic_wakeup));
+	// }
 
+	strlcpy(dst->periodic_wakeup, "disable", sizeof(dst->periodic_wakeup));
 	ESP_LOGI(TAG, "dst->periodic_wakeup: %s", dst->periodic_wakeup);
-	//*****	
+	//*****
 
 	//*****	
 	key = cJSON_GetObjectItem(root,"wakeup_interval");

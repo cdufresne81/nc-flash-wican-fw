@@ -1750,8 +1750,6 @@ function getElements() {
         sleepDisableAgree: document.getElementById("sleep_disable_agree"),
         protocol: document.getElementById("protocol"),
         portType: document.getElementById("port_type"),
-        periodicWakeup: document.getElementById("periodic_wakeup"),
-        wakeupEveryRow: document.getElementById("wakeup_every_row"),
         sta_ble_info: document.getElementById("sta_ble_info")
     };
 }
@@ -1797,9 +1795,6 @@ function submit_enable() {
     
     // Configure MQTT and battery alert visibility
     configureMqttAndBatteryAlerts(elements);
-    
-    // Configure periodic wakeup settings
-    configurePeriodicWakeup(elements);
 }
 
 function configureWifiModeSettings(elements, wifiMode) {
@@ -1943,18 +1938,6 @@ function configureMqttAndBatteryAlerts(elements) {
     elements.battAlertDiv.style.display = "none";
 }
 
-// Periodic wakeup is inert on WICAN_PRO: the wake is a plain esp_restart() that no code
-// distinguishes from a cold boot, and this build has no outbound client to report with.
-// Pinned to "disable" (same shape as configureMqttAndBatteryAlerts above) so a device
-// that had it enabled is actually switched off on its next Submit, not merely stripped
-// of the UI. The elements stay in the DOM -- storeData() reads both ids unconditionally,
-// so periodic_wakeup / wakeup_interval keep round-tripping. See the hidden rows in
-// homepage_full.html and GitHub issue #24 for what would bring this back.
-function configurePeriodicWakeup(elements) {
-    elements.periodicWakeup.value = "disable";
-    elements.periodicWakeup.disabled = true;
-    elements.wakeupEveryRow.style.display = "none";
-}
 document.getElementById("defaultOpen").click();
 function checkStatus() {
     const xhttp = new XMLHttpRequest();
@@ -2668,11 +2651,10 @@ xhttp.onload = async function() {
             document.getElementById("sleep_disable_agree").selectedIndex = "0";
         }
         toggleSleepWarning();
-        if(obj.periodic_wakeup == "enable") {
-            document.getElementById("periodic_wakeup").selectedIndex = "0";
-        } else if(obj.periodic_wakeup == "disable") {
-            document.getElementById("periodic_wakeup").selectedIndex = "1";
-        }
+        // Pinned, not mirrored: periodic wakeup is retired and the firmware force-disables
+        // the key in the config parser. A legacy config.json may still say "enable" (
+        // /load_config streams the raw file), so ignore it and post "disable" back.
+        document.getElementById("periodic_wakeup").value = "disable";
 
         document.getElementById("batt_mqtt_user").value = obj.batt_mqtt_user;
         document.getElementById("batt_mqtt_pass").value = obj.batt_mqtt_pass;
