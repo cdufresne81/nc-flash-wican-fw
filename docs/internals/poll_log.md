@@ -6,7 +6,9 @@ Verified on device build `v1.6.0-4-gf553d31` (bench PCM, 19 PIDs): 2.5 ms avg RT
 
 ## Polling model: free-running, one request in flight
 
-There is **no pacing timer**. The RX task runs a single-PID round-robin over every enabled PID in `s_cfg->pids`: send one request, wait for that reply (or timeout), immediately send the next. The ECU therefore sets the tempo — a busy ECU answers slower and the poll rate drops with it, which is why the design cannot overload the ECU or the bus (self-pacing; a bench-measured sweep of 19 PIDs ≈ 10% of a 500 kbit/s bus).
+The RX task runs a single-PID round-robin over every enabled PID in `s_cfg->pids`: send one request, wait for that reply (or timeout), immediately send the next. The ECU sets the tempo — a busy ECU answers slower and the poll rate drops with it, which is why the design cannot overload the ECU or the bus (self-pacing; a bench-measured sweep of 19 PIDs ≈ 10% of a 500 kbit/s bus).
+
+The **only** pacing is the `POLLLOG_MIN_SWEEP_MS` floor at the end of each sweep (the 100 Hz cap below). There is no periodic timer, no tick source, and no per-PID delay — self-pacing plus one ceiling.
 
 Key constants (top of `poll_log.c`):
 
