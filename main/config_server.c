@@ -859,13 +859,10 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 	// below, so config.json is parsed only once.
 	bool do_reboot = true;   // default to the always-correct behavior
 	device_config_t *shadow = heap_caps_malloc(sizeof *shadow, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-	device_config_t *probe  = heap_caps_malloc(sizeof *probe,  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-	if (shadow == NULL || probe == NULL)
+	if (shadow == NULL)
 	{
 		ESP_LOGE(TAG, "config validate: allocation failed, not persisting");
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
-		free(shadow);
-		free(probe);
 		free(buf);
 		return ESP_ERR_NO_MEM;
 	}
@@ -878,7 +875,6 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
 			"Configuration rejected: a required field is missing or invalid");
 		free(shadow);
-		free(probe);
 		free(buf);
 		return ESP_FAIL;
 	}
@@ -890,7 +886,6 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 		ESP_LOGE(TAG, "Failed to open %s for writing", FS_MOUNT_POINT "/config.json");
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save configuration");
 		free(shadow);
-		free(probe);
 		free(buf);
 		return ESP_FAIL;
 	}
@@ -900,7 +895,6 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 		ESP_LOGE(TAG, "Failed to write configuration: %zu/%d bytes written", written, received);
 		fclose(f);
 		free(shadow);
-		free(probe);
 		free(buf);
 		return ESP_FAIL;
 	}
@@ -909,42 +903,48 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 	// ---- Live-apply decision (issue #39) -------------------------------------
 	// Reuse the shadow parsed above so a live apply is byte-for-byte reboot-
 	// equivalent. Reboot dominates: apply live ONLY when every changed field is
-	// whitelisted.
-	// STEP 3: probe = live config with ONLY the whitelisted fields overwritten
-	// by the parsed values (full-field memcpy, never strlcpy). If probe still
-	// differs from the fully-parsed shadow, a non-whitelist field changed.
-	memcpy(probe, &device_config, sizeof *probe);
-	#define LIVE_APPLY_FIELD(F) memcpy((char *)probe  + offsetof(device_config_t, F), \
-	                                   (char *)shadow + offsetof(device_config_t, F), \
-	                                   sizeof shadow->F);
-	LIVE_APPLY_WHITELIST(LIVE_APPLY_FIELD)
-	#undef LIVE_APPLY_FIELD
-
-	if (memcmp(probe, shadow, sizeof *shadow) == 0)
+	// whitelisted. probe is scratch for the whitelist diff and is needed only
+	// here -- allocate it now; if that fails, fall back to the always-correct
+	// reboot (the config is already validated and persisted).
+	device_config_t *probe = heap_caps_malloc(sizeof *probe, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (probe != NULL)
 	{
-		// STEP 5: only whitelisted fields changed -> copy each into the live
-		// config (field-width only; NEVER whole-struct memcpy, which would
-		// rewrite reboot fields and transiently zero sta_fallbacks).
-		#define LIVE_APPLY_FIELD(F) memcpy(&device_config.F, &shadow->F, sizeof device_config.F);
+		// probe = live config with ONLY the whitelisted fields overwritten by the
+		// parsed values (full-field memcpy, never strlcpy). If probe still differs
+		// from the fully-parsed shadow, a non-whitelist field changed.
+		memcpy(probe, &device_config, sizeof *probe);
+		#define LIVE_APPLY_FIELD(F) memcpy((char *)probe  + offsetof(device_config_t, F), \
+		                                   (char *)shadow + offsetof(device_config_t, F), \
+		                                   sizeof shadow->F);
 		LIVE_APPLY_WHITELIST(LIVE_APPLY_FIELD)
 		#undef LIVE_APPLY_FIELD
 
-		// STEP 6: refresh the cached raw-config string so /load_config and the
-		// next Submit don't revert the live change (httpd handlers serialize on
-		// one task -> plain swap+free is safe here).
-		char *fresh = heap_caps_malloc((size_t)received + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-		if (fresh != NULL)
+		if (memcmp(probe, shadow, sizeof *shadow) == 0)
 		{
-			memcpy(fresh, buf, (size_t)received);
-			fresh[received] = '\0';
-			char *old = device_config_file;
-			device_config_file = fresh;
-			free(old);
+			// Only whitelisted fields changed -> copy each into the live config
+			// (field-width only; NEVER whole-struct memcpy, which would rewrite
+			// reboot fields and transiently zero sta_fallbacks).
+			#define LIVE_APPLY_FIELD(F) memcpy(&device_config.F, &shadow->F, sizeof device_config.F);
+			LIVE_APPLY_WHITELIST(LIVE_APPLY_FIELD)
+			#undef LIVE_APPLY_FIELD
+
+			// Refresh the cached raw-config string so /load_config and the next
+			// Submit don't revert the live change (httpd handlers serialize on one
+			// task -> plain swap+free is safe here).
+			char *fresh = heap_caps_malloc((size_t)received + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+			if (fresh != NULL)
+			{
+				memcpy(fresh, buf, (size_t)received);
+				fresh[received] = '\0';
+				char *old = device_config_file;
+				device_config_file = fresh;
+				free(old);
+			}
+			do_reboot = false;
 		}
-		do_reboot = false;
+		free(probe);
 	}
 	free(shadow);
-	free(probe);
 
 	// Honest envelope: reboot only when a reboot-required field changed.
 	if (do_reboot)
