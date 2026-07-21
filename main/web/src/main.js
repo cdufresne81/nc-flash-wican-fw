@@ -1321,6 +1321,12 @@ function readSampleEvery(entry) {
     return /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
 }
 
+// Effective divisor: 0, 1, and any non-integer/NaN all mean "every sweep" (=1); only an integer
+// >=2 actually gates. Single source for the load/min/hint call sites below. readSampleEvery() is
+// deliberately NOT normalized here -- the save validator still needs to tell garbage from a real
+// divisor -- so the normalizer is a separate one-liner applied only where an effective N is wanted.
+const effDivisor = n => (Number.isInteger(n) && n >= 2) ? n : 1;
+
 var pollActive   = false;  // /poll_status .active
 var pollQuiesced = false;  // /poll_status .quiesced
 var pollSweepMs  = 0;      // last measured mean sweep, ms; 0 = unknown
@@ -1331,8 +1337,7 @@ function sampleLoadFromEntries() {
     var sum = 0;
     document.querySelectorAll('.pid-entry').forEach(function (e) {
         if (e.querySelector('.enabled-chk')?.checked === false) return;
-        var n = readSampleEvery(e);
-        if (!Number.isInteger(n) || n < 2) n = 1;
+        var n = effDivisor(readSampleEvery(e));
         sum += 1 / n;
     });
     return sum;
@@ -1348,8 +1353,7 @@ function sampleLoadCommitted() {
         var sum = 0;
         pids.forEach(function (p) {
             if (p.enabled === false) return;
-            var n = parseInt(p.SampleEvery, 10);
-            if (!Number.isFinite(n) || n < 2) n = 1;
+            var n = effDivisor(parseInt(p.SampleEvery, 10));
             sum += 1 / n;
         });
         return sum;
@@ -1374,8 +1378,7 @@ function currentMinN() {
     var mn = 0;
     document.querySelectorAll('.pid-entry').forEach(function (e) {
         if (e.querySelector('.enabled-chk')?.checked === false) return;
-        var n = readSampleEvery(e);
-        if (!Number.isInteger(n) || n < 2) n = 1;
+        var n = effDivisor(readSampleEvery(e));
         if (mn === 0 || n < mn) mn = n;
     });
     return mn || 1;
@@ -1406,7 +1409,7 @@ function sampleUnknownReason() {
 }
 
 function sampleHintText(n, predMs) {
-    var mult = (Number.isInteger(n) && n >= 2) ? n : 1;
+    var mult = effDivisor(n);
     var label = (mult === 1) ? 'every sweep' : ('every ' + mult + ' sweeps');
     if (!predMs) return '≈ ' + label + ' (' + sampleUnknownReason() + ')';
     var ms = predMs * mult;

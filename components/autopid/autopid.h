@@ -92,7 +92,8 @@ typedef struct
     bool enabled;
     /* Sweep-divisor scheduling (issue #29): poll this PID on every Nth poll_log sweep.
      * 0 or 1 == every sweep -- the default and today's shipped behaviour. Parsed from
-     * "SampleEvery" (auto_pid.json pids/std_pids) or "sample_every" (car_data.json pids).
+     * "SampleEvery" on auto_pid.json custom pids and std_pids only (car_data.json is not
+     * wired -- NC-Miata-only build; calloc leaves it 0 there, i.e. every sweep).
      * Inert outside the POLL_LOG protocol (Legacy AutoPID and fast_log have no sweep). */
     uint8_t sample_every;
     /* Executed sweeps still to skip before this PID is due. Seeded at config load by
