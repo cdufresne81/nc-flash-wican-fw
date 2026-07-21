@@ -594,6 +594,12 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                     sh_value = "18DB33F1";
                 }
 
+                // standard_init is a single global field re-derived by every
+                // std_pid iteration (last one wins). Free the prior strdup before
+                // overwriting so N std_pids don't leak N-1 copies per parse -- a
+                // per-apply leak once live hot-reload re-parses on each save.
+                // (The block below reassigns it on every path, so no NULL needed.)
+                free(autopid_config->standard_init);
                 if (is_protocol_68 || is_protocol_79)
                 {
                     if (curr_pid->rxheader != NULL && strlen(curr_pid->rxheader) > 0)
@@ -634,7 +640,12 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                         {
                             if (strcmp(pid_info->params[i].name, strchr(curr_pid->parameters->name, '-') + 1) == 0)
                             {
+                                // parse_parameter_object already strdup'd "none"
+                                // defaults into class/unit; free them before the
+                                // lookup overwrite so the defaults don't leak.
+                                free(curr_pid->parameters->class);
                                 curr_pid->parameters->class = strdup_psram(pid_info->params[i].class);
+                                free(curr_pid->parameters->unit);
                                 curr_pid->parameters->unit = strdup_psram(pid_info->params[i].unit);
                                 char pid_hex[3];
                                 strncpy(pid_hex, curr_pid->parameters->name, 2);

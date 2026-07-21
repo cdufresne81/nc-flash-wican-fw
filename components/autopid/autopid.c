@@ -321,6 +321,24 @@ autopid_config_t *autopid_reload_config(void)
         autopid_config_deep_free(new_cfg);
         return NULL;
     }
+
+    // Trip-open vs reload race (issue #43 P1): the safe-point check
+    // (!csv_logger_session_active()) can pass, then this function spends ~100 ms in
+    // load_autopid_config() while the CSV writer opens a trip -- its header is frozen
+    // from the OLD table but records would then come from the NEW one for the whole
+    // trip (column mismatch). Re-check UNDER s_autopid_mutex: the column provider
+    // (autopid_collect_log_columns) takes the same mutex to read the table, so if it
+    // already ran, its read strictly precedes this re-check. If a session is now open,
+    // defer -- don't swap; the caller re-arms and retries once the trip closes. This
+    // shrinks the exposure from the whole parse to the writer's file-open instant.
+    if (csv_logger_session_active())
+    {
+        xSemaphoreGive(s_autopid_mutex);
+        ESP_LOGI(TAG, "reload: CSV trip opened mid-parse, deferring swap until it closes");
+        autopid_config_deep_free(new_cfg);
+        return AUTOPID_RELOAD_DEFERRED;
+    }
+
     autopid_config_t *old_cfg = autopid_config;
     autopid_config = new_cfg;
 

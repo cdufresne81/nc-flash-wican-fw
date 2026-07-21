@@ -467,7 +467,14 @@ static void polllog_rx_task(void *arg)
         {
             s_reload_requested = false;
             autopid_config_t *n = autopid_reload_config();
-            if (n != NULL)
+            if (n == AUTOPID_RELOAD_DEFERRED)
+            {
+                /* A CSV trip opened between our check above and the swap (issue #43 P1).
+                 * Not a rejection: re-arm so the swap retries at the next safe point once
+                 * the trip closes. Leave s_last_reload_ok untouched (no outcome yet). */
+                s_reload_requested = true;
+            }
+            else if (n != NULL)
             {
                 s_cfg = n;
                 s_pid_count = n->pid_count;
