@@ -85,10 +85,22 @@ static char *device_id;
 static EventGroupHandle_t xautopid_event_group = NULL;
 static StaticEventGroup_t xautopid_event_group_buffer;
 static autopid_config_t *autopid_config = NULL;
+// Config mutex hoisted out of the swappable autopid_config struct (issue #39): a live
+// PID-table hot-swap frees the old struct, so a per-struct mutex handle (the former
+// autopid_config->mutex) was a use-after-free once locked cross-task after a swap.
+// This file-static handle is created once and never destroyed, so it stays valid
+// across swaps and is the single serialization point for the config pointer.
+static SemaphoreHandle_t s_autopid_mutex = NULL;
+// Serializes auto_pid.json file writes (store_auto_data_handler) against the live
+// reload's count+parse (P2 TOCTOU guard, issue #39). Created once at config load.
+static SemaphoreHandle_t s_autopid_file_lock = NULL;
 static autopid_data_t autopid_data = {.json_str = NULL, .mutex = NULL};
 static QueueHandle_t protocolnumberQueue = NULL;
 // Cached configuration JSON (built once after autopid_config is loaded)
 static char *autopid_config_json = NULL;
+// Previous /autopid_data cache generation, retired one reload late so an httpd handler
+// mid-send of the returned pointer isn't freed under it (issue #39). Poll-task only.
+static char *s_prev_cfg_json = NULL;
 static StaticTimer_t autopid_bit_set_timer_buffer;
 static TimerHandle_t autopid_bit_set_timer_handle = NULL;
 
@@ -234,19 +246,96 @@ esp_err_t autopid_get_protocol_number(int32_t *protocol_value)
 
 bool autopid_lock(uint32_t timeout_ms)
 {
-    if (!autopid_config || !autopid_config->mutex)
+    if (!autopid_config || !s_autopid_mutex)
         return false;
 
     TickType_t to = pdMS_TO_TICKS(timeout_ms);
-    return (xSemaphoreTake(autopid_config->mutex, to) == pdTRUE);
+    return (xSemaphoreTake(s_autopid_mutex, to) == pdTRUE);
 }
 
 void autopid_unlock(void)
 {
-    if (!autopid_config || !autopid_config->mutex)
+    if (!autopid_config || !s_autopid_mutex)
         return;
 
-    xSemaphoreGive(autopid_config->mutex);
+    xSemaphoreGive(s_autopid_mutex);
+}
+
+// --- Live PID-table hot-swap (issue #39) --------------------------------------
+// File lock (P2): serialize auto_pid.json writes against the reload's count+parse so a
+// write landing between load_autopid_config()'s count and parse can't make parse iterate
+// a larger array than was allocated (heap overflow). No-op until created at config load.
+void autopid_file_lock(void)
+{
+    if (s_autopid_file_lock)
+        xSemaphoreTake(s_autopid_file_lock, portMAX_DELAY);
+}
+
+void autopid_file_unlock(void)
+{
+    if (s_autopid_file_lock)
+        xSemaphoreGive(s_autopid_file_lock);
+}
+
+autopid_config_t *autopid_reload_config(void)
+{
+    // 1. Re-parse auto_pid.json OFF the config lock (SD/flash I/O), serialized against
+    //    the handler's file write so we never parse a torn size (P2).
+    autopid_file_lock();
+    autopid_config_t *new_cfg = load_autopid_config();
+    autopid_file_unlock();
+    if (!new_cfg)
+    {
+        ESP_LOGW(TAG, "reload: load_autopid_config returned NULL, keeping old table");
+        return NULL;
+    }
+
+    // 2. Known-good validation. cmd==NULL is a NORMAL, poll-loop-tolerated state -- not only
+    //    for disabled/std/tail pids but for an ENABLED pid whose name doesn't resolve to a
+    //    command (polllog_poll_one returns on !pid->cmd regardless of enabled). Rejecting on
+    //    enabled+cmd==NULL would refuse a table a reboot loads fine, breaking reboot-equivalence
+    //    and turning the handler's "live" reply into a lie. So validate only the shape that is
+    //    a real hazard: a parameter array whose count disagrees with its (NULL) base -> an
+    //    out-of-bounds read in the poll loop. On reject, keep the old table (never brick).
+    if (new_cfg->pids)
+    {
+        for (uint32_t i = 0; i < new_cfg->pid_count; i++)
+        {
+            pid_data_t *p = &new_cfg->pids[i];
+            if (p->parameters_count > 0 && p->parameters == NULL)
+            {
+                ESP_LOGW(TAG, "reload: pid %lu parameter array inconsistent, rejecting reload", (unsigned long)i);
+                autopid_config_deep_free(new_cfg);
+                return NULL;
+            }
+        }
+    }
+
+    // 3. Swap under the config lock (single aligned pointer store). Take s_autopid_mutex
+    //    directly with portMAX_DELAY (a true infinite wait) -- autopid_lock() would run it
+    //    through pdMS_TO_TICKS and overflow it to a finite timeout. Matches the file's other
+    //    swap-critical sites. autopid_config is non-NULL here (the old table is still live).
+    if (xSemaphoreTake(s_autopid_mutex, portMAX_DELAY) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "reload: could not take config lock, rejecting reload");
+        autopid_config_deep_free(new_cfg);
+        return NULL;
+    }
+    autopid_config_t *old_cfg = autopid_config;
+    autopid_config = new_cfg;
+
+    // 4. Invalidate the /autopid_data cache (lazy rebuild from the new table). Two-generation
+    //    retirement: free the PREVIOUS stale string now, hold THIS one until the next reload
+    //    so a concurrent get-then-send of the returned raw pointer isn't freed under it.
+    free(s_prev_cfg_json);
+    s_prev_cfg_json = autopid_config_json;
+    autopid_config_json = NULL;
+    xSemaphoreGive(s_autopid_mutex);
+
+    // 5. Free the old table AFTER the global was republished under the lock and every
+    //    reader observes the new base (see the UAF-free proof in docs/goal-live-reconfigure.md).
+    autopid_config_deep_free(old_cfg);
+    return new_cfg;
 }
 
 // Column provider for the wide CSV logger (Task #11). Registered via
@@ -270,7 +359,7 @@ static int autopid_collect_log_columns(char (*names)[CSV_LOGGER_NAME_MAX],
                                        char (*sources)[CSV_LOGGER_SOURCE_MAX],
                                        int max_cols)
 {
-    if (!autopid_config || !autopid_config->mutex)
+    if (!autopid_config || !s_autopid_mutex)
         return -1;
     if (!autopid_lock(100))
         return -1;
@@ -688,7 +777,7 @@ static void merge_response_frames(uint8_t *data, uint32_t length, uint8_t *merge
 
 esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint32_t available_pids_size)
 {
-    if (autopid_config == NULL || autopid_config->mutex == NULL)
+    if (autopid_config == NULL || s_autopid_mutex == NULL)
     {
         ESP_LOGE(TAG, "autopid_config not initialized");
         return ESP_ERR_INVALID_STATE;
@@ -724,7 +813,7 @@ esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint
         return ESP_ERR_NO_MEM;
     }
 
-    xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
+    xSemaphoreTake(s_autopid_mutex, portMAX_DELAY);
 
     cJSON *root = cJSON_CreateObject();
     cJSON *pid_array = cJSON_CreateArray();
@@ -749,7 +838,7 @@ esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint
         ESP_LOGE(TAG, "Invalid protocol number: %d", selected_protocol);
         // elm327_unlock();
         free(response);
-        xSemaphoreGive(autopid_config->mutex);
+        xSemaphoreGive(s_autopid_mutex);
         return ESP_FAIL;
     }
 
@@ -916,7 +1005,7 @@ esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint
             // while (xQueueReceive(autopidQueue, response, pdMS_TO_TICKS(1000)) == pdPASS);
 
             free(response);
-            xSemaphoreGive(autopid_config->mutex);
+            xSemaphoreGive(s_autopid_mutex);
             return ESP_OK;
         }
         ESP_LOGW(TAG, "JSON string too long for buffer");
@@ -934,13 +1023,13 @@ esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint
     cJSON_Delete(root);
     free(response);
     // elm327_unlock();
-    xSemaphoreGive(autopid_config->mutex);
+    xSemaphoreGive(s_autopid_mutex);
     return ESP_FAIL;
 }
 
 static void autopid_data_update(autopid_config_t *pids)
 {
-    if (!pids || !pids->mutex)
+    if (!pids || !s_autopid_mutex)
     {
         ESP_LOGE(TAG, "Invalid autopid_config or mutex");
         return;
@@ -1116,20 +1205,20 @@ char *autopid_get_config(void)
     if (autopid_config_json == NULL)
     {
         // Build lazily if possible (defensive in case init wasn't called yet)
-        if (!autopid_config || !autopid_config->mutex)
+        if (!autopid_config || !s_autopid_mutex)
         {
             ESP_LOGE(TAG, "autopid_get_config: autopid_config not ready");
             return NULL;
         }
 
         // Build under mutex and cache
-        if (xSemaphoreTake(autopid_config->mutex, portMAX_DELAY) == pdTRUE)
+        if (xSemaphoreTake(s_autopid_mutex, portMAX_DELAY) == pdTRUE)
         {
             cJSON *parameters_object = cJSON_CreateObject();
             if (!parameters_object)
             {
                 ESP_LOGE(TAG, "Failed to create JSON object");
-                xSemaphoreGive(autopid_config->mutex);
+                xSemaphoreGive(s_autopid_mutex);
                 return NULL;
             }
 
@@ -1199,7 +1288,7 @@ char *autopid_get_config(void)
                 free(json_tmp);
             }
             cJSON_Delete(parameters_object);
-            xSemaphoreGive(autopid_config->mutex);
+            xSemaphoreGive(s_autopid_mutex);
         }
     }
     return autopid_config_json;
@@ -2175,7 +2264,7 @@ static bool all_parameters_failed(autopid_config_t *autopid_config)
 
     bool any_success = false;
 
-    xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
+    xSemaphoreTake(s_autopid_mutex, portMAX_DELAY);
     for (uint32_t i = 0; i < autopid_config->pid_count; i++)
     {
         pid_data_t *curr_pid = &autopid_config->pids[i];
@@ -2190,7 +2279,7 @@ static bool all_parameters_failed(autopid_config_t *autopid_config)
         if (any_success)
             break;
     }
-    xSemaphoreGive(autopid_config->mutex);
+    xSemaphoreGive(s_autopid_mutex);
 
     return !any_success;
 }
@@ -2256,7 +2345,7 @@ static void autopid_task(void *pvParameters)
         return;
     }
 
-    // xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
+    // xSemaphoreTake(s_autopid_mutex, portMAX_DELAY);
     // uint32_t total_params = 0;
 
     // for (uint32_t i = 0; i < autopid_config->pid_count; i++)
@@ -2265,7 +2354,7 @@ static void autopid_task(void *pvParameters)
     // }
 
     // bool *pid_failed = calloc(total_params, sizeof(bool));
-    // xSemaphoreGive(autopid_config->mutex);
+    // xSemaphoreGive(s_autopid_mutex);
 
     // Select ECU protocol.
     // - If configured as "0": use Auto (query ELM for negotiated protocol)
@@ -2426,7 +2515,7 @@ static void autopid_task(void *pvParameters)
         // elm327_lock();
         if (!pid_polling_paused)
         {
-            xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
+            xSemaphoreTake(s_autopid_mutex, portMAX_DELAY);
 
             // Loop through all PIDs
             for (uint32_t i = 0; i < autopid_config->pid_count; i++)
@@ -2644,10 +2733,10 @@ static void autopid_task(void *pvParameters)
                         // Update pid data
                         autopid_data_update(autopid_config);
                         // pause 100ms between pid requests
-                        xSemaphoreGive(autopid_config->mutex);
+                        xSemaphoreGive(s_autopid_mutex);
                         dev_status_wait_for_bits(DEV_AUTOPID_ELM327_APP_BIT, portMAX_DELAY);
                         vTaskDelay(pdMS_TO_TICKS(100));
-                        xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
+                        xSemaphoreTake(s_autopid_mutex, portMAX_DELAY);
                     }
                     else
                     {
@@ -2658,7 +2747,7 @@ static void autopid_task(void *pvParameters)
         }
 
             // elm327_unlock();
-            xSemaphoreGive(autopid_config->mutex);
+            xSemaphoreGive(s_autopid_mutex);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
 
@@ -2674,7 +2763,7 @@ static void autopid_task(void *pvParameters)
             while (xQueueReceive(autopidQueue, &monitor_rsp, 0) == pdPASS)
                 ;
 
-            xSemaphoreTake(autopid_config->mutex, portMAX_DELAY);
+            xSemaphoreTake(s_autopid_mutex, portMAX_DELAY);
 
             bool did_monitor = false;
             for (uint32_t fi = 0; fi < autopid_config->can_filters_count; fi++)
@@ -2737,7 +2826,7 @@ static void autopid_task(void *pvParameters)
                 previous_pid_type = PID_MAX;
             }
 
-            xSemaphoreGive(autopid_config->mutex);
+            xSemaphoreGive(s_autopid_mutex);
         }
 
         if (wc_timer_is_expired(&ecu_check_timer))
@@ -2841,11 +2930,15 @@ autopid_config_t *autopid_load_config_only(void)
         return NULL;
     }
 
-    autopid_config->mutex = xSemaphoreCreateMutex();
-    if (autopid_config->mutex == NULL)
+    s_autopid_mutex = xSemaphoreCreateMutex();
+    if (s_autopid_mutex == NULL)
     {
         ESP_LOGE(TAG, "autopid_load_config_only: failed to create config mutex");
         return NULL;
+    }
+    if (s_autopid_file_lock == NULL)
+    {
+        s_autopid_file_lock = xSemaphoreCreateMutex();
     }
 
     if (autopid_data.mutex == NULL)
@@ -2942,13 +3035,17 @@ void autopid_init(char *id)
 
     if (autopid_config)
     {
-        autopid_config->mutex = xSemaphoreCreateMutex();
+        s_autopid_mutex = xSemaphoreCreateMutex();
+        if (s_autopid_file_lock == NULL)
+        {
+            s_autopid_file_lock = xSemaphoreCreateMutex();
+        }
 
         // if(autopid_config->pid_count > 0){
         //     print_pids(autopid_config); //broken
         // }
 
-        if (!autopid_config->mutex)
+        if (!s_autopid_mutex)
         {
             ESP_LOGE(TAG, "Failed to create autopid_config mutex");
             return;

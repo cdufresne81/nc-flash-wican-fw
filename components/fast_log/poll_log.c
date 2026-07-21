@@ -150,6 +150,14 @@ static void polllog_stats_reset(void)
  * refresh once per stats window. Plain aligned 32-bit fields -> atomic enough for a status
  * readout across the poll task and the httpd handler, so no mutex is needed. */
 static volatile bool     s_active = false;
+/* Live PID-table hot-swap (issue #39). s_reload_requested is set by the httpd handler
+ * (poll_log_request_reload) and drained on THIS task at the top-of-loop safe point.
+ * s_pid_count is a cross-task-safe mirror of s_cfg->pid_count so GET /poll_status never
+ * dereferences the swappable s_cfg. s_last_reload_ok publishes the true outcome (the
+ * handler answers optimistically before this task validates). */
+static volatile bool     s_reload_requested = false;
+static volatile bool     s_last_reload_ok = true;
+static volatile uint32_t s_pid_count = 0;
 static volatile uint32_t s_cum_ok = 0, s_cum_timeout = 0, s_cum_txfail = 0;
 static volatile uint32_t s_win_ok = 0, s_win_timeout = 0, s_win_txfail = 0;
 static volatile float    s_win_rtt_avg_ms = 0, s_win_rtt_min_ms = 0, s_win_rtt_max_ms = 0, s_win_req_s = 0;
@@ -451,6 +459,28 @@ static void polllog_rx_task(void *arg)
             continue;
         }
 
+        /* Live PID-table hot-swap safe point (issue #39): we own the poll task and hold
+         * no table pointer here (this is above the sweep). Do the swap here and nowhere
+         * else. Defer while a CSV trip is open so the wide columns stay frozen for the
+         * trip -- the flag stays set and drains at the first safe point after it closes. */
+        if (s_reload_requested && !csv_logger_session_active())
+        {
+            s_reload_requested = false;
+            autopid_config_t *n = autopid_reload_config();
+            if (n != NULL)
+            {
+                s_cfg = n;
+                s_pid_count = n->pid_count;
+                s_last_reload_ok = true;
+                ESP_LOGI(TAG, "PID table hot-reloaded: %u pids", (unsigned)s_pid_count);
+            }
+            else
+            {
+                s_last_reload_ok = false;
+                ESP_LOGW(TAG, "PID reload rejected -- keeping old table");
+            }
+        }
+
         const int64_t now = esp_timer_get_time();
 
         if (s_engine_running)
@@ -620,6 +650,7 @@ void poll_log_init(char *id, uint32_t log_period)
         s_polllog_guard = 0;
         return;
     }
+    s_pid_count = s_cfg->pid_count;   /* cross-task mirror for GET /poll_status (issue #39) */
     if (s_cfg->pid_count == 0)
     {
         ESP_LOGW(TAG, "config has 0 polled PIDs; POLL_LOG is poll-only, nothing to request");
@@ -724,16 +755,32 @@ char *poll_log_get_status_json(void)
              "\"rtt_avg_ms\":%.2f,\"rtt_min_ms\":%.2f,\"rtt_max_ms\":%.2f,\"req_s\":%.1f,"
              "\"sweep_ms\":%.1f,\"sweep_hz\":%.2f,\"pids\":%u,"
              "\"win_ok\":%u,\"win_timeout\":%u,\"win_txfail\":%u,"
-             "\"engine_running\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u}",
+             "\"engine_running\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s}",
              s_active ? "true" : "false",
              (unsigned)s_cum_ok, (unsigned)s_cum_timeout, (unsigned)s_cum_txfail,
              (double)s_win_rtt_avg_ms, (double)s_win_rtt_min_ms, (double)s_win_rtt_max_ms,
              (double)s_win_req_s,
              (double)s_sweep_ms, (double)s_sweep_hz,
-             (unsigned)(s_cfg ? s_cfg->pid_count : 0),
+             (unsigned)s_pid_count,   /* cross-task-safe mirror, never derefs s_cfg (issue #39) */
              (unsigned)s_win_ok, (unsigned)s_win_timeout, (unsigned)s_win_txfail,
              poll_log_engine_running() ? "true" : "false",
              s_quiesced ? "true" : "false",
-             (unsigned)poll_log_bus_idle_ms());
+             (unsigned)poll_log_bus_idle_ms(),
+             s_last_reload_ok ? "true" : "false");
     return buf;
+}
+
+/* Live PID-table hot-swap request (issue #39). Called on the httpd task by
+ * store_auto_data_handler after it writes the new auto_pid.json. Sets a flag ONLY; the
+ * actual re-parse + swap runs on the poll task at its top-of-loop safe point. s_active
+ * doubles as the mode guard: it is only true while POLL_LOG's task is running, so
+ * non-POLL_LOG modes (AUTO_PID/FAST_LOG) return false and the handler answers
+ * "reboot-required" -- the only correct answer when this task isn't the one owning the
+ * table. Returns true if the reload was queued. */
+bool poll_log_request_reload(void)
+{
+    if (!s_active)
+        return false;
+    s_reload_requested = true;
+    return true;
 }

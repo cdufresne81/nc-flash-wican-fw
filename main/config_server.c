@@ -54,6 +54,7 @@
 #include "cJSON.h"
 #include<stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include "ver.h"
 
 #include <esp_wifi.h>
@@ -209,6 +210,11 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"st
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"periodic_wakeup\":\"disable\",\"wakeup_interval\":\"5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
 static device_config_t device_config;
 TimerHandle_t xrestartTimer;
+
+// Boot parser hoisted out of config_server_load_cfg so the live-apply path in
+// store_config_handler can parse into a scratch struct without side effects.
+// Returns false on any parse/validation error (caller decides recovery).
+static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg);
 
 static void config_server_schedule_reboot(restart_tracker_planned_reason_t reason,
 								  restart_tracker_source_t source,
@@ -689,12 +695,42 @@ static esp_err_t index_handler(httpd_req_t *req)
     return (ret == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
+// LIVE whitelist (issue #39): the config.json keys that apply at runtime without a
+// reboot because every consumer re-reads them live (LED task each loop, smartconnect
+// per transition, batt-alert creds/protocol when an alert fires). Any change to a
+// field NOT listed here still forces a reboot via the memcmp(probe,shadow) backstop.
+// batt_alert (master) is inert: the parser force-disables it, so it can never diff.
+// Deliberately EXCLUDED (stay reboot-required): batt_alert_volt, batt_alert_time
+// (cached once into adc_task statics). Keep this list in lockstep with
+// docs/goal-live-reconfigure.md (exactly 20 keys).
+#define LIVE_APPLY_WHITELIST(X) \
+	X(led_blink_ms) \
+	X(home_ssid) X(home_password) X(home_security) X(home_protocol) \
+	X(drive_ssid) X(drive_password) X(drive_security) X(drive_protocol) \
+	X(drive_connection_type) X(drive_mode_timeout) \
+	X(batt_alert) X(batt_alert_protocol) X(batt_alert_ssid) X(batt_alert_pass) \
+	X(batt_alert_url) X(batt_alert_port) X(batt_alert_topic) \
+	X(batt_mqtt_user) X(batt_mqtt_pass)
+
+// Single authority for the honest apply-envelope wire contract (issue #39), shared by
+// /store_config and /store_auto_data. `applied` is one of "reboot"|"live"|"deferred";
+// `msg` is a fixed literal (never user input), so no JSON escaping is needed.
+static esp_err_t config_server_send_apply_envelope(httpd_req_t *req, bool reboot,
+						   const char *applied, const char *msg)
+{
+	char body[256];
+	snprintf(body, sizeof body,
+		 "{\"reboot\":%s,\"applied\":\"%s\",\"msg\":\"%s\"}",
+		 reboot ? "true" : "false", applied, msg);
+	httpd_resp_set_type(req, "application/json");
+	return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t store_config_handler(httpd_req_t *req)
 {
 	ESP_LOGI(TAG, "store_config_handler called: content_len=%d", req ? req->content_len : -1);
 
 	esp_err_t ret_val = ESP_OK;
-	bool response_sent = false;
 	FILE *f = NULL;
 
 	if (req == NULL)
@@ -835,15 +871,76 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 	}
 	fclose(f);
 
-	// Send success response
-	const char *resp_str = "Configuration saved! Rebooting...";
-	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-	response_sent = true;
+	// ---- Live-apply decision (issue #39) -------------------------------------
+	// Reuse the real boot parser so a live apply is byte-for-byte reboot-equivalent.
+	// Reboot dominates: apply live ONLY when every changed field is whitelisted.
+	bool do_reboot = true;   // default to the always-correct behavior
+	device_config_t *shadow = heap_caps_malloc(sizeof *shadow, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	device_config_t *probe  = heap_caps_malloc(sizeof *probe,  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (shadow != NULL && probe != NULL)
+	{
+		// STEP 2: seed shadow from the LIVE config (padding/skipped fields become
+		// byte-equal to RAM so the diff can't false-positive), then parse into it.
+		memcpy(shadow, &device_config, sizeof *shadow);
+		if (config_server_parse_cfg_into(shadow, buf))
+		{
+			// STEP 3: probe = live config with ONLY the whitelisted fields overwritten
+			// by the parsed values (full-field memcpy, never strlcpy). If probe still
+			// differs from the fully-parsed shadow, a non-whitelist field changed.
+			memcpy(probe, &device_config, sizeof *probe);
+			#define LIVE_APPLY_FIELD(F) memcpy((char *)probe  + offsetof(device_config_t, F), \
+			                                   (char *)shadow + offsetof(device_config_t, F), \
+			                                   sizeof shadow->F);
+			LIVE_APPLY_WHITELIST(LIVE_APPLY_FIELD)
+			#undef LIVE_APPLY_FIELD
 
-	// Trigger reboot
-	config_server_schedule_reboot(RESTART_TRACKER_PLANNED_REASON_CONFIG_APPLY,
-						 RESTART_TRACKER_SOURCE_WEB_UI,
-						 RESTART_TRACKER_FLAG_SETTINGS_SAVED);
+			if (memcmp(probe, shadow, sizeof *shadow) == 0)
+			{
+				// STEP 5: only whitelisted fields changed -> copy each into the live
+				// config (field-width only; NEVER whole-struct memcpy, which would
+				// rewrite reboot fields and transiently zero sta_fallbacks).
+				#define LIVE_APPLY_FIELD(F) memcpy(&device_config.F, &shadow->F, sizeof device_config.F);
+				LIVE_APPLY_WHITELIST(LIVE_APPLY_FIELD)
+				#undef LIVE_APPLY_FIELD
+
+				// STEP 6: refresh the cached raw-config string so /load_config and the
+				// next Submit don't revert the live change (httpd handlers serialize on
+				// one task -> plain swap+free is safe here).
+				char *fresh = heap_caps_malloc((size_t)received + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+				if (fresh != NULL)
+				{
+					memcpy(fresh, buf, (size_t)received);
+					fresh[received] = '\0';
+					char *old = device_config_file;
+					device_config_file = fresh;
+					free(old);
+				}
+				do_reboot = false;
+			}
+		}
+		else
+		{
+			ESP_LOGW(TAG, "live-apply: re-parse failed, rebooting to apply");
+		}
+	}
+	free(shadow);
+	free(probe);
+
+	// Honest envelope: reboot only when a reboot-required field changed.
+	if (do_reboot)
+	{
+		config_server_send_apply_envelope(req, true, "reboot",
+			"Configuration saved. Rebooting to apply.");
+		config_server_schedule_reboot(RESTART_TRACKER_PLANNED_REASON_CONFIG_APPLY,
+							 RESTART_TRACKER_SOURCE_WEB_UI,
+							 RESTART_TRACKER_FLAG_SETTINGS_SAVED);
+	}
+	else
+	{
+		config_server_send_apply_envelope(req, false, "live",
+			"Configuration applied (no reboot).");
+		ESP_LOGI(TAG, "config applied live (no reboot)");
+	}
 
 	free(buf);
 	return ESP_OK;
@@ -1141,10 +1238,14 @@ static esp_err_t store_auto_data_handler(httpd_req_t *req)
 
 	ESP_LOGI(TAG, "Validated JSON payload, size=%d bytes", received);
 
-	// Write to file
+	// Write to file under the autopid file lock (P2, issue #39): serializes against the
+	// live reload's count+parse so a reload can never observe a torn/half-written file
+	// (which would size pids[] from one generation and parse the other -> heap overflow).
+	autopid_file_lock();
 	FILE *f = fopen(FS_MOUNT_POINT "/auto_pid.json", "w");
 	if (f == NULL)
 	{
+		autopid_file_unlock();
 		ESP_LOGE(TAG, "Failed to open %s for writing", FS_MOUNT_POINT "/auto_pid.json");
 		free(json_buffer);
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open file for writing");
@@ -1156,18 +1257,40 @@ static esp_err_t store_auto_data_handler(httpd_req_t *req)
 	{
 		ESP_LOGE(TAG, "File write failed: %zu/%d bytes", written, received);
 		fclose(f);
+		autopid_file_unlock();
 		free(json_buffer);
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to write data to file");
 		return ESP_FAIL;
 	}
 
 	fclose(f);
+	autopid_file_unlock();
 	free(json_buffer);
 
-	// Send success response
-	const char *resp_str = "Auto PID table will take effect after submit.";
-	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-	ESP_LOGI(TAG, "store_auto_data_handler completed successfully: written=%d bytes", received);
+	// ---- Honest envelope (issue #39) -----------------------------------------
+	// The file is written, so the new table applies at next boot regardless. Decide
+	// whether it ALSO applies live:
+	//   !queued            -> not POLL_LOG mode: only a reboot can load it.
+	//   trip open          -> defer: the swap runs when the current CSV trip closes
+	//                         (its columns stay frozen mid-trip) or on reboot.
+	//   otherwise          -> live: the swap runs at the poll task's next safe point.
+	bool queued = poll_log_request_reload();
+	if (!queued)
+	{
+		config_server_send_apply_envelope(req, true, "reboot",
+			"PID table saved; takes effect after reboot.");
+	}
+	else if (csv_logger_session_active())
+	{
+		config_server_send_apply_envelope(req, false, "deferred",
+			"Datalog trip in progress -- new PID table takes effect when this trip ends (or on reboot).");
+	}
+	else
+	{
+		config_server_send_apply_envelope(req, false, "live",
+			"PID table applied. New logging columns start with the next trip.");
+	}
+	ESP_LOGI(TAG, "store_auto_data_handler completed: written=%d bytes, queued=%d", received, (int)queued);
 
 	return ESP_OK;
 }
@@ -2013,7 +2136,7 @@ static const httpd_uri_t poll_status_uri = {
     .user_ctx  = NULL
 };
 
-static void config_server_load_cfg(char *cfg)
+static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 {
 	cJSON * root, *key = 0;
 	root = cJSON_Parse(cfg);
@@ -2021,14 +2144,13 @@ static void config_server_load_cfg(char *cfg)
 		ESP_LOGE(TAG, "Failed to parse JSON config");
 		goto config_error_no_json;
 	}
-	struct stat st;
 
 	// Initialize fallback list to empty before parsing
-	device_config.sta_fallbacks_count = 0;
+	dst->sta_fallbacks_count = 0;
 	for (int i = 0; i < 5; ++i) {
-		device_config.sta_fallbacks[i].ssid[0] = '\0';
-		device_config.sta_fallbacks[i].pass[0] = '\0';
-		strlcpy(device_config.sta_fallbacks[i].security, "wpa3", sizeof(device_config.sta_fallbacks[i].security));
+		dst->sta_fallbacks[i].ssid[0] = '\0';
+		dst->sta_fallbacks[i].pass[0] = '\0';
+		strlcpy(dst->sta_fallbacks[i].security, "wpa3", sizeof(dst->sta_fallbacks[i].security));
 	}
 	
 	key = cJSON_GetObjectItem(root,"wifi_mode");
@@ -2039,8 +2161,8 @@ static void config_server_load_cfg(char *cfg)
 	if (key->valuestring == NULL) {
 		goto config_error;
 	}
-	strlcpy(device_config.wifi_mode, key->valuestring, sizeof(device_config.wifi_mode));
-	ESP_LOGI(TAG, "device_config.wifi_mode: %s", device_config.wifi_mode);
+	strlcpy(dst->wifi_mode, key->valuestring, sizeof(dst->wifi_mode));
+	ESP_LOGI(TAG, "dst->wifi_mode: %s", dst->wifi_mode);
 
 	key = cJSON_GetObjectItem(root,"ap_ch");
 	if(key == 0)
@@ -2050,12 +2172,12 @@ static void config_server_load_cfg(char *cfg)
 	if (key->valuestring == NULL) {
 		goto config_error;
 	}
-	strlcpy(device_config.ap_ch, key->valuestring, sizeof(device_config.ap_ch));
-	ESP_LOGI(TAG, "device_config.ap_ch: %s", device_config.ap_ch);
+	strlcpy(dst->ap_ch, key->valuestring, sizeof(dst->ap_ch));
+	ESP_LOGI(TAG, "dst->ap_ch: %s", dst->ap_ch);
 
 	// Optional custom AP SSID (backward compatible)
-	strlcpy(device_config.ap_ssid_en, "disable", sizeof(device_config.ap_ssid_en));
-	device_config.ap_ssid[0] = '\0';
+	strlcpy(dst->ap_ssid_en, "disable", sizeof(dst->ap_ssid_en));
+	dst->ap_ssid[0] = '\0';
 	key = cJSON_GetObjectItem(root, "ap_ssid_en");
 	if (key)
 	{
@@ -2063,23 +2185,23 @@ static void config_server_load_cfg(char *cfg)
 		{
 			if (strcmp(key->valuestring, "enable") == 0 || strcmp(key->valuestring, "disable") == 0)
 			{
-				strlcpy(device_config.ap_ssid_en, key->valuestring, sizeof(device_config.ap_ssid_en));
+				strlcpy(dst->ap_ssid_en, key->valuestring, sizeof(dst->ap_ssid_en));
 			}
 		}
 		else if (cJSON_IsBool(key))
 		{
-			strlcpy(device_config.ap_ssid_en, cJSON_IsTrue(key) ? "enable" : "disable", sizeof(device_config.ap_ssid_en));
+			strlcpy(dst->ap_ssid_en, cJSON_IsTrue(key) ? "enable" : "disable", sizeof(dst->ap_ssid_en));
 		}
 	}
-	ESP_LOGI(TAG, "device_config.ap_ssid_en: %s", device_config.ap_ssid_en);
+	ESP_LOGI(TAG, "dst->ap_ssid_en: %s", dst->ap_ssid_en);
 	key = cJSON_GetObjectItem(root, "ap_ssid");
 	if (key && cJSON_IsString(key) && key->valuestring)
 	{
-		strlcpy(device_config.ap_ssid, key->valuestring, sizeof(device_config.ap_ssid));
+		strlcpy(dst->ap_ssid, key->valuestring, sizeof(dst->ap_ssid));
 	}
-	if (strcmp(device_config.ap_ssid_en, "enable") == 0)
+	if (strcmp(dst->ap_ssid_en, "enable") == 0)
 	{
-		size_t ap_ssid_len = strlen(device_config.ap_ssid);
+		size_t ap_ssid_len = strlen(dst->ap_ssid);
 		if (ap_ssid_len < AP_SSID_MIN_LEN || ap_ssid_len > AP_SSID_MAX_LEN)
 		{
 			ESP_LOGE(TAG, "Invalid ap_ssid length %u", (unsigned)ap_ssid_len);
@@ -2096,8 +2218,8 @@ static void config_server_load_cfg(char *cfg)
 	{
 		goto config_error;
 	}
-	strlcpy(device_config.sta_ssid, key->valuestring, sizeof(device_config.sta_ssid));
-	ESP_LOGI(TAG, "device_config.sta_ssid: %s", device_config.sta_ssid);
+	strlcpy(dst->sta_ssid, key->valuestring, sizeof(dst->sta_ssid));
+	ESP_LOGI(TAG, "dst->sta_ssid: %s", dst->sta_ssid);
 
 	key = cJSON_GetObjectItem(root,"sta_pass");
 	if(key == 0)
@@ -2108,8 +2230,8 @@ static void config_server_load_cfg(char *cfg)
 	{
 		goto config_error;
 	}
-	strlcpy(device_config.sta_pass, key->valuestring, sizeof(device_config.sta_pass));
-	ESP_LOGI(TAG, "device_config.sta_pass: %s", device_config.sta_pass);
+	strlcpy(dst->sta_pass, key->valuestring, sizeof(dst->sta_pass));
+	ESP_LOGI(TAG, "dst->sta_pass: %s", dst->sta_pass);
 
 	key = cJSON_GetObjectItem(root,"can_datarate");
 	if(key == 0)
@@ -2119,8 +2241,8 @@ static void config_server_load_cfg(char *cfg)
 	if (key->valuestring == NULL) {
 		goto config_error;
 	}
-	strlcpy(device_config.can_datarate, key->valuestring, sizeof(device_config.can_datarate));
-	ESP_LOGI(TAG, "device_config.can_datarate: %s", device_config.can_datarate);
+	strlcpy(dst->can_datarate, key->valuestring, sizeof(dst->can_datarate));
+	ESP_LOGI(TAG, "dst->can_datarate: %s", dst->can_datarate);
 
 	key = cJSON_GetObjectItem(root,"can_mode");
 	if(key == 0)
@@ -2130,8 +2252,8 @@ static void config_server_load_cfg(char *cfg)
 	if (key->valuestring == NULL) {
 		goto config_error;
 	}
-	strlcpy(device_config.can_mode, key->valuestring, sizeof(device_config.can_mode));
-	ESP_LOGI(TAG, "device_config.can_mode: %s", device_config.can_mode);
+	strlcpy(dst->can_mode, key->valuestring, sizeof(dst->can_mode));
+	ESP_LOGI(TAG, "dst->can_mode: %s", dst->can_mode);
 
 	key = cJSON_GetObjectItem(root,"port_type");
 	if(key == 0)
@@ -2141,8 +2263,8 @@ static void config_server_load_cfg(char *cfg)
 	if (key->valuestring == NULL) {
 		goto config_error;
 	}
-	strlcpy(device_config.port_type, key->valuestring, sizeof(device_config.port_type));
-	ESP_LOGI(TAG, "device_config.port_type: %s", device_config.port_type);
+	strlcpy(dst->port_type, key->valuestring, sizeof(dst->port_type));
+	ESP_LOGI(TAG, "dst->port_type: %s", dst->port_type);
 
 	key = cJSON_GetObjectItem(root,"port");
 	if(key == 0)
@@ -2152,8 +2274,8 @@ static void config_server_load_cfg(char *cfg)
 	if (key->valuestring == NULL) {
 		goto config_error;
 	}
-	strlcpy(device_config.port, key->valuestring, sizeof(device_config.port));
-	ESP_LOGI(TAG, "device_config.port: %s", device_config.port);
+	strlcpy(dst->port, key->valuestring, sizeof(dst->port));
+	ESP_LOGI(TAG, "dst->port: %s", dst->port);
 
 
 	key = cJSON_GetObjectItem(root,"ap_pass");
@@ -2165,8 +2287,8 @@ static void config_server_load_cfg(char *cfg)
 	{
 		goto config_error;
 	}
-	strlcpy(device_config.ap_pass, key->valuestring, sizeof(device_config.ap_pass));
-	ESP_LOGI(TAG, "device_config.ap_pass: %s", device_config.ap_pass);
+	strlcpy(dst->ap_pass, key->valuestring, sizeof(dst->ap_pass));
+	ESP_LOGI(TAG, "dst->ap_pass: %s", dst->ap_pass);
 
 	key = cJSON_GetObjectItem(root,"protocol");
 	if(key == 0)
@@ -2177,8 +2299,8 @@ static void config_server_load_cfg(char *cfg)
 	{
 		goto config_error;
 	}
-	strlcpy(device_config.protocol, key->valuestring, sizeof(device_config.protocol));
-	ESP_LOGI(TAG, "device_config.protocol: %s", device_config.protocol);
+	strlcpy(dst->protocol, key->valuestring, sizeof(dst->protocol));
+	ESP_LOGI(TAG, "dst->protocol: %s", dst->protocol);
 
 	key = cJSON_GetObjectItem(root,"ble_pass");
 	if(key == 0)
@@ -2189,8 +2311,8 @@ static void config_server_load_cfg(char *cfg)
 	{
 		goto config_error;
 	}
-	strlcpy(device_config.ble_pass, key->valuestring, sizeof(device_config.ble_pass));
-	ESP_LOGI(TAG, "device_config.ble_pass: %s", device_config.ble_pass);
+	strlcpy(dst->ble_pass, key->valuestring, sizeof(dst->ble_pass));
+	ESP_LOGI(TAG, "dst->ble_pass: %s", dst->ble_pass);
 
 	key = cJSON_GetObjectItem(root,"ble_power");
 	if(key && key->valuestring) {
@@ -2198,14 +2320,14 @@ static void config_server_load_cfg(char *cfg)
 		int p = atoi(key->valuestring);
 		switch(p){
 			case -12: case -9: case -6: case -3: case 0: case 3: case 6: case 9:
-				strlcpy(device_config.ble_power, key->valuestring, sizeof(device_config.ble_power));
+				strlcpy(dst->ble_power, key->valuestring, sizeof(dst->ble_power));
 				break;
 			default:
-				strlcpy(device_config.ble_power, "9", sizeof(device_config.ble_power));
+				strlcpy(dst->ble_power, "9", sizeof(dst->ble_power));
 				ESP_LOGW(TAG, "Invalid ble_power %d, defaulting to 9", p);
 		}
 	} else {
-		strlcpy(device_config.ble_power, "9", sizeof(device_config.ble_power));
+		strlcpy(dst->ble_power, "9", sizeof(dst->ble_power));
 		ESP_LOGW(TAG, "ble_power missing, defaulting to 9");
 	}
 
@@ -2218,8 +2340,8 @@ static void config_server_load_cfg(char *cfg)
 	if (key->valuestring == NULL) {
 		goto config_error;
 	}
-	strlcpy(device_config.sleep_status, key->valuestring, sizeof(device_config.sleep_status));
-	ESP_LOGI(TAG, "device_config.sleep_status: %s", device_config.sleep_status);
+	strlcpy(dst->sleep_status, key->valuestring, sizeof(dst->sleep_status));
+	ESP_LOGI(TAG, "dst->sleep_status: %s", dst->sleep_status);
 
 	key = cJSON_GetObjectItem(root,"ble_status");
 	if(key == 0)
@@ -2230,8 +2352,8 @@ static void config_server_load_cfg(char *cfg)
 	if (key->valuestring == NULL) {
 		goto config_error;
 	}
-	strlcpy(device_config.ble_status, key->valuestring, sizeof(device_config.ble_status));
-	ESP_LOGI(TAG, "device_config.ble_status: %s", device_config.ble_status);
+	strlcpy(dst->ble_status, key->valuestring, sizeof(dst->ble_status));
+	ESP_LOGI(TAG, "dst->ble_status: %s", dst->ble_status);
 
 	key = cJSON_GetObjectItem(root,"sleep_volt");
 	if(key == 0)
@@ -2242,8 +2364,8 @@ static void config_server_load_cfg(char *cfg)
 	if (key->valuestring == NULL) {
 		goto config_error;
 	}
-	strlcpy(device_config.sleep_volt, key->valuestring, sizeof(device_config.sleep_volt));
-	ESP_LOGI(TAG, "device_config.sleep_volt: %s", device_config.sleep_volt);
+	strlcpy(dst->sleep_volt, key->valuestring, sizeof(dst->sleep_volt));
+	ESP_LOGI(TAG, "dst->sleep_volt: %s", dst->sleep_volt);
 
 	// Task #6: engine-running gate threshold (CSV logger only; separate from sleep_volt).
 	// MIGRATION-SAFE: default on a missing/garbage key -- do NOT goto config_error like the
@@ -2254,139 +2376,139 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"engine_volt");
 	if(key == 0 || key->valuestring == NULL)
 	{
-		strlcpy(device_config.engine_volt, "13.2", sizeof(device_config.engine_volt));
+		strlcpy(dst->engine_volt, "13.2", sizeof(dst->engine_volt));
 	}
 	else
 	{
-		strlcpy(device_config.engine_volt, key->valuestring, sizeof(device_config.engine_volt));
+		strlcpy(dst->engine_volt, key->valuestring, sizeof(dst->engine_volt));
 		char *ev_end;
-		float ev = strtof(device_config.engine_volt, &ev_end);
-		if(*ev_end != '\0' || ev_end == device_config.engine_volt || ev < 13.0f || ev > 15.0f)
+		float ev = strtof(dst->engine_volt, &ev_end);
+		if(*ev_end != '\0' || ev_end == dst->engine_volt || ev < 13.0f || ev > 15.0f)
 		{
-			strlcpy(device_config.engine_volt, "13.2", sizeof(device_config.engine_volt));
+			strlcpy(dst->engine_volt, "13.2", sizeof(dst->engine_volt));
 		}
 	}
-	ESP_LOGI(TAG, "device_config.engine_volt: %s", device_config.engine_volt);
+	ESP_LOGI(TAG, "dst->engine_volt: %s", dst->engine_volt);
 
 	//*****
 	// key = cJSON_GetObjectItem(root,"batt_alert");
-	// if(key == 0 || (strlen(key->valuestring) > sizeof(device_config.batt_alert)))
+	// if(key == 0 || (strlen(key->valuestring) > sizeof(dst->batt_alert)))
 	// {
 	// 	goto config_error;
 	// }
 
-	strlcpy(device_config.batt_alert, "disable", sizeof(device_config.batt_alert));
-	ESP_LOGI(TAG, "device_config.batt_alert: %s", device_config.batt_alert);
+	strlcpy(dst->batt_alert, "disable", sizeof(dst->batt_alert));
+	ESP_LOGI(TAG, "dst->batt_alert: %s", dst->batt_alert);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_alert_ssid");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_alert_ssid)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_ssid)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_alert_ssid, key->valuestring, sizeof(device_config.batt_alert_ssid));
-	ESP_LOGI(TAG, "device_config.batt_alert_ssid: %s", device_config.batt_alert_ssid);
+	strlcpy(dst->batt_alert_ssid, key->valuestring, sizeof(dst->batt_alert_ssid));
+	ESP_LOGI(TAG, "dst->batt_alert_ssid: %s", dst->batt_alert_ssid);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_alert_pass");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_alert_pass)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_pass)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_alert_pass, key->valuestring, sizeof(device_config.batt_alert_pass));
-	ESP_LOGI(TAG, "device_config.batt_alert_pass: %s", device_config.batt_alert_pass);
+	strlcpy(dst->batt_alert_pass, key->valuestring, sizeof(dst->batt_alert_pass));
+	ESP_LOGI(TAG, "dst->batt_alert_pass: %s", dst->batt_alert_pass);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_alert_volt");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_alert_volt)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_volt)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_alert_volt, key->valuestring, sizeof(device_config.batt_alert_volt));
-	ESP_LOGI(TAG, "device_config.batt_alert_volt: %s", device_config.batt_alert_volt);
+	strlcpy(dst->batt_alert_volt, key->valuestring, sizeof(dst->batt_alert_volt));
+	ESP_LOGI(TAG, "dst->batt_alert_volt: %s", dst->batt_alert_volt);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_alert_protocol");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_alert_protocol)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_protocol)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_alert_protocol, key->valuestring, sizeof(device_config.batt_alert_protocol));
-	ESP_LOGI(TAG, "device_config.batt_alert_protocol: %s", device_config.batt_alert_protocol);
+	strlcpy(dst->batt_alert_protocol, key->valuestring, sizeof(dst->batt_alert_protocol));
+	ESP_LOGI(TAG, "dst->batt_alert_protocol: %s", dst->batt_alert_protocol);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_alert_url");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_alert_url)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_url)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_alert_url, key->valuestring, sizeof(device_config.batt_alert_url));
-	ESP_LOGI(TAG, "device_config.batt_alert_url: %s", device_config.batt_alert_url);
+	strlcpy(dst->batt_alert_url, key->valuestring, sizeof(dst->batt_alert_url));
+	ESP_LOGI(TAG, "dst->batt_alert_url: %s", dst->batt_alert_url);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_alert_port");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_alert_port)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_port)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_alert_port, key->valuestring, sizeof(device_config.batt_alert_port));
-	ESP_LOGI(TAG, "device_config.batt_alert_port: %s", device_config.batt_alert_port);
+	strlcpy(dst->batt_alert_port, key->valuestring, sizeof(dst->batt_alert_port));
+	ESP_LOGI(TAG, "dst->batt_alert_port: %s", dst->batt_alert_port);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_alert_topic");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_alert_topic)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_topic)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_alert_topic, key->valuestring, sizeof(device_config.batt_alert_topic));
-	ESP_LOGI(TAG, "device_config.batt_alert_topic: %s", device_config.batt_alert_topic);
+	strlcpy(dst->batt_alert_topic, key->valuestring, sizeof(dst->batt_alert_topic));
+	ESP_LOGI(TAG, "dst->batt_alert_topic: %s", dst->batt_alert_topic);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_mqtt_user");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_mqtt_user)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_mqtt_user)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_mqtt_user, key->valuestring, sizeof(device_config.batt_mqtt_user));
-	ESP_LOGI(TAG, "device_config.batt_mqtt_user: %s", device_config.batt_mqtt_user);
+	strlcpy(dst->batt_mqtt_user, key->valuestring, sizeof(dst->batt_mqtt_user));
+	ESP_LOGI(TAG, "dst->batt_mqtt_user: %s", dst->batt_mqtt_user);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_mqtt_pass");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_mqtt_pass)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_mqtt_pass)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_mqtt_pass, key->valuestring, sizeof(device_config.batt_mqtt_pass));
-	ESP_LOGI(TAG, "device_config.batt_mqtt_pass: %s", device_config.batt_mqtt_pass);
+	strlcpy(dst->batt_mqtt_pass, key->valuestring, sizeof(dst->batt_mqtt_pass));
+	ESP_LOGI(TAG, "dst->batt_mqtt_pass: %s", dst->batt_mqtt_pass);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"batt_alert_time");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(device_config.batt_alert_time)))
+	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_time)))
 	{
 		goto config_error;
 	}
 
-	strlcpy(device_config.batt_alert_time, key->valuestring, sizeof(device_config.batt_alert_time));
-	ESP_LOGI(TAG, "device_config.batt_alert_time: %s", device_config.batt_alert_time);
+	strlcpy(dst->batt_alert_time, key->valuestring, sizeof(dst->batt_alert_time));
+	ESP_LOGI(TAG, "dst->batt_alert_time: %s", dst->batt_alert_time);
 	//*****
 
 
@@ -2398,49 +2520,49 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"wakeup_volt");
 	if(key == 0)
 	{
-		strlcpy(device_config.wakeup_volt, "13.5", sizeof(device_config.wakeup_volt));
+		strlcpy(dst->wakeup_volt, "13.5", sizeof(dst->wakeup_volt));
 	}
 	else
 	{
-		strlcpy(device_config.wakeup_volt, key->valuestring, sizeof(device_config.wakeup_volt));
+		strlcpy(dst->wakeup_volt, key->valuestring, sizeof(dst->wakeup_volt));
 	}
 
-	ESP_LOGI(TAG, "device_config.wakeup_volt: %s", device_config.wakeup_volt);
+	ESP_LOGI(TAG, "dst->wakeup_volt: %s", dst->wakeup_volt);
 	//*****
 	
 	//*****
 	key = cJSON_GetObjectItem(root,"sleep_time");
 	if(key == 0)
 	{
-		strlcpy(device_config.sleep_time, "5", sizeof(device_config.sleep_time));
+		strlcpy(dst->sleep_time, "5", sizeof(dst->sleep_time));
 	}
 	else
 	{
-		uint32_t sleep_time = atoi(device_config.sleep_time);
+		uint32_t sleep_time = atoi(dst->sleep_time);
 
 		if(sleep_time > 30 && sleep_time < 1)
 		{
-			strlcpy(device_config.sleep_time, "5", sizeof(device_config.sleep_time));
+			strlcpy(dst->sleep_time, "5", sizeof(dst->sleep_time));
 		}
 
-		strlcpy(device_config.sleep_time, key->valuestring, sizeof(device_config.sleep_time));
+		strlcpy(dst->sleep_time, key->valuestring, sizeof(dst->sleep_time));
 	}
 
-	ESP_LOGI(TAG, "device_config.sleep_time: %s", device_config.sleep_time);
+	ESP_LOGI(TAG, "dst->sleep_time: %s", dst->sleep_time);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"sta_security");
 	if(key == 0)
 	{
-		strlcpy(device_config.sta_security, "wpa3", sizeof(device_config.sta_security));
+		strlcpy(dst->sta_security, "wpa3", sizeof(dst->sta_security));
 	}
 	else
 	{
-		strlcpy(device_config.sta_security, key->valuestring, sizeof(device_config.sta_security));
+		strlcpy(dst->sta_security, key->valuestring, sizeof(dst->sta_security));
 	}
 
-	ESP_LOGI(TAG, "device_config.sta_security: %s", device_config.sta_security);
+	ESP_LOGI(TAG, "dst->sta_security: %s", dst->sta_security);
 	//*****
 
 	//***** Parse optional fallback STA networks *****
@@ -2465,20 +2587,20 @@ static void config_server_load_cfg(char *cfg)
 				continue;
 			const char *sec_val = (f_sec && cJSON_IsString(f_sec)) ? f_sec->valuestring : "wpa3";
 
-			strlcpy(device_config.sta_fallbacks[kept].ssid, f_ssid->valuestring, sizeof(device_config.sta_fallbacks[kept].ssid));
-			strlcpy(device_config.sta_fallbacks[kept].pass, pass_val, sizeof(device_config.sta_fallbacks[kept].pass));
+			strlcpy(dst->sta_fallbacks[kept].ssid, f_ssid->valuestring, sizeof(dst->sta_fallbacks[kept].ssid));
+			strlcpy(dst->sta_fallbacks[kept].pass, pass_val, sizeof(dst->sta_fallbacks[kept].pass));
 			if (strcmp(sec_val, "wpa2") == 0 || strcmp(sec_val, "wpa3") == 0)
 			{
-				strlcpy(device_config.sta_fallbacks[kept].security, sec_val, sizeof(device_config.sta_fallbacks[kept].security));
+				strlcpy(dst->sta_fallbacks[kept].security, sec_val, sizeof(dst->sta_fallbacks[kept].security));
 			}
 			else
 			{
-				strlcpy(device_config.sta_fallbacks[kept].security, "wpa3", sizeof(device_config.sta_fallbacks[kept].security));
+				strlcpy(dst->sta_fallbacks[kept].security, "wpa3", sizeof(dst->sta_fallbacks[kept].security));
 			}
 			kept++;
 		}
-		device_config.sta_fallbacks_count = kept;
-		ESP_LOGI(TAG, "Loaded %d STA fallback networks", device_config.sta_fallbacks_count);
+		dst->sta_fallbacks_count = kept;
+		ESP_LOGI(TAG, "Loaded %d STA fallback networks", dst->sta_fallbacks_count);
 	}
 	else
 	{
@@ -2487,114 +2609,114 @@ static void config_server_load_cfg(char *cfg)
 
 	//**** SmartConnect fields ****
 	key = cJSON_GetObjectItem(root,"home_ssid");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(device_config.home_ssid) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->home_ssid) - 1)
 	{
-		strlcpy(device_config.home_ssid, "MeatPi", sizeof(device_config.home_ssid));
+		strlcpy(dst->home_ssid, "MeatPi", sizeof(dst->home_ssid));
 	}
 	else
 	{
-		strlcpy(device_config.home_ssid, key->valuestring, sizeof(device_config.home_ssid));
+		strlcpy(dst->home_ssid, key->valuestring, sizeof(dst->home_ssid));
 	}
-	ESP_LOGI(TAG, "device_config.home_ssid: %s", device_config.home_ssid);
+	ESP_LOGI(TAG, "dst->home_ssid: %s", dst->home_ssid);
 
 	key = cJSON_GetObjectItem(root,"home_password");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) < 8 || strlen(key->valuestring) > sizeof(device_config.home_password) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) < 8 || strlen(key->valuestring) > sizeof(dst->home_password) - 1)
 	{
-		strlcpy(device_config.home_password, "TomatoSauce", sizeof(device_config.home_password));
+		strlcpy(dst->home_password, "TomatoSauce", sizeof(dst->home_password));
 	}
 	else
 	{
-		strlcpy(device_config.home_password, key->valuestring, sizeof(device_config.home_password));
+		strlcpy(dst->home_password, key->valuestring, sizeof(dst->home_password));
 	}
-	ESP_LOGI(TAG, "device_config.home_password: %s", device_config.home_password);
+	ESP_LOGI(TAG, "dst->home_password: %s", dst->home_password);
 
 	key = cJSON_GetObjectItem(root,"home_security");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(device_config.home_security) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->home_security) - 1)
 	{
-		strlcpy(device_config.home_security, "wpa3", sizeof(device_config.home_security));
+		strlcpy(dst->home_security, "wpa3", sizeof(dst->home_security));
 	}
 	else
 	{
-		strlcpy(device_config.home_security, key->valuestring, sizeof(device_config.home_security));
+		strlcpy(dst->home_security, key->valuestring, sizeof(dst->home_security));
 	}
-	ESP_LOGI(TAG, "device_config.home_security: %s", device_config.home_security);
+	ESP_LOGI(TAG, "dst->home_security: %s", dst->home_security);
 
 	key = cJSON_GetObjectItem(root,"home_protocol");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(device_config.home_protocol) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->home_protocol) - 1)
 	{
-		strlcpy(device_config.home_protocol, "auto_pid", sizeof(device_config.home_protocol));
+		strlcpy(dst->home_protocol, "auto_pid", sizeof(dst->home_protocol));
 	}
 	else
 	{
-		strlcpy(device_config.home_protocol, key->valuestring, sizeof(device_config.home_protocol));
+		strlcpy(dst->home_protocol, key->valuestring, sizeof(dst->home_protocol));
 	}
-	ESP_LOGI(TAG, "device_config.home_protocol: %s", device_config.home_protocol);
+	ESP_LOGI(TAG, "dst->home_protocol: %s", dst->home_protocol);
 
 	key = cJSON_GetObjectItem(root,"drive_ssid");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(device_config.drive_ssid) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->drive_ssid) - 1)
 	{
-		strlcpy(device_config.drive_ssid, "MeatPi", sizeof(device_config.drive_ssid));
+		strlcpy(dst->drive_ssid, "MeatPi", sizeof(dst->drive_ssid));
 	}
 	else
 	{
-		strlcpy(device_config.drive_ssid, key->valuestring, sizeof(device_config.drive_ssid));
+		strlcpy(dst->drive_ssid, key->valuestring, sizeof(dst->drive_ssid));
 	}
-	ESP_LOGI(TAG, "device_config.drive_ssid: %s", device_config.drive_ssid);
+	ESP_LOGI(TAG, "dst->drive_ssid: %s", dst->drive_ssid);
 
 	key = cJSON_GetObjectItem(root,"drive_password");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) < 8 || strlen(key->valuestring) > sizeof(device_config.drive_password) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) < 8 || strlen(key->valuestring) > sizeof(dst->drive_password) - 1)
 	{
-		strlcpy(device_config.drive_password, "TomatoSauce", sizeof(device_config.drive_password));
+		strlcpy(dst->drive_password, "TomatoSauce", sizeof(dst->drive_password));
 	}
 	else
 	{
-		strlcpy(device_config.drive_password, key->valuestring, sizeof(device_config.drive_password));
+		strlcpy(dst->drive_password, key->valuestring, sizeof(dst->drive_password));
 	}
-	ESP_LOGI(TAG, "device_config.drive_password: %s", device_config.drive_password);
+	ESP_LOGI(TAG, "dst->drive_password: %s", dst->drive_password);
 
 	key = cJSON_GetObjectItem(root,"drive_security");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(device_config.drive_security) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->drive_security) - 1)
 	{
-		strlcpy(device_config.drive_security, "wpa3", sizeof(device_config.drive_security));
+		strlcpy(dst->drive_security, "wpa3", sizeof(dst->drive_security));
 	}
 	else
 	{
-		strlcpy(device_config.drive_security, key->valuestring, sizeof(device_config.drive_security));
+		strlcpy(dst->drive_security, key->valuestring, sizeof(dst->drive_security));
 	}
-	ESP_LOGI(TAG, "device_config.drive_security: %s", device_config.drive_security);
+	ESP_LOGI(TAG, "dst->drive_security: %s", dst->drive_security);
 
 	key = cJSON_GetObjectItem(root,"drive_connection_type");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(device_config.drive_connection_type) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->drive_connection_type) - 1)
 	{
-		strlcpy(device_config.drive_connection_type, "wifi", sizeof(device_config.drive_connection_type));
+		strlcpy(dst->drive_connection_type, "wifi", sizeof(dst->drive_connection_type));
 	}
 	else
 	{
-		strlcpy(device_config.drive_connection_type, key->valuestring, sizeof(device_config.drive_connection_type));
+		strlcpy(dst->drive_connection_type, key->valuestring, sizeof(dst->drive_connection_type));
 	}
-	ESP_LOGI(TAG, "device_config.drive_connection_type: %s", device_config.drive_connection_type);
+	ESP_LOGI(TAG, "dst->drive_connection_type: %s", dst->drive_connection_type);
 
 	key = cJSON_GetObjectItem(root,"drive_mode_timeout");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(device_config.drive_mode_timeout) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->drive_mode_timeout) - 1)
 	{
-		strlcpy(device_config.drive_mode_timeout, "60", sizeof(device_config.drive_mode_timeout));
+		strlcpy(dst->drive_mode_timeout, "60", sizeof(dst->drive_mode_timeout));
 	}
 	else
 	{
-		strlcpy(device_config.drive_mode_timeout, key->valuestring, sizeof(device_config.drive_mode_timeout));
+		strlcpy(dst->drive_mode_timeout, key->valuestring, sizeof(dst->drive_mode_timeout));
 	}
-	ESP_LOGI(TAG, "device_config.drive_mode_timeout: %s", device_config.drive_mode_timeout);
+	ESP_LOGI(TAG, "dst->drive_mode_timeout: %s", dst->drive_mode_timeout);
 
 	key = cJSON_GetObjectItem(root,"drive_protocol");
-	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(device_config.drive_protocol) - 1)
+	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->drive_protocol) - 1)
 	{
-		strlcpy(device_config.drive_protocol, "auto_pid", sizeof(device_config.drive_protocol));
+		strlcpy(dst->drive_protocol, "auto_pid", sizeof(dst->drive_protocol));
 	}
 	else
 	{
-		strlcpy(device_config.drive_protocol, key->valuestring, sizeof(device_config.drive_protocol));
+		strlcpy(dst->drive_protocol, key->valuestring, sizeof(dst->drive_protocol));
 	}
-	ESP_LOGI(TAG, "device_config.drive_protocol: %s", device_config.drive_protocol);
+	ESP_LOGI(TAG, "dst->drive_protocol: %s", dst->drive_protocol);
 
 	//**** End SmartConnect fields ****
 
@@ -2602,21 +2724,21 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"csv_log");
 	if(key == 0)
 	{
-		strlcpy(device_config.csv_log, "disable", sizeof(device_config.csv_log));
+		strlcpy(dst->csv_log, "disable", sizeof(dst->csv_log));
 	}
 	else
 	{
-		strlcpy(device_config.csv_log, key->valuestring, sizeof(device_config.csv_log));
+		strlcpy(dst->csv_log, key->valuestring, sizeof(dst->csv_log));
 	}
-	ESP_LOGI(TAG, "device_config.csv_log: %s", device_config.csv_log);
+	ESP_LOGI(TAG, "dst->csv_log: %s", dst->csv_log);
 	//*****
 
 	//*****
 	// Coerce any non-enable/disable csv_log value to "disable" so a garbage NVS
 	// value can never enable the logger.
-	if(strcmp(device_config.csv_log, "enable") != 0 && strcmp(device_config.csv_log, "disable") != 0)
+	if(strcmp(dst->csv_log, "enable") != 0 && strcmp(dst->csv_log, "disable") != 0)
 	{
-		strlcpy(device_config.csv_log, "disable", sizeof(device_config.csv_log));
+		strlcpy(dst->csv_log, "disable", sizeof(dst->csv_log));
 	}
 	//*****
 
@@ -2624,13 +2746,13 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"log_filesystem");
 	if(key == 0)
 	{
-		strlcpy(device_config.log_filesystem, "littlefs", sizeof(device_config.log_filesystem));
+		strlcpy(dst->log_filesystem, "littlefs", sizeof(dst->log_filesystem));
 	}
 	else
 	{
-		strlcpy(device_config.log_filesystem, key->valuestring, sizeof(device_config.log_filesystem));
+		strlcpy(dst->log_filesystem, key->valuestring, sizeof(dst->log_filesystem));
 	}
-	ESP_LOGI(TAG, "device_config.log_filesystem: %s", device_config.log_filesystem);
+	ESP_LOGI(TAG, "dst->log_filesystem: %s", dst->log_filesystem);
 	//*****
 
 	//*****
@@ -2638,34 +2760,34 @@ static void config_server_load_cfg(char *cfg)
 
 	if(key == 0)
 	{
-		strlcpy(device_config.log_storage, "sdcard", sizeof(device_config.log_storage));
+		strlcpy(dst->log_storage, "sdcard", sizeof(dst->log_storage));
 	}
 	else
 	{
-		strlcpy(device_config.log_storage, key->valuestring, sizeof(device_config.log_storage));
+		strlcpy(dst->log_storage, key->valuestring, sizeof(dst->log_storage));
 	}
 
-	ESP_LOGI(TAG, "device_config.log_storage: %s", device_config.log_storage);
+	ESP_LOGI(TAG, "dst->log_storage: %s", dst->log_storage);
 	//*****
 
 	//*****
 	key = cJSON_GetObjectItem(root,"log_period");
 	if(key == 0)
 	{
-		strlcpy(device_config.log_period, "10", sizeof(device_config.log_period));
+		strlcpy(dst->log_period, "10", sizeof(dst->log_period));
 	}
 	else
 	{
-		uint32_t log_period = atoi(device_config.log_period);
+		uint32_t log_period = atoi(dst->log_period);
 
 		if(log_period > 300 && log_period < 1)
 		{
-			strlcpy(device_config.log_period, "10", sizeof(device_config.log_period));
+			strlcpy(dst->log_period, "10", sizeof(dst->log_period));
 		}
 
-		strlcpy(device_config.log_period, key->valuestring, sizeof(device_config.log_period));
+		strlcpy(dst->log_period, key->valuestring, sizeof(dst->log_period));
 	}
-	ESP_LOGI(TAG, "device_config.log_period: %s", device_config.log_period);
+	ESP_LOGI(TAG, "dst->log_period: %s", dst->log_period);
 	//*****
 
 	//***** led_blink_ms: single normalization point. Snapping garbage or legacy
@@ -2675,10 +2797,10 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"led_blink_ms");
 	{
 		int32_t ms = (key != 0 && key->valuestring != NULL) ? atoi(key->valuestring) : 52;
-		snprintf(device_config.led_blink_ms, sizeof(device_config.led_blink_ms),
+		snprintf(dst->led_blink_ms, sizeof(dst->led_blink_ms),
 				 "%ld", (long)led_indicator_snap_rate_ms(ms));
 	}
-	ESP_LOGI(TAG, "device_config.led_blink_ms: %s", device_config.led_blink_ms);
+	ESP_LOGI(TAG, "dst->led_blink_ms: %s", dst->led_blink_ms);
 	//*****
 
 	//***** Wide CSV (Task #11): csv_grid_mode / csv_grid_hz. Garbage coerces to a safe default
@@ -2686,39 +2808,39 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"csv_grid_mode");
 	if(key == 0)
 	{
-		strlcpy(device_config.csv_grid_mode, "fixed", sizeof(device_config.csv_grid_mode));
+		strlcpy(dst->csv_grid_mode, "fixed", sizeof(dst->csv_grid_mode));
 	}
 	else
 	{
-		strlcpy(device_config.csv_grid_mode, key->valuestring, sizeof(device_config.csv_grid_mode));
+		strlcpy(dst->csv_grid_mode, key->valuestring, sizeof(dst->csv_grid_mode));
 	}
-	if(strcmp(device_config.csv_grid_mode, "event") != 0 && strcmp(device_config.csv_grid_mode, "fixed") != 0)
+	if(strcmp(dst->csv_grid_mode, "event") != 0 && strcmp(dst->csv_grid_mode, "fixed") != 0)
 	{
-		strlcpy(device_config.csv_grid_mode, "fixed", sizeof(device_config.csv_grid_mode));
+		strlcpy(dst->csv_grid_mode, "fixed", sizeof(dst->csv_grid_mode));
 	}
-	ESP_LOGI(TAG, "device_config.csv_grid_mode: %s", device_config.csv_grid_mode);
+	ESP_LOGI(TAG, "dst->csv_grid_mode: %s", dst->csv_grid_mode);
 	//*****
 
 	key = cJSON_GetObjectItem(root,"csv_grid_hz");
 	if(key == 0)
 	{
-		strlcpy(device_config.csv_grid_hz, "10", sizeof(device_config.csv_grid_hz));
+		strlcpy(dst->csv_grid_hz, "10", sizeof(dst->csv_grid_hz));
 	}
 	else
 	{
-		strlcpy(device_config.csv_grid_hz, key->valuestring, sizeof(device_config.csv_grid_hz));
+		strlcpy(dst->csv_grid_hz, key->valuestring, sizeof(dst->csv_grid_hz));
 		//***** "auto" (issue #23): grid tracks the measured poll sweep rate; otherwise 1-50 Hz.
-		if(strcmp(device_config.csv_grid_hz, "auto") != 0)
+		if(strcmp(dst->csv_grid_hz, "auto") != 0)
 		{
 			char *gh_end;
-			long gh = strtol(device_config.csv_grid_hz, &gh_end, 10);
-			if(*gh_end != '\0' || gh_end == device_config.csv_grid_hz || gh < 1 || gh > 50)
+			long gh = strtol(dst->csv_grid_hz, &gh_end, 10);
+			if(*gh_end != '\0' || gh_end == dst->csv_grid_hz || gh < 1 || gh > 50)
 			{
-				strlcpy(device_config.csv_grid_hz, "10", sizeof(device_config.csv_grid_hz));
+				strlcpy(dst->csv_grid_hz, "10", sizeof(dst->csv_grid_hz));
 			}
 		}
 	}
-	ESP_LOGI(TAG, "device_config.csv_grid_hz: %s", device_config.csv_grid_hz);
+	ESP_LOGI(TAG, "dst->csv_grid_hz: %s", dst->csv_grid_hz);
 	//*****
 
 	//***** Engine-running CSV gate (Stage 1): anything not "enable"/"disable" coerces to "enable"
@@ -2726,57 +2848,57 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"csv_require_engine");
 	if(key == 0 || key->valuestring == NULL)
 	{
-		strlcpy(device_config.csv_require_engine, "enable", sizeof(device_config.csv_require_engine));
+		strlcpy(dst->csv_require_engine, "enable", sizeof(dst->csv_require_engine));
 	}
 	else
 	{
-		strlcpy(device_config.csv_require_engine, key->valuestring, sizeof(device_config.csv_require_engine));
+		strlcpy(dst->csv_require_engine, key->valuestring, sizeof(dst->csv_require_engine));
 	}
-	if(strcmp(device_config.csv_require_engine, "enable") != 0 && strcmp(device_config.csv_require_engine, "disable") != 0)
+	if(strcmp(dst->csv_require_engine, "enable") != 0 && strcmp(dst->csv_require_engine, "disable") != 0)
 	{
-		strlcpy(device_config.csv_require_engine, "enable", sizeof(device_config.csv_require_engine));
+		strlcpy(dst->csv_require_engine, "enable", sizeof(dst->csv_require_engine));
 	}
-	ESP_LOGI(TAG, "device_config.csv_require_engine: %s", device_config.csv_require_engine);
+	ESP_LOGI(TAG, "dst->csv_require_engine: %s", dst->csv_require_engine);
 	//*****
 
 	key = cJSON_GetObjectItem(root,"ap_auto_disable");
 	if(key == 0)
 	{
-		strlcpy(device_config.ap_auto_disable, "disable", sizeof(device_config.ap_auto_disable));
+		strlcpy(dst->ap_auto_disable, "disable", sizeof(dst->ap_auto_disable));
 	}
 	else
 	{
-		strlcpy(device_config.ap_auto_disable, key->valuestring, sizeof(device_config.ap_auto_disable));
+		strlcpy(dst->ap_auto_disable, key->valuestring, sizeof(dst->ap_auto_disable));
 	}
 
-	ESP_LOGI(TAG, "device_config.ap_auto_disable: %s", device_config.ap_auto_disable);
+	ESP_LOGI(TAG, "dst->ap_auto_disable: %s", dst->ap_auto_disable);
 
 	//*****
 	key = cJSON_GetObjectItem(root,"periodic_wakeup");
 	if(key == 0)
 	{
-		strlcpy(device_config.periodic_wakeup, "disable", sizeof(device_config.periodic_wakeup));
+		strlcpy(dst->periodic_wakeup, "disable", sizeof(dst->periodic_wakeup));
 	}
 	else
 	{
-		strlcpy(device_config.periodic_wakeup, key->valuestring, sizeof(device_config.periodic_wakeup));
+		strlcpy(dst->periodic_wakeup, key->valuestring, sizeof(dst->periodic_wakeup));
 	}
 
-	ESP_LOGI(TAG, "device_config.periodic_wakeup: %s", device_config.periodic_wakeup);
+	ESP_LOGI(TAG, "dst->periodic_wakeup: %s", dst->periodic_wakeup);
 	//*****	
 
 	//*****	
 	key = cJSON_GetObjectItem(root,"wakeup_interval");
 	if(key == 0)
 	{
-		strlcpy(device_config.wakeup_interval, "60", sizeof(device_config.wakeup_interval));
+		strlcpy(dst->wakeup_interval, "60", sizeof(dst->wakeup_interval));
 	}
 	else
 	{
-		strlcpy(device_config.wakeup_interval, key->valuestring, sizeof(device_config.wakeup_interval));
+		strlcpy(dst->wakeup_interval, key->valuestring, sizeof(dst->wakeup_interval));
 	}
 
-	ESP_LOGI(TAG, "device_config.wakeup_interval: %s", device_config.wakeup_interval);
+	ESP_LOGI(TAG, "dst->wakeup_interval: %s", dst->wakeup_interval);
 	//*****	
 
 
@@ -2785,14 +2907,14 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"sleep_disable_agree");
 	if(key == 0)
 	{
-		strlcpy(device_config.sleep_disable_agree, "no", sizeof(device_config.sleep_disable_agree));
+		strlcpy(dst->sleep_disable_agree, "no", sizeof(dst->sleep_disable_agree));
 	}
 	else
 	{
-		strlcpy(device_config.sleep_disable_agree, key->valuestring, sizeof(device_config.sleep_disable_agree));
+		strlcpy(dst->sleep_disable_agree, key->valuestring, sizeof(dst->sleep_disable_agree));
 	}
 
-	ESP_LOGI(TAG, "device_config.sleep_disable_agree: %s", device_config.sleep_disable_agree);
+	ESP_LOGI(TAG, "dst->sleep_disable_agree: %s", dst->sleep_disable_agree);
 	//*****	
 
 	//*****
@@ -2801,22 +2923,22 @@ static void config_server_load_cfg(char *cfg)
 	if(key == 0)
 	{
 		ESP_LOGI(TAG, "imu_threshold not found, loading default");
-		strcpy(device_config.imu_threshold, "8");
+		strcpy(dst->imu_threshold, "8");
 	}
 	else
 	{
 		if(strlen(key->valuestring) > 0 && strlen(key->valuestring) < 16)
 		{
-			strcpy(device_config.imu_threshold, key->valuestring);
+			strcpy(dst->imu_threshold, key->valuestring);
 		}
 		else
 		{
 			ESP_LOGI(TAG, "imu_threshold invalid length, loading default");
-			strcpy(device_config.imu_threshold, "8");
+			strcpy(dst->imu_threshold, "8");
 		}
 	}
 
-	ESP_LOGI(TAG, "device_config.imu_threshold: %s", device_config.imu_threshold);
+	ESP_LOGI(TAG, "dst->imu_threshold: %s", dst->imu_threshold);
 	//*****
 
 	//*****
@@ -2826,14 +2948,14 @@ static void config_server_load_cfg(char *cfg)
 	key = cJSON_GetObjectItem(root,"debug");
 	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) == 0))
 	{
-		device_config.debug_enabled = 0; // default to no debug
+		dst->debug_enabled = 0; // default to no debug
 	}
 	else
 	{
-		strcmp(key->valuestring, "enabled") == 0 ? (device_config.debug_enabled = 1) : (device_config.debug_enabled = 0);
+		strcmp(key->valuestring, "enabled") == 0 ? (dst->debug_enabled = 1) : (dst->debug_enabled = 0);
 	}
 
-	if(device_config.debug_enabled)
+	if(dst->debug_enabled)
 	{
 		ESP_LOGW(TAG, "\r\n\r\n*****************Debug mode enabled*****************\r\n\r\n");
 	}
@@ -2844,31 +2966,27 @@ static void config_server_load_cfg(char *cfg)
 	//*****
 
 	cJSON_Delete(root);
-	return;
+	return true;
 
 
 config_error:
-    // Check if destination file exists before renaming
-    if (stat(FS_MOUNT_POINT"/config.json", &st) == 0)
-    {
-    	ESP_LOGE(TAG, "config.json file error, restoring default");
-        // Delete it if it exists
-        unlink(FS_MOUNT_POINT"/config.json");
-		FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
-		if (f) {
-			fputs(device_config_default, f);
-			fclose(f);
-		}
-		vTaskDelay(3000 / portTICK_PERIOD_MS);
-		restart_tracker_restart(RESTART_TRACKER_PLANNED_REASON_CONFIG_RECOVERY,
-						 RESTART_TRACKER_SOURCE_CONFIG_SERVER,
-						 RESTART_TRACKER_FLAG_SETTINGS_SAVED | RESTART_TRACKER_FLAG_RECOVERY_ACTION);
-    }
 	cJSON_Delete(root);
-	return;
+	return false;
 
 config_error_no_json:
-	ESP_LOGE(TAG, "JSON parsing failed, restoring default config");
+	return false;
+}
+
+// Boot entry: parse config.json into the live device_config. On failure, restore
+// the factory-default config and reboot (the old in-line recovery, hoisted out so
+// the parser itself is side-effect-free and reusable for the live-apply path).
+static void config_server_load_cfg(char *cfg)
+{
+	if (config_server_parse_cfg_into(&device_config, cfg))
+	{
+		return;
+	}
+	ESP_LOGE(TAG, "config parse failed, restoring default config");
 	unlink(FS_MOUNT_POINT"/config.json");
 	FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
 	if (f) {

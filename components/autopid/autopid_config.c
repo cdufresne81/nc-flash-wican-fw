@@ -436,8 +436,13 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
     else
         autopid_config->cycle = 10000;
 
-    autopid_config->pid_std_en = standard_pids_item ? (strcmp(standard_pids_item->valuestring, "enable") == 0) : false;
-    autopid_config->pid_specific_en = specific_pids_item ? (strcmp(specific_pids_item->valuestring, "enable") == 0) : false;
+    // Guard against non-string JSON (e.g. "standard_pids":123): valuestring is NULL for
+    // non-string cJSON, so strcmp(NULL) would panic. With the live hot-reload this parse
+    // runs on the poll task, so a hostile table must never crash mid-drive (issue #39).
+    autopid_config->pid_std_en = (standard_pids_item && cJSON_IsString(standard_pids_item) && standard_pids_item->valuestring)
+                                     ? (strcmp(standard_pids_item->valuestring, "enable") == 0) : false;
+    autopid_config->pid_specific_en = (specific_pids_item && cJSON_IsString(specific_pids_item) && specific_pids_item->valuestring)
+                                     ? (strcmp(specific_pids_item->valuestring, "enable") == 0) : false;
 
     // PID response validation (optional)
     // Supports either string: "enable"/"disable" or boolean: true/false.
@@ -455,9 +460,12 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
     }
     autopid_config->pid_validation_en = true; 
 
-    // Load custom pids
+    // Load custom pids. Guard cJSON_IsArray: the sizing pass (count_auto_pid_pids) only
+    // counts arrays, but cJSON_ArrayForEach happily walks an OBJECT's children too -- a
+    // {"pids":{...}} payload would then parse more entries than were allocated and overflow
+    // pids[] on the poll task during the live hot-reload (issue #39).
     cJSON *pids = cJSON_GetObjectItem(root, "pids");
-    if (pids)
+    if (pids && cJSON_IsArray(pids))
     {
         cJSON *pid;
         cJSON_ArrayForEach(pid, pids)
@@ -475,8 +483,11 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                 autopid_config->pid_custom_en = true;
             }
 
-            curr_pid->cmd = pid_item ? (char *)heap_caps_malloc(strlen(pid_item->valuestring) + 2, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM) : NULL;
-            if (curr_pid->cmd && pid_item && strlen(pid_item->valuestring) > 1)
+            // Guard non-string "PID" (valuestring NULL -> strlen(NULL) panic). Must be
+            // crash-proof on the poll task under the live hot-reload (issue #39).
+            bool pid_is_str = (pid_item && cJSON_IsString(pid_item) && pid_item->valuestring);
+            curr_pid->cmd = pid_is_str ? (char *)heap_caps_malloc(strlen(pid_item->valuestring) + 2, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM) : NULL;
+            if (curr_pid->cmd && pid_is_str && strlen(pid_item->valuestring) > 1)
             {
                 strcpy(curr_pid->cmd, pid_item->valuestring);
                 strcat(curr_pid->cmd, "\r");
@@ -520,9 +531,10 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
         }
     }
 
-    // Load standard pids
+    // Load standard pids (cJSON_IsArray guard: see the custom-pids note above -- count vs
+    // parse must agree on what is an array, or pids[] overflows).
     cJSON *std_pids = cJSON_GetObjectItem(root, "std_pids");
-    if (std_pids)
+    if (std_pids && cJSON_IsArray(std_pids))
     {
         cJSON *pid;
         cJSON_ArrayForEach(pid, std_pids)
@@ -857,7 +869,7 @@ static void parse_car_data_json(autopid_config_t *autopid_config, int *pid_index
             }
 
             cJSON *pids = cJSON_GetObjectItem(car, "pids");
-            if (pids)
+            if (pids && cJSON_IsArray(pids)) // match count_car_data_pids; non-array would overflow pids[]
             {
                 cJSON *pid;
                 cJSON_ArrayForEach(pid, pids)
@@ -980,4 +992,63 @@ autopid_config_t *load_autopid_config(void)
     autopid_config->pid_count = total_pids;
 
     return autopid_config;
+}
+
+// Free every heap-allocated member of a parameter_t array, then the array base.
+// Guards the base so a partial-alloc (count>0 but base NULL) can't deref. All four
+// strings are strdup_psram'd (incl. "none" defaults) -> no static literals, safe free.
+static void autopid_free_param_array(parameter_t *params, uint32_t count)
+{
+    if (!params)
+        return;
+    for (uint32_t j = 0; j < count; j++)
+    {
+        free(params[j].name);
+        free(params[j].expression);
+        free(params[j].unit);
+        free(params[j].class);
+    }
+    free(params);
+}
+
+// Deep-free a table produced by load_autopid_config(). Mirrors the parser's exact
+// allocation set: pids[].cmd/init/rxheader + each pid's parameter strings+array,
+// can_filters[] parameter strings+array, calculated[] strings+array, the six
+// top-level char*, then the struct. Guards every array base (partial-alloc safe).
+void autopid_config_deep_free(autopid_config_t *c)
+{
+    if (!c)
+        return;
+
+    if (c->pids)
+    {
+        for (uint32_t i = 0; i < c->pid_count; i++)
+        {
+            free(c->pids[i].cmd);
+            free(c->pids[i].init);
+            free(c->pids[i].rxheader);
+            autopid_free_param_array(c->pids[i].parameters, c->pids[i].parameters_count);
+        }
+        free(c->pids);
+    }
+
+    if (c->can_filters)
+    {
+        for (uint32_t i = 0; i < c->can_filters_count; i++)
+        {
+            autopid_free_param_array(c->can_filters[i].parameters, c->can_filters[i].parameters_count);
+        }
+        free(c->can_filters);
+    }
+
+    autopid_free_param_array(c->calculated, c->calculated_count);
+
+    free(c->custom_init);
+    free(c->standard_init);
+    free(c->specific_init);
+    free(c->selected_car_model);
+    free(c->std_ecu_protocol);
+    free(c->vehicle_model);
+
+    free(c);
 }

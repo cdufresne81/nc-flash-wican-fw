@@ -141,7 +141,8 @@ typedef struct
     char* vehicle_model;
     uint32_t cycle;     //To be removed when std pid gets its own period
     time_t last_successful_pid_time;  // Timestamp in seconds since epoch of last successful PID response
-    SemaphoreHandle_t mutex;
+    // NB: no per-config mutex -- serialization is via the file-static s_autopid_mutex in
+    // autopid.c (created once, never destroyed, so it stays valid across live table swaps).
 } autopid_config_t;
 
 typedef struct 
@@ -185,4 +186,23 @@ void autopid_unlock(void);
 // (the caller must NOT already hold it); does no bus/SD/flash I/O; a no-op when no calculated
 // channels are configured.
 void autopid_eval_calculated_channels(void);
+
+// --- Live PID-table hot-swap (issue #39) --------------------------------------
+// Deep-free a table produced by load_autopid_config() (mirrors its allocation set;
+// never touches the hoisted config mutex). Public so the reload path can retire the
+// old table after the swap.
+void autopid_config_deep_free(autopid_config_t *c);
+
+// Re-parse auto_pid.json and atomically swap it in for the live autopid_config.
+// MUST be called ONLY from the poll task at its safe point (holds no table pointer).
+// Validates the new table (rejects only enabled pids with no cmd / inconsistent
+// parameter arrays) and keeps the old table on any failure. Returns the new table on
+// success, NULL if the reload was rejected (caller keeps running the old table).
+autopid_config_t *autopid_reload_config(void);
+
+// Serialize auto_pid.json file writes against the reload's count+parse (P2 TOCTOU
+// guard). store_auto_data_handler holds this around its fwrite; the reload holds it
+// around load_autopid_config(). No-op if the lock was never created (non-autopid modes).
+void autopid_file_lock(void);
+void autopid_file_unlock(void);
 #endif
