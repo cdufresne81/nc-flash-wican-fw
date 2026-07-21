@@ -182,6 +182,38 @@ static uint32_t json_item_to_u32(const cJSON *item, uint32_t default_value)
     return default_value;
 }
 
+/* Sweep divisor (issue #29). Accepts a JSON number or a numeric string (every shipped
+ * per-PID value in auto_pid.json is a string, so a hand-editor will pattern-match to
+ * "SampleEvery": "4" -- rejecting that would silently mean "every sweep", the worst
+ * possible failure). Absent / empty / non-numeric / negative / NaN / <=1 all collapse to
+ * 0 == every sweep, so an old auto_pid.json parses bit-identically.
+ * The clamp is applied in the DOUBLE domain before the integer cast: (uint32_t)1e20 is
+ * undefined behaviour and on xtensa can land at 0, which would silently turn "slowest
+ * possible" into "every sweep". With the live hot-reload (issue #39) this parse runs on
+ * the poll task, so a hostile config must never produce an out-of-range divisor. */
+static uint8_t json_item_to_sample_every(const cJSON *item, const char *dbg)
+{
+    double d;
+    if (item == NULL)
+        return 0;
+    if (cJSON_IsNumber(item))
+        d = item->valuedouble;
+    else if (cJSON_IsString(item) && item->valuestring && item->valuestring[0] != '\0')
+        d = atof(item->valuestring);          /* garbage -> 0.0 -> every sweep */
+    else
+        return 0;
+
+    if (!(d > 1.0))                            /* also rejects NaN and negatives */
+        return 0;
+    if (d >= (double)AUTOPID_MAX_SAMPLE_EVERY)
+    {
+        ESP_LOGW(TAG, "SampleEvery %.0f clamped to %d (%s)", d,
+                 AUTOPID_MAX_SAMPLE_EVERY, dbg ? dbg : "pid");
+        return (uint8_t)AUTOPID_MAX_SAMPLE_EVERY;
+    }
+    return (uint8_t)d;                         /* truncates 4.9 -> 4; documented */
+}
+
 static char *json_strdup_key_or_default(const cJSON *obj, const char *key, const char *default_value)
 {
     if (!obj || !key)
@@ -509,6 +541,7 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
             curr_pid->rxheader = rxheader_item ? strdup_psram(rxheader_item->valuestring) : NULL;
             curr_pid->pid_type = PID_CUSTOM;
             curr_pid->enabled = (enabled_item && cJSON_IsBool(enabled_item)) ? cJSON_IsTrue(enabled_item) : true;
+            curr_pid->sample_every = json_item_to_sample_every(cJSON_GetObjectItem(pid, "SampleEvery"), "auto_pid pids");
 
             curr_pid->parameters_count = 1;
             curr_pid->parameters = (parameter_t *)heap_caps_calloc(1, sizeof(parameter_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
@@ -544,6 +577,7 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
             {
                 cJSON *enabled_item = cJSON_GetObjectItem(pid, "enabled");
                 curr_pid->enabled = (enabled_item && cJSON_IsBool(enabled_item)) ? cJSON_IsTrue(enabled_item) : true;
+                curr_pid->sample_every = json_item_to_sample_every(cJSON_GetObjectItem(pid, "SampleEvery"), "auto_pid std_pids");
             }
 
             char std_init_buf[64];

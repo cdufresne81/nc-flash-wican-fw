@@ -33,6 +33,13 @@
 // Safety caps for user-configurable destinations (prevents stack/heap abuse via config JSON)
 #define AUTOPID_MAX_DESTINATIONS 6
 
+/* Sweep-divisor cap (issue #29). Bounds polllog_prepare_schedule()'s two stack arrays at
+ * 65 bytes each and keeps every divisor inside the uint8_t counter. Enforced in BOTH the
+ * parser (json_item_to_sample_every) and polllog_prepare_schedule(); the latter is the
+ * authoritative enforcement point because it INDEXES arrays with the value while running
+ * on the sole-TWAI-owner poll task. The UI validator must use the same 64. */
+#define AUTOPID_MAX_SAMPLE_EVERY 64
+
 typedef struct {
     uint8_t data[AUTOPID_BUFFER_SIZE];
     uint32_t length;
@@ -83,6 +90,16 @@ typedef struct
     pid_type_t pid_type;
     char* rxheader;
     bool enabled;
+    /* Sweep-divisor scheduling (issue #29): poll this PID on every Nth poll_log sweep.
+     * 0 or 1 == every sweep -- the default and today's shipped behaviour. Parsed from
+     * "SampleEvery" (auto_pid.json pids/std_pids) or "sample_every" (car_data.json pids).
+     * Inert outside the POLL_LOG protocol (Legacy AutoPID and fast_log have no sweep). */
+    uint8_t sample_every;
+    /* Executed sweeps still to skip before this PID is due. Seeded at config load by
+     * polllog_prepare_schedule() with this PID's phase offset; decremented once per
+     * EXECUTED, GATED sweep. Owned exclusively by the poll task, never persisted, always
+     * re-derived after a live hot-reload (poll_log.c:466-489). */
+    uint8_t sample_ctr;
 }pid_data_t;
 
 // CAN filter configuration (broadcast frames parsing)
