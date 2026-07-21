@@ -1943,18 +1943,17 @@ function configureMqttAndBatteryAlerts(elements) {
     elements.battAlertDiv.style.display = "none";
 }
 
+// Periodic wakeup is inert on WICAN_PRO: the wake is a plain esp_restart() that no code
+// distinguishes from a cold boot, and this build has no outbound client to report with.
+// Pinned to "disable" (same shape as configureMqttAndBatteryAlerts above) so a device
+// that had it enabled is actually switched off on its next Submit, not merely stripped
+// of the UI. The elements stay in the DOM -- storeData() reads both ids unconditionally,
+// so periodic_wakeup / wakeup_interval keep round-tripping. See the hidden rows in
+// homepage_full.html and GitHub issue #24 for what would bring this back.
 function configurePeriodicWakeup(elements) {
-    const sleepDisabled = elements.sleepStatus.value === "disable";
-    
-    if (sleepDisabled) {
-        elements.periodicWakeup.disabled = true;
-        elements.periodicWakeup.value = "disable";
-        elements.wakeupEveryRow.style.display = "none";
-    } else {
-        elements.periodicWakeup.disabled = false;
-        const wakeupEnabled = elements.periodicWakeup.value === "enable";
-        elements.wakeupEveryRow.style.display = wakeupEnabled ? "table-row" : "none";
-    }
+    elements.periodicWakeup.value = "disable";
+    elements.periodicWakeup.disabled = true;
+    elements.wakeupEveryRow.style.display = "none";
 }
 document.getElementById("defaultOpen").click();
 function checkStatus() {
