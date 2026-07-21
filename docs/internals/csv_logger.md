@@ -24,6 +24,8 @@ csv_grid_mode: CSV_GRID_EVENT (0) | CSV_GRID_FIXED (1)
 - `main/config_server.c` parses `"auto"` as a valid sentinel; the getter `config_server_get_csv_grid_hz()` then returns 1 with `*hz = 0` — **callers must treat `*hz == 0` as "auto"**, it is never a literal 0 Hz.
 - At session open csv_logger latches `csv_grid_auto` from that sentinel. In auto mode, `csv_grid_period_ms()` re-derives the tick period *on every use* from the registered rate callback (`csv_logger_set_rate_fn()` — poll_log registers `poll_log_sweep_hz`), clamped to 20–1000 ms (50–1 Hz). If the callback is missing or returns 0 (rate not yet measured, or a protocol that never registers one), it falls back to `CSV_GRID_HZ_DEFAULT`.
 - Net effect: the grid tracks the *measured* polled-sweep rate live. Bench-verified on `v1.6.0-2-ga4082fd`: 19-PID sweep measured 20.9 Hz → auto trip logged 402 rows in 19.8 s (20.2 Hz, 48–49 ms spacing, every polled column fresh each row).
+- Since issue #29, `poll_log_sweep_hz()` reports the **fastest channel's** cadence, not the mean sweep — with per-PID `SampleEvery` divisors the two differ, and slaving the grid to the sweep would oversample every channel. Nothing here changed; the callback contract is the same float. See [poll_log.md](poll_log.md).
+- **The 20 ms (50 Hz) clamp is the real ceiling.** Shortening the sweep — pushing channels onto CAN filters, or slowing them with `SampleEvery` — can drive the measured rate past 50 Hz, at which point the grid pins to 50 and rows stop tracking the sweep 1:1. That is intended (it bounds SD write rate and row width), but it means a very fast config silently logs slower than it polls.
 
 ### Why slave the grid to the sweep
 

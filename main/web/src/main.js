@@ -416,6 +416,13 @@ const pidEntryStyles = `
         text-overflow: ellipsis;
         white-space: nowrap;
     }
+
+    .sample-every-hint {
+        margin-left: 8px;
+        color: #6b7280;
+        font-size: 12px;
+        white-space: nowrap;
+    }
 `;
 
 // Test results are shown two ways: a compact colored chip on the row (a persistent
@@ -707,6 +714,28 @@ function addCollapsibleRow(rowData = {}) {
                     <td><input type="text" class="unit-input" value="${safe(rowData.Unit || '')}"
                         placeholder="e.g. V, °C, kPa"></td>
                 </tr>
+                <!-- Sample Rate (issue #29): the per-PID sweep divisor "SampleEvery". No id= and
+                     no inline on*= handler -- both would be invisible to lint_web.py (check 1
+                     scans getElementById literals, check 2 scans homepage_full.html only), so the
+                     control is wired with addEventListener below, like .delete-btn/.collapse-btn.
+                     The custom field's max MUST stay equal to AUTOPID_MAX_SAMPLE_EVERY
+                     (components/autopid/autopid.h). -->
+                <tr>
+                    <td>Sample Rate:</td>
+                    <td>
+                        <select class="sample-every-select">
+                            <option value="0">Every sweep</option>
+                            <option value="2">Every 2nd sweep</option>
+                            <option value="4">Every 4th sweep</option>
+                            <option value="8">Every 8th sweep</option>
+                            <option value="16">Every 16th sweep</option>
+                            <option value="custom">Custom&hellip;</option>
+                        </select>
+                        <input type="number" class="sample-every-custom" min="2" max="64" step="1"
+                               value="" placeholder="N" style="width:5em;display:none">
+                        <span class="sample-every-hint"></span>
+                    </td>
+                </tr>
                 <!-- Class + Period hidden: Class is upstream HA/MQTT sensor metadata nothing
                      in this firmware consumes, and Period is honored only by the Legacy
                      AutoPID scheduler -- the Datalogger (poll_log) protocol polls every PID
@@ -787,6 +816,36 @@ const updateTitle = () => {
 nameInput.addEventListener('input', updateTitle);
 pidInput.addEventListener('input', updateTitle);
 
+// --- Sample Rate (per-PID sweep divisor, issue #29) -------------------------------
+const SAMPLE_PRESETS = ['0', '2', '4', '8', '16'];
+const sampleSel    = entry.querySelector('.sample-every-select');
+const sampleCustom = entry.querySelector('.sample-every-custom');
+
+// Hydrate. 0, 1, absent and any garbage all mean "every sweep": the poll_log gate treats
+// N<2 as a no-op, so the UI canonicalizes the same way or a save would invent a distinction
+// the firmware does not have. parseInt(undefined,10) is NaN -> handled -> a brand-new row
+// from addRowAutoTable() correctly defaults to "Every sweep".
+let sampleN = parseInt(rowData.SampleEvery, 10);
+if (!Number.isFinite(sampleN) || sampleN < 2) sampleN = 0;
+if (sampleN > 64) sampleN = 64;      // must equal AUTOPID_MAX_SAMPLE_EVERY (autopid.h)
+if (SAMPLE_PRESETS.includes(String(sampleN))) {
+    sampleSel.value = String(sampleN);
+    sampleCustom.value = '';
+    sampleCustom.style.display = 'none';
+} else {
+    sampleSel.value = 'custom';               // e.g. a hand-written N=5
+    sampleCustom.value = String(sampleN);
+    sampleCustom.style.display = '';
+}
+sampleSel.addEventListener('change', () => {
+    const custom = sampleSel.value === 'custom';
+    sampleCustom.style.display = custom ? '' : 'none';
+    if (custom && !sampleCustom.value) { sampleCustom.value = '3'; sampleCustom.focus(); }
+    updateAllSampleHints();
+});
+sampleCustom.addEventListener('input', updateAllSampleHints);
+if (enabledChk) enabledChk.addEventListener('change', updateAllSampleHints);
+
 entry.querySelectorAll('input, select').forEach(input => {
     input.addEventListener('input', enableAutoStoreButton);
 });
@@ -794,6 +853,10 @@ entry.querySelectorAll('input, select').forEach(input => {
 wireRowDrag(entry);
 
 container.appendChild(entry);
+// After the append, not before: updateAllSampleHints() walks document .pid-entry rows, so
+// running it while `entry` is still detached would leave THIS row's hint blank until the
+// next edit. Sets textContent only and dispatches no event -> does not dirty Store.
+updateAllSampleHints();
 return entry;
 }
 
@@ -1120,6 +1183,13 @@ function loadAutoTable(jsonData) {
                     MinValue: pidData.MinValue || '',
                     MaxValue: pidData.MaxValue || '',
                     Period: pidData.Period || '',
+                    // Per-PID sweep divisor (issue #29). loadAutoTable hydrates through this
+                    // hard-coded whitelist, so a key that is NOT listed here is silently dropped
+                    // on load and therefore lost on the next Store -- the rate would revert to
+                    // "Every sweep" with no error and nothing in lint or build would catch it.
+                    // Deliberately NOT `|| ''`: that idiom coerces a meaningful 0; pass undefined
+                    // through and let the row builder normalize absent/0/1/junk.
+                    SampleEvery: pidData.SampleEvery,
                     description: pidData.description || '',
                     comment: pidData.comment || '',
                     enabled: pidData.enabled
@@ -1190,6 +1260,9 @@ function loadAutoTable(jsonData) {
         } catch (e) {
             autoTableSavedJson = null;
         }
+        // Sample Rate hints (issue #29): one-shot /poll_status read, placed AFTER the
+        // autoTableSavedJson snapshot above so sampleLoadCommitted() has its anchor.
+        pollSweepRefresh();
         console.log("loadAutoTable completed successfully");
 
     } catch (error) {
@@ -1234,6 +1307,140 @@ function emitOptionalNotes(target, entry) {
     }
 }
 
+// ---------------------------------------------------------------------------------
+// Sample Rate (per-PID sweep divisor, issue #29): read-back + the predicted-cadence hint.
+// ---------------------------------------------------------------------------------
+
+// Returns an integer >= 0, or NaN when the Custom field holds anything that is not a bare
+// non-negative decimal integer (the caller turns NaN into the user-facing throw).
+function readSampleEvery(entry) {
+    const sel = entry.querySelector('.sample-every-select');
+    if (!sel) return 0;                                   // row predates the control
+    if (sel.value !== 'custom') return parseInt(sel.value, 10) || 0;
+    const raw = (entry.querySelector('.sample-every-custom')?.value || '').trim();
+    return /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
+}
+
+// Effective divisor: 0, 1, and any non-integer/NaN all mean "every sweep" (=1); only an integer
+// >=2 actually gates. Single source for the load/min/hint call sites below. readSampleEvery() is
+// deliberately NOT normalized here -- the save validator still needs to tell garbage from a real
+// divisor -- so the normalizer is a separate one-liner applied only where an effective N is wanted.
+const effDivisor = n => (Number.isInteger(n) && n >= 2) ? n : 1;
+
+var pollActive   = false;  // /poll_status .active
+var pollQuiesced = false;  // /poll_status .quiesced
+var pollSweepMs  = 0;      // last measured mean sweep, ms; 0 = unknown
+var pollReach    = true;   // last fetch succeeded
+
+// Sum of 1/N over ENABLED rows -- the sweep's poll-load, in "PIDs per sweep".
+function sampleLoadFromEntries() {
+    var sum = 0;
+    document.querySelectorAll('.pid-entry').forEach(function (e) {
+        if (e.querySelector('.enabled-chk')?.checked === false) return;
+        var n = effDivisor(readSampleEvery(e));
+        sum += 1 / n;
+    });
+    return sum;
+}
+
+// Same quantity for the config the DEVICE is running. autoTableSavedJson is the last
+// committed serialization (snapshotted at load, refreshed after every successful Store),
+// so it is exactly the device's table; fall back to the live DOM if it is null.
+function sampleLoadCommitted() {
+    if (!autoTableSavedJson) return sampleLoadFromEntries();
+    try {
+        var pids = (JSON.parse(autoTableSavedJson).pids) || [];
+        var sum = 0;
+        pids.forEach(function (p) {
+            if (p.enabled === false) return;
+            var n = effDivisor(parseInt(p.SampleEvery, 10));
+            sum += 1 / n;
+        });
+        return sum;
+    } catch (e) { return sampleLoadFromEntries(); }
+}
+
+// Predicted MEAN sweep for the table AS CURRENTLY EDITED. Anchored to the MEASURED sweep,
+// not to rtt_avg_ms: rtt_avg_ms is OK-only and ignores 30 ms timeouts, so an RTT model can
+// disagree with the measured figure by ~3x with no user edit. This form is IDENTICALLY the
+// measured sweep when nothing has been edited -- the honesty property -- and is an
+// approximation (it assumes uniform per-PID cost) only for the delta the user just made.
+function predictedSweepMs() {
+    if (!pollSweepMs) return 0;
+    var base = sampleLoadCommitted();
+    var now  = sampleLoadFromEntries();
+    if (!(base > 0) || !(now > 0)) return 0;
+    return pollSweepMs * (now / base);
+}
+
+// Smallest divisor over enabled rows -- the multiplier the firmware's sched_min_n will take.
+function currentMinN() {
+    var mn = 0;
+    document.querySelectorAll('.pid-entry').forEach(function (e) {
+        if (e.querySelector('.enabled-chk')?.checked === false) return;
+        var n = effDivisor(readSampleEvery(e));
+        if (mn === 0 || n < mn) mn = n;
+    });
+    return mn || 1;
+}
+
+// One-shot, no new recurring timer: called on Logger-tab open, at the end of loadAutoTable,
+// and 2 s after a successful Store.
+function pollSweepRefresh() {
+    return fetch('/poll_status')
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+            pollReach    = true;
+            pollActive   = !!(j && j.active === true);
+            pollQuiesced = !!(j && j.quiesced === true);
+            pollSweepMs  = (pollActive && Number.isFinite(j.sweep_ms) && j.sweep_ms > 0) ? j.sweep_ms : 0;
+        })
+        .catch(function () { pollReach = false; pollActive = false; pollSweepMs = 0; })
+        .then(updateAllSampleHints);
+}
+
+// Word the "no number" case from what /poll_status actually says, and ALWAYS render
+// something so an ungated row is visibly wired up rather than silently empty.
+function sampleUnknownReason() {
+    if (!pollReach)   return 'device unreachable';
+    if (!pollActive)  return 'not in Datalogger mode';
+    if (pollQuiesced) return 'engine off';
+    return 'measuring…';
+}
+
+function sampleHintText(n, predMs) {
+    var mult = effDivisor(n);
+    var label = (mult === 1) ? 'every sweep' : ('every ' + mult + ' sweeps');
+    if (!predMs) return '≈ ' + label + ' (' + sampleUnknownReason() + ')';
+    var ms = predMs * mult;
+    return '≈ ' + Math.round(ms) + ' ms (' + (1000 / ms).toFixed(1) + ' Hz)';
+}
+
+// updateAll..., not updateOne...: changing one row's divisor changes the predicted sweep and
+// therefore EVERY row's hint -- that live coupling is the point of the control. Sets
+// textContent only and dispatches no event, so it can never mark the table dirty.
+function updateAllSampleHints() {
+    var pred = predictedSweepMs();
+    document.querySelectorAll('.pid-entry').forEach(function (e) {
+        var span = e.querySelector('.sample-every-hint');
+        if (span) span.textContent = sampleHintText(readSampleEvery(e), pred);
+    });
+    var ro = document.getElementById('polled_sweep_readout');
+    if (!ro) return;
+    if (!pollSweepMs) { ro.textContent = 'Measured sweep: not available (' + sampleUnknownReason() + ')'; return; }
+    // Warn on the predicted FAST-CHANNEL period, which is what csv_grid_period_ms() clamps
+    // at 20 ms -- NOT on the predicted sweep. Warning on the sweep false-alarms on every
+    // uniformly-gated table (all 19 at N=8 -> 5.9 ms sweep but a 47.5 ms grid period,
+    // nowhere near the cap).
+    var fastMs = pred * currentMinN();
+    var warn = (fastMs > 0 && fastMs < 20)
+        ? '   ⚠ predicted fastest channel is above the 50 Hz CSV grid cap — the grid will clamp'
+        : '';
+    ro.textContent = 'Measured sweep: ' + pollSweepMs.toFixed(1) + ' ms (' +
+                     (1000 / pollSweepMs).toFixed(1) + ' Hz)' +
+                     (pred ? '   ·   predicted after apply: ' + pred.toFixed(1) + ' ms' : '') + warn;
+}
+
 // Build the auto_pid.json POST body from the Logger-page DOM. Throws on a validation
 // failure (the caller surfaces the message). Split out of storeAutoTableData so the
 // same serialization can snapshot a load-time baseline for the skip-unchanged guard.
@@ -1252,6 +1459,7 @@ function buildAutoTableJson() {
     })();
     if(entries?.length) {
         entries.forEach((entry, index) => {
+            const sampleEvery = readSampleEvery(entry);
             const pidData = {
                 Name: entry.querySelector('.name-input')?.value || '',
                 Init: entry.querySelector('.init-input')?.value || '',
@@ -1262,6 +1470,13 @@ function buildAutoTableJson() {
                 MinValue: entry.querySelector('.min-value-input')?.value || '',
                 MaxValue: entry.querySelector('.max-value-input')?.value || '',
                 Period: entry.querySelector('.period-input')?.value || '',
+                // Per-PID sweep divisor (issue #29). N<2 is the universal default and the
+                // firmware's no-op, so it emits NO key at all -- a config that never touched
+                // this control saves byte-identically to what it loaded. Same discipline as
+                // emitOptionalNotes() for description/comment; the key sits here, after Period
+                // and before enabled, because emitOptionalNotes appends AFTER enabled and would
+                // interleave the divisor with description/comment.
+                ...(sampleEvery >= 2 ? { SampleEvery: sampleEvery } : {}),
                 enabled: entry.querySelector('.enabled-chk')?.checked !== false
             };
             emitOptionalNotes(pidData, entry);
@@ -1277,6 +1492,17 @@ function buildAutoTableJson() {
             }
             if (!/^\d+$/.test(pidData.Period) || (parseInt(pidData.Period) < 100 && parseInt(pidData.Period) != 0)) {
                 throw new Error("Period must be a number greater than 100");
+            }
+            // Sample Rate (issue #29). readSampleEvery returns NaN for a Custom field holding
+            // anything that is not a bare non-negative decimal integer, so 4.5 / -2 / 1e3 / ""
+            // all land here. Lower bound is 0 in code (0 and 1 are reachable only from the
+            // preset select and both mean "every sweep"); the message says 2..64 because that
+            // is the range the user can type. The upper bound is a FIRMWARE COUPLING, not a UI
+            // preference -- it must stay equal to AUTOPID_MAX_SAMPLE_EVERY in
+            // components/autopid/autopid.h, or a saved value would be silently truncated by the
+            // parser while the UI kept showing what was typed.
+            if (!Number.isInteger(sampleEvery) || sampleEvery < 0 || sampleEvery > 64) {
+                throw new Error(`Sample Rate for "${pidData.Name}" must be a whole number from 2 to 64`);
             }
             custom_pid_data.push(pidData);
         });
@@ -1388,6 +1614,10 @@ async function storeAutoTableData(skipIfUnchanged = false) {
             }
             autoTableSavedJson = serialized;   // committed -> this is the new baseline
             showNotification(msg, color, 6000);
+            // Re-measure once the live apply has settled (issue #29): the alpha-1/8 sweep EMA
+            // needs ~8 sweeps, and the new baseline above makes the predicted figure collapse
+            // back onto the measured one. One setTimeout, not a recurring timer.
+            setTimeout(pollSweepRefresh, 2000);
         })
         .catch(error => {
             showNotification("Error saving settings: " + error.message, "red");
@@ -1722,6 +1952,9 @@ function openTab(evt, tabName) {
     } else if (tabName === 'console_tab') {
         csv_status_poll_start();
         consoleRefresh();
+    } else if (tabName === 'logger') {
+        // Refresh the measured sweep behind the Sample Rate hints (issue #29). One-shot.
+        pollSweepRefresh();
     }
 }
 

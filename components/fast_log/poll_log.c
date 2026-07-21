@@ -99,6 +99,38 @@ static const char *TAG = "poll_log";
 #define POLLLOG_RESUME_FRAMES    1        /* an RX frame triggers a PROBE-resume; confirmed only by a real OK */
 #define POLLLOG_FLASH_PARK_MS    20       /* interlock park sleep while a flash owns the bus (task #36) */
 
+/* Divisor-gate staleness bypass (issue #29). Half the engine-off budget. If no OK has
+ * landed for this long, poll EVERYTHING regardless of divisors, so a long divisor on the
+ * only answering channel can never let (now - s_last_ok_us) reach POLLLOG_ENGINE_OFF_MS
+ * and fire a FALSE ENGINE_STOP. Costs nothing on a healthy config (an OK lands every
+ * min_n sweeps, i.e. tens of ms) and does not weaken the real detector: with the engine
+ * genuinely off, un-gated full sweeps still yield no OK and we still quiesce at 5 s. */
+#define POLLLOG_GATE_STALE_MS    (POLLLOG_ENGINE_OFF_MS / 2)
+
+/* HARD RATE CAP: no PID is ever polled more often than every POLLLOG_MIN_SWEEP_MS.
+ * Each PID is requested once per sweep, so a floor on sweep duration IS a per-PID rate
+ * cap: 10 ms -> 100 Hz. Above that is overkill for this vehicle -- nothing on an NC
+ * powertrain bus carries 100 Hz of real information -- and the cost is not free: it is
+ * ECU diag-task load, bus utilisation, and CSV record rate, all spent on samples that
+ * only duplicate their predecessor.
+ *
+ * It also makes the issue-#29 divisors predictable in wall-clock terms: with the floor
+ * engaged, SampleEvery N means "at most every N x 10 ms", so N=4 is <= 25 Hz regardless
+ * of how few PIDs are configured or how fast the ECU answers.
+ *
+ * The pacing delay is applied BEFORE the sweep-rate measurement, so sweep_ms/sweep_hz
+ * (and therefore the Auto CSV grid) report the true achieved cadence and not the
+ * un-paced rate the loop could have run at. The TWAI RX queue is not drained during the
+ * delay: at ~2000 frame/s that is ~20 frames into a 96-slot queue, and the next sweep's
+ * first polllog_poll_one drains stale frames before transmitting. */
+#define POLLLOG_MIN_SWEEP_MS     10
+#define POLLLOG_MIN_SWEEP_US     ((int64_t)POLLLOG_MIN_SWEEP_MS * 1000)
+
+/* GET /poll_status buffer. Was 400 (~285 chars typical); the issue-#29 schedule fields add
+ * ~260 at max field widths. snprintf's return is CHECKED at the call site -- silent
+ * truncation here emits invalid JSON to the web UI and to any polling tooling. */
+#define POLLLOG_STATUS_JSON_SZ   1024
+
 /* ---- Hybrid broadcast capture (ENABLED -- issue #7) ---------------------- */
 /* Folds the passive broadcast decode into poll_log: every non-response frame poll_log already
  * drains while waiting (and previously threw away) is matched against the configured can_filters
@@ -171,6 +203,23 @@ static volatile float    s_win_rtt_avg_ms = 0, s_win_rtt_min_ms = 0, s_win_rtt_m
  * (the poll task); 32-bit aligned floats -> atomic enough for lock-free readers, same contract
  * as the status snapshot above (deliberately NOT the 64-bit us value, which would tear). */
 static volatile float s_sweep_hz = 0, s_sweep_ms = 0;
+
+/* Per-PID sweep-divisor scheduling (issue #29). Single-writer (poll task) aligned scalars,
+ * same lock-free contract as the status snapshot above. */
+static volatile uint32_t s_sweep_seq    = 0;  /* one tick per gate pass (incl. empty sweeps); never reset */
+static volatile uint32_t s_sweep_empty  = 0;  /* of those, how many requested nothing */
+static volatile uint32_t s_sweep_pids   = 0;  /* PIDs actually requested in the last sweep */
+static volatile uint32_t s_gate_skips   = 0;  /* cumulative polls suppressed by the divisor gate */
+static volatile uint32_t s_pace_sweeps  = 0;  /* sweeps held back by the POLLLOG_MIN_SWEEP_MS cap */
+static volatile uint32_t s_pids_gated   = 0;  /* pollable PIDs with sample_every >= 2 */
+static volatile uint32_t s_sched_min_n  = 1;  /* min effective divisor over POLLABLE pids; 1 = nothing gated */
+static volatile bool     s_gating_live  = false; /* the gate is actually in effect right now */
+static volatile float    s_fast_ms = 0, s_fast_hz = 0;  /* fastest channel: sweep * sched_min_n */
+/* Sweep-duration spread over the 3 s stats window -- the direct phasing-quality readout.
+ * Working accumulators (poll task only) + published mirrors (read by the httpd task), same
+ * two-stage contract as s_st -> s_win_*. */
+static float             s_acc_sweep_min_ms = 0, s_acc_sweep_max_ms = 0;
+static volatile float    s_win_sweep_min_ms = 0, s_win_sweep_max_ms = 0;
 
 /* Engine-off quiesce state (Stage 1). Single-writer (the poll task) aligned fields, same no-mutex
  * contract as the status snapshot above; the getters below do plain reads. */
@@ -313,24 +362,46 @@ static void polllog_decode_broadcast(const twai_message_t *msg)
 }
 #endif /* POLLLOG_HYBRID */
 
+/* Sweep-divisor gate (issue #29). sample_every 0/1 == every sweep: one compare, no state
+ * touched -> a config that sets nothing runs today's exact path, bit for bit.
+ * Called at most ONCE per PID per EXECUTED sweep, and only while the gate is active;
+ * see the invariant comment in polllog_rx_task. */
+static inline bool polllog_pid_due(pid_data_t *pid)
+{
+    if (pid->sample_every <= 1)
+        return true;
+    if (pid->sample_ctr > 0)
+    {
+        pid->sample_ctr--;
+        s_gate_skips++;
+        return false;
+    }
+    pid->sample_ctr = (uint8_t)(pid->sample_every - 1);
+    return true;
+}
+
 /*
  * Poll one PID: build the ISO-TP single-frame request, transmit, then wait (non-blocking drain)
  * up to POLLLOG_RESP_TIMEOUT_MS for the matching 0x7E8 reply. On a match, decode every enabled
  * parameter via evaluate_expression() on the RAW response bytes (B0=PCI, exactly the buffer shape
  * the expressions are authored against) and push to the wide CSV with source "PID" (matching the
  * column provider). Updates rolling turnaround stats.
+ *
+ * Returns true if a request was actually attempted -- which is exactly the condition under which
+ * this call YIELDED and DRAINED (issue #29). The caller relies on that to detect a sweep in which
+ * nothing was requested, because every vTaskDelay and every can_receive in the sweep lives here.
  */
-static void polllog_poll_one(pid_data_t *pid)
+static bool polllog_poll_one(pid_data_t *pid)
 {
     if (!pid || !pid->enabled || !pid->cmd)
-        return;
+        return false;
 
     uint8_t req[3];
     size_t rl = polllog_req_bytes(pid->cmd, req);
     if (rl == 0)
     {
         ESP_LOGW(TAG, "skip PID with unparseable cmd '%s'", pid->cmd);
-        return;
+        return false;
     }
 
     /* Build the ISO-TP single-frame request (always an 8-byte OBD frame). */
@@ -361,7 +432,7 @@ static void polllog_poll_one(pid_data_t *pid)
         s_cum_txfail++;
         vTaskDelay(1);  /* the only no-reply path that never waits: yield so a persistent TX-queue-full
                          * backlog (driver quiescing for OTA/sleep) can't spin this task -> WDT-safe */
-        return;
+        return true;    /* attempted (and yielded) -- not an empty-sweep iteration */
     }
 
     const int64_t deadline = t_send + (int64_t)POLLLOG_RESP_TIMEOUT_MS * 1000;
@@ -429,6 +500,99 @@ static void polllog_poll_one(pid_data_t *pid)
         s_st.timeout++;
         s_cum_timeout++;
     }
+    return true;
+}
+
+/* Assign each gated PID a phase offset so same-divisor channels spread across different
+ * sweeps instead of all firing on the same one (which makes sweep duration oscillate).
+ * Two-pass even spread WITHIN each divisor group. Also publishes the schedule summary read
+ * by /poll_status and by the Auto CSV grid multiplier.
+ *
+ * Deterministic and RE-DERIVED (never preserved) across the live hot-reload: the same JSON
+ * always yields the same phases, so a reload that changes an unrelated field causes no
+ * disturbance, and there is no stable per-PID identity to match on anyway (the old table is
+ * deep-freed, indices shift when a row is added, and cmd/name matching is a fragile O(n^2)
+ * heuristic that can silently mis-map). Worst-case cost of re-deriving is one lcm(N)
+ * transient, <= 64 sweeps. Deleting or reordering a gated row therefore re-phases its whole
+ * divisor group -- harmless and deterministic, but it is why an unrelated edit can show up
+ * as a brief sweep_min_ms/sweep_max_ms transient.
+ *
+ * KNOWN LIMITATION, deliberate: this equalises WITHIN a divisor group, not across groups, so
+ * an N=2 group and an N=4 group still co-fire every 4th sweep. The within-group case is the
+ * one that produces the pathological all-fire-together sweep. Residual oscillation is
+ * MEASURABLE via sweep_min_ms/sweep_max_ms -- do not build a cross-N optimiser (bin-packing
+ * over lcm(all N)) speculatively.
+ */
+static void polllog_prepare_schedule(autopid_config_t *c)
+{
+    uint8_t  cnt[AUTOPID_MAX_SAMPLE_EVERY + 1] = {0};
+    uint8_t  k  [AUTOPID_MAX_SAMPLE_EVERY + 1] = {0};
+    uint8_t  tmp[3];
+    uint32_t gated = 0, min_n = 0;
+
+    if (c == NULL)
+    {
+        s_pids_gated = 0;
+        s_sched_min_n = 1;
+        return;
+    }
+
+    for (uint32_t i = 0; i < c->pid_count; i++)
+    {
+        pid_data_t *p = &c->pids[i];
+        p->sample_ctr = 0;
+        /* THE enforcement point for the divisor range. The parser clamps too, but THIS
+         * function indexes cnt[]/k[] with the value and runs on the sole-TWAI-owner poll
+         * task (8 KB internal-RAM stack), so an out-of-range value here is stack corruption
+         * in the one task the brick-safety invariant depends on. Clamp and write back so
+         * the gate and the schedule can never disagree. */
+        if (p->sample_every > AUTOPID_MAX_SAMPLE_EVERY)
+            p->sample_every = (uint8_t)AUTOPID_MAX_SAMPLE_EVERY;
+        /* Exactly the validity test the sweep applies (polllog_poll_one): a row that is
+         * disabled, has no cmd, or whose cmd never parses can NEVER produce a value. Such a
+         * row must not pin sched_min_n (which would make the Auto CSV grid tick faster than
+         * any channel refreshes and fill the log with LOCF duplicates) and must not consume
+         * a phase slot. */
+        if (!p->enabled || !p->cmd || polllog_req_bytes(p->cmd, tmp) == 0)
+        {
+            if (p->enabled && p->sample_every > 1)
+                ESP_LOGW(TAG, "SampleEvery ignored: pid '%s' can never be polled", p->cmd ? p->cmd : "(null)");
+            continue;
+        }
+        const uint8_t n = (p->sample_every > 1) ? p->sample_every : 1;
+        if (min_n == 0 || n < min_n)
+            min_n = n;
+        if (n > 1 && cnt[n] < 255)
+            cnt[n]++;
+    }
+
+    for (uint32_t i = 0; i < c->pid_count; i++)
+    {
+        pid_data_t *p = &c->pids[i];
+        const uint8_t n = p->sample_every;
+        if (!p->enabled || n <= 1 || cnt[n] == 0)
+            continue;
+        if (!p->cmd || polllog_req_bytes(p->cmd, tmp) == 0)
+            continue;
+        if (k[n] >= cnt[n])
+            continue;   /* >255 PIDs in one divisor group: the tail keeps phase 0 (see cap comment) */
+        /* k-th member of the N-group -> phase floor(k*N/cnt) mod N: even spread.
+         * 2 PIDs at N=4 -> phases 0,2 (not 0,1 -- that is why it is two-pass);
+         * 4 -> 0,1,2,3; 6 -> 0,0,1,2,2,3. */
+        p->sample_ctr = (uint8_t)(((uint32_t)k[n] * n / cnt[n]) % n);
+        k[n]++;
+        gated++;
+        ESP_LOGI(TAG, "  gated: '%s' every %u sweep(s), phase %u",
+                 (p->parameters && p->parameters[0].name) ? p->parameters[0].name : p->cmd,
+                 (unsigned)n, (unsigned)p->sample_ctr);
+    }
+
+    s_pids_gated  = gated;
+    s_sched_min_n = (min_n == 0) ? 1u : min_n;
+
+    if (gated > 0)
+        ESP_LOGI(TAG, "sweep divisors active: %u/%u pids gated, fastest channel every %u sweep(s)",
+                 (unsigned)gated, (unsigned)c->pid_count, (unsigned)s_sched_min_n);
 }
 
 static void polllog_rx_task(void *arg)
@@ -477,6 +641,11 @@ static void polllog_rx_task(void *arg)
             else if (n != NULL)
             {
                 s_cfg = n;
+                /* Re-derive the divisor schedule for the NEW table (issue #29). Runs on the
+                 * poll task, before this iteration's sweep, and nothing outside this task
+                 * reads sample_ctr -- so the publish window is empty. Phases are deterministic
+                 * from the JSON, so an unrelated edit re-derives them identically. */
+                polllog_prepare_schedule(n);
                 s_pid_count = n->pid_count;
                 s_last_reload_ok = true;
                 ESP_LOGI(TAG, "PID table hot-reloaded: %u pids", (unsigned)s_pid_count);
@@ -495,10 +664,43 @@ static void polllog_rx_task(void *arg)
             const uint32_t sweep_ok_before = s_cum_ok;
             const int64_t  sweep_t0 = now;
 
-            /* One single-PID round-robin sweep over all configured polled PIDs. */
+            /* The divisor gate applies only when the ECU is confirmed answering AND an OK is
+             * not going stale. Captured once so the whole sweep is consistent even if
+             * s_confirmed flips mid-sweep.
+             *   BYPASS 1 -- PROBING (!s_confirmed): boot and every quiesce-resume run full
+             *     sweeps. Makes the probe path bit-identical to today and removes any risk
+             *     that an all-gated table starves POLLLOG_PROBE_MS of poll attempts and
+             *     strands the logger in a quiesce loop.
+             *   BYPASS 2 -- STALE OK: once POLLLOG_GATE_STALE_MS has elapsed with no OK,
+             *     poll everything. Without this, a sweep inflated by un-gated PIDs that
+             *     always TIME OUT (30 ms each) combined with a high divisor on the only
+             *     answering channel can push (now - s_last_ok_us) past POLLLOG_ENGINE_OFF_MS
+             *     and fire a FALSE ENGINE_STOP, closing the csv require-engine gate mid-drive.
+             * Both bypasses skip polllog_pid_due() entirely, so counters do NOT tick and
+             * phase resumes exactly where it left off. */
+            const bool gate_active = s_confirmed &&
+                ((now - s_last_ok_us) < (int64_t)POLLLOG_GATE_STALE_MS * 1000);
+            /* "the sweep shape currently in effect is a GATED one". Drives both the EMA rule
+             * and the fast-channel multiplier, so the measurement and the multiplier always
+             * describe the same shape. False whenever nothing is gated -> every ungated
+             * config takes today's exact path. */
+            const bool gating_live = gate_active && (s_pids_gated > 0);
+            s_gating_live = gating_live;
+            uint32_t polled = 0;
+
+            /* One single-PID round-robin sweep over all configured polled PIDs.
+             * INVARIANT (issue #29): sample_ctr advances ONLY on an iteration that actually
+             * reached this loop with the gate active. can_should_park() and the QUIESCED
+             * branch both continue/delay above this point, so a 10 s flash session can never
+             * burn every PID's skip budget and then fire them all at once on the first
+             * unparked sweep. */
             for (uint32_t i = 0; i < s_cfg->pid_count; i++)
             {
-                polllog_poll_one(&s_cfg->pids[i]);
+                pid_data_t *p = &s_cfg->pids[i];
+                if (gate_active && p->enabled && !polllog_pid_due(p))
+                    continue;
+                if (polllog_poll_one(p))
+                    polled++;
                 /* Phase B option (b): no per-PID delay. Every poll already yields inside
                  * polllog_poll_one -- the response-wait loop sleeps vTaskDelay(1) until the reply lands
                  * (the reply can't be queued before we send: we drain stale frames first), a timeout
@@ -507,20 +709,107 @@ static void polllog_rx_task(void *arg)
                  * sleep -- reclaiming ~20% of the sweep time the measure-first run was leaving on the table. */
             }
 
-            /* Calculated channels (Task #17): after a full round-robin sweep every polled source
-             * channel's p->value is freshest -- evaluate calc expressions over those and record each
-             * as source "CALC". No-op when none configured; takes autopid_lock itself (we hold none here). */
-            autopid_eval_calculated_channels();
+            s_sweep_seq++;          /* the divisor's TIME BASE: one tick per gate pass */
+            s_sweep_pids = polled;
 
-            /* Sweep-rate measurement (issue #23): fold this sweep into the EMA only if at least
-             * one PID answered -- see the s_sweep_hz block comment for the freeze/poison rules. */
-            if (s_cum_ok != sweep_ok_before)
+            if (polled == 0)
+            {
+                /* Nothing was requested, so nothing yielded AND nothing drained: every
+                 * vTaskDelay AND every can_receive in the sweep lives inside polllog_poll_one.
+                 *  - Yield: a yield-free prio-5 loop starves IDLE (TWDT error flood; PANIC is
+                 *    unset so it floods rather than reboots) and the prio-4 CSV writer.
+                 *    taskYIELD() is NOT sufficient -- IDLE is prio 0 and this task would just
+                 *    be re-selected.
+                 *  - Drain: poll_log is the SOLE TWAI consumer. The driver RX queue is 96 slots
+                 *    (main/can.c); on a 500 kbit powertrain bus at ~2000 frame/s it fills in
+                 *    ~48 ms. A legal gated config (one PID at N=64) produces 63 consecutive
+                 *    empty sweeps -- unbounded queue growth by construction. Draining here also
+                 *    keeps hybrid broadcast decode running at the same rate it does today.
+                 * Reachable from a legal gated config, and from a config in which every PID is
+                 * disabled or has an unparseable cmd -- the latter spin already ships today. */
+                s_sweep_empty++;
+                twai_message_t m;
+                while (can_receive(&m, 0) == ESP_OK)
+                {
+#if POLLLOG_HYBRID
+                    polllog_decode_broadcast(&m);
+#endif
+                }
+                /* Calculated channels on an empty sweep, so CALC keeps tracking the CANFLT
+                 * inputs just decoded -- a broadcast-only config with all polled rows
+                 * disabled still produces CALC columns. Unthrottled: the pacing floor below
+                 * bounds this loop at POLLLOG_MIN_SWEEP_MS, so "every empty sweep" is <= 100
+                 * Hz by construction. (Before the floor existed this path ran at ~1000 Hz and
+                 * needed an explicit every-16th throttle to avoid flooding the record queue.) */
+                autopid_eval_calculated_channels();
+            }
+            else
+            {
+                /* Calculated channels (Task #17): after a full round-robin sweep every polled source
+                 * channel's p->value is freshest -- evaluate calc expressions over those and record each
+                 * as source "CALC". No-op when none configured; takes autopid_lock itself (we hold none here). */
+                autopid_eval_calculated_channels();
+            }
+
+            /* Hard rate cap: hold the sweep to POLLLOG_MIN_SWEEP_MS. See the constant.
+             * Rounded UP so a paced sweep never lands under the floor. This is also the
+             * ONLY guaranteed yield on the empty-sweep path (which is microseconds long, so
+             * it always paces); the polled path additionally yields inside every
+             * polllog_poll_one. The `polled == 0` fallback exists so that a future change
+             * which lifts a sweep past the floor cannot silently produce a yield-free loop. */
+            {
+                const int64_t raw_us = esp_timer_get_time() - sweep_t0;
+                uint32_t pace_ms = 0;
+                if (raw_us < POLLLOG_MIN_SWEEP_US)
+                    pace_ms = (uint32_t)((POLLLOG_MIN_SWEEP_US - raw_us + 999) / 1000);
+                if (pace_ms == 0 && polled == 0)
+                    pace_ms = 1;
+                if (pace_ms > 0)
+                {
+                    s_pace_sweeps++;
+                    vTaskDelay(pdMS_TO_TICKS(pace_ms));
+                }
+            }
+
+            /* Sweep-rate measurement (issue #23, extended by #29).
+             * Fold rule: today's rule (">=1 OK") OR gating_live. The extra term is what makes
+             * fast_ms EXACT: with divisors, some executed sweeps request nothing, and a PID
+             * with divisor m fires once every m EXECUTED sweeps -- so its mean inter-sample
+             * interval is m x (mean duration of ALL executed sweeps). Averaging only the
+             * non-empty ones overstates it (worked example: 1 PID at N=2 + 1 at N=3 -> the
+             * non-empty mean is 3.125 ms, x2 = 6.25 ms, but the N=2 channel's true mean
+             * interval is 4.83 ms -- 29% high). Empty sweeps are folded ONLY while gating is
+             * live, so the anti-poison guard (probe sweeps against a silent ECU) and the
+             * all-PIDs-disabled case keep today's exact behaviour. */
+            if ((s_cum_ok != sweep_ok_before) || gating_live)
             {
                 static float ema_us = 0;   /* poll-task-local; the volatiles below are the readers' view */
+                static bool  ema_gated = false;
+                if (ema_gated != gating_live)
+                {
+                    /* The sweep SHAPE just changed (gate engaged/disengaged: probe->confirmed,
+                     * stale bypass, or a hot-reload that added/removed divisors). Re-seed
+                     * rather than decay: an alpha-1/8 EMA needs ~8 sweeps to cross, and the
+                     * multiplier flips instantly, so decaying would hand csv_grid_period_ms()
+                     * a rate that is wrong by up to min_n x for ~0.4 s on EVERY engine restart. */
+                    ema_gated = gating_live;
+                    ema_us = 0;
+                }
                 const float sweep_us = (float)(esp_timer_get_time() - sweep_t0);
                 ema_us = (ema_us > 0) ? (ema_us * 0.875f + sweep_us * 0.125f) : sweep_us;
                 s_sweep_ms = ema_us / 1000.0f;
                 s_sweep_hz = (ema_us > 0) ? (1e6f / ema_us) : 0;
+                /* Fastest channel's cadence = mean executed-sweep x smallest live divisor.
+                 * mn is 1 whenever the gate is not actually in effect, so the multiplier and
+                 * the measurement always describe the same sweep shape. Identical to sweep_ms
+                 * when nothing is gated. THIS -- not sweep_ms -- is what the Auto CSV grid tracks. */
+                const float mn = gating_live ? (float)(s_sched_min_n ? s_sched_min_n : 1u) : 1.0f;
+                s_fast_ms = s_sweep_ms * mn;
+                s_fast_hz = s_sweep_hz / mn;
+                /* 3 s-window sweep-duration spread: the phasing-quality readout. */
+                const float ms = sweep_us / 1000.0f;
+                if (s_acc_sweep_min_ms == 0 || ms < s_acc_sweep_min_ms) s_acc_sweep_min_ms = ms;
+                if (ms > s_acc_sweep_max_ms) s_acc_sweep_max_ms = ms;
             }
 
             /* Quiesce decision -> flip the bus to LISTEN_ONLY so we stop holding it awake. Two cases,
@@ -629,6 +918,14 @@ static void polllog_rx_task(void *arg)
             s_win_rtt_min_ms = min_ms;
             s_win_rtt_max_ms = max_ms;
             s_win_req_s = (window_s > 0) ? (total / window_s) : 0.0f;
+            /* Publish the sweep-duration spread mirrors (issue #29) and re-arm the working
+             * accumulators. Done HERE, above polllog_stats_reset(), so /poll_status only ever
+             * reads a completed window -- never a mid-window accumulator that could report a
+             * 0.0 ms sweep and make a phasing check pass for the wrong reason. */
+            s_win_sweep_min_ms = s_acc_sweep_min_ms;
+            s_win_sweep_max_ms = s_acc_sweep_max_ms;
+            s_acc_sweep_min_ms = 0;
+            s_acc_sweep_max_ms = 0;
             polllog_stats_reset();
             stats_t = now;
         }
@@ -658,6 +955,8 @@ void poll_log_init(char *id, uint32_t log_period)
         return;
     }
     s_pid_count = s_cfg->pid_count;   /* cross-task mirror for GET /poll_status (issue #39) */
+    /* Seed the divisor schedule (issue #29) before the poll task exists -- no race. */
+    polllog_prepare_schedule(s_cfg);
     if (s_cfg->pid_count == 0)
     {
         ESP_LOGW(TAG, "config has 0 polled PIDs; POLL_LOG is poll-only, nothing to request");
@@ -730,9 +1029,14 @@ bool poll_log_quiesced(void)
 
 float poll_log_sweep_hz(void)
 {
-    /* 0 = no measurement (POLL_LOG inactive, or no sweep has completed with an OK yet);
+    /* Issue #29: with per-PID divisors, mean sweep time is no longer the rate at which any
+     * channel refreshes -- the fastest channel refreshes every s_sched_min_n sweeps.
+     * Reporting mean sweep here would make the Auto grid oversample and emit full-width
+     * duplicate rows. s_fast_hz == s_sweep_hz whenever gating is not live, so a config that
+     * sets no SampleEvery feeds the CSV grid the identical float.
+     * 0 = no measurement (POLL_LOG inactive, or no sweep has completed with an OK yet);
      * callers (the CSV auto-grid) fall back to their own default on 0. */
-    return s_active ? s_sweep_hz : 0.0f;
+    return s_active ? s_fast_hz : 0.0f;
 }
 
 uint32_t poll_log_bus_idle_ms(void)
@@ -754,26 +1058,44 @@ uint32_t poll_log_bus_idle_ms(void)
  */
 char *poll_log_get_status_json(void)
 {
-    char *buf = malloc(400);
+    char *buf = malloc(POLLLOG_STATUS_JSON_SZ);
     if (buf == NULL)
         return NULL;
-    snprintf(buf, 400,
+    int n = snprintf(buf, POLLLOG_STATUS_JSON_SZ,
              "{\"active\":%s,\"ok\":%u,\"timeout\":%u,\"txfail\":%u,"
              "\"rtt_avg_ms\":%.2f,\"rtt_min_ms\":%.2f,\"rtt_max_ms\":%.2f,\"req_s\":%.1f,"
              "\"sweep_ms\":%.1f,\"sweep_hz\":%.2f,\"pids\":%u,"
+             "\"pids_gated\":%u,\"sched_min_n\":%u,\"gating_active\":%s,"
+             "\"sweep_pids\":%u,\"sweep_seq\":%u,\"sweep_empty\":%u,\"gate_skips\":%u,"
+             "\"pace_sweeps\":%u,\"min_sweep_ms\":%u,"
+             "\"sweep_min_ms\":%.1f,\"sweep_max_ms\":%.1f,\"fast_ms\":%.1f,\"fast_hz\":%.2f,"
              "\"win_ok\":%u,\"win_timeout\":%u,\"win_txfail\":%u,"
-             "\"engine_running\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s}",
+             "\"engine_running\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s,"
+             "\"reload_pending\":%s}",
              s_active ? "true" : "false",
              (unsigned)s_cum_ok, (unsigned)s_cum_timeout, (unsigned)s_cum_txfail,
              (double)s_win_rtt_avg_ms, (double)s_win_rtt_min_ms, (double)s_win_rtt_max_ms,
              (double)s_win_req_s,
              (double)s_sweep_ms, (double)s_sweep_hz,
              (unsigned)s_pid_count,   /* cross-task-safe mirror, never derefs s_cfg (issue #39) */
+             (unsigned)s_pids_gated, (unsigned)s_sched_min_n,
+             s_gating_live ? "true" : "false",
+             (unsigned)s_sweep_pids, (unsigned)s_sweep_seq, (unsigned)s_sweep_empty,
+             (unsigned)s_gate_skips,
+             (unsigned)s_pace_sweeps, (unsigned)POLLLOG_MIN_SWEEP_MS,
+             (double)s_win_sweep_min_ms, (double)s_win_sweep_max_ms,
+             (double)s_fast_ms, (double)s_fast_hz,
              (unsigned)s_win_ok, (unsigned)s_win_timeout, (unsigned)s_win_txfail,
              poll_log_engine_running() ? "true" : "false",
              s_quiesced ? "true" : "false",
              (unsigned)poll_log_bus_idle_ms(),
-             s_last_reload_ok ? "true" : "false");
+             s_last_reload_ok ? "true" : "false",
+             s_reload_requested ? "true" : "false");
+    /* Silent truncation would emit INVALID JSON to the web UI and to any tooling polling
+     * this endpoint -- log loudly rather than let a future field addition break it quietly. */
+    if (n < 0 || n >= POLLLOG_STATUS_JSON_SZ)
+        ESP_LOGE(TAG, "poll_status JSON truncated (%d >= %d) -- invalid JSON emitted",
+                 n, POLLLOG_STATUS_JSON_SZ);
     return buf;
 }
 

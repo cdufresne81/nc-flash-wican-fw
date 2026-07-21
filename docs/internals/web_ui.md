@@ -26,7 +26,7 @@ This guarantees a browser save/revert cycle leaves `/load_config` and `/load_aut
 
 **Known exceptions to the byte-identical invariant:** `batt_alert` and `periodic_wakeup` are *retired*, not merely hidden — `config_server_parse_cfg_into()` force-pins both to `"disable"`, so a device whose stored config had either set to `"enable"` shows that one key flipped after a save/revert cycle. Intentional; not a regression.
 
-Hidden this way so far: protocol selector, CAN bitrate/mode, BLE, Battery Alert, Low-Voltage Behavior, Motion Threshold (PR #25); per-PID and per-filter `Class` + `Period(ms)` rows (PR #27 follow-up — inert outside Legacy AutoPID; `Period` is reserved for the sample-groups feature, issue #29); Periodic wake up + Wakeup Every (PR #46 — the wake was only an `esp_restart()` that nothing distinguishes from a cold boot, and this build has no outbound client to report with; issue #24 would revive it).
+Hidden this way so far: protocol selector, CAN bitrate/mode, BLE, Battery Alert, Low-Voltage Behavior, Motion Threshold (PR #25); per-PID and per-filter `Class` + `Period(ms)` rows (PR #27 follow-up — inert outside Legacy AutoPID; `Period` stays retired — issue #29 shipped as a *new* `SampleEvery` key rather than re-using it, precisely because every shipped PID carries `Period: "200"`); Periodic wake up + Wakeup Every (PR #46 — the wake was only an `esp_restart()` that nothing distinguishes from a cold boot, and this build has no outbound client to report with; issue #24 would revive it).
 
 ## Dynamic entry templates
 
@@ -36,5 +36,6 @@ PID entries and Custom CAN Filter entries are not static HTML — they're templa
 
 - `GET /load_config` streams the raw stored `config.json` (legacy configs may lack new keys); `GET /check_status` is the *built* JSON with defaults applied. Don't confuse them.
 - `POST /store_config` replaces the whole file and **always reboots** — to change one key: load → modify → post the full object.
-- `POST /store_auto_data` writes `auto_pid.json` **without** rebooting; follow with `POST /system_reboot` to apply.
+- `POST /store_auto_data` writes `auto_pid.json` **without** rebooting and hot-swaps the live PID table on the poll task (issue #39). The reply envelope says which happened: `"applied":"live"`, or `"applied":"deferred"` when a CSV trip was open (the swap retries once it closes).
+- Per-PID `SampleEvery` (issue #29) is **omitted when it is 0 or 1**, so a config that uses no divisors round-trips byte-identically. Only 2..64 is emitted; the UI validator's cap must stay equal to `AUTOPID_MAX_SAMPLE_EVERY` in `components/autopid/autopid.h`.
 - `csv_grid_hz` is a string key holding `"1".."50"` or `"auto"` (see [csv_logger.md](csv_logger.md)).
