@@ -1181,6 +1181,15 @@ function loadAutoTable(jsonData) {
                 console.error('Error in UI updates:', error);
             }
         });
+        // Snapshot the just-loaded table as the skip-unchanged baseline for the combined
+        // Submit (storeAutoTableData(true)). All .value fields and rows above are set
+        // synchronously by here. If the load can't be re-serialized cleanly, leave the
+        // baseline null so a Submit always POSTs (safe default).
+        try {
+            autoTableSavedJson = JSON.stringify(buildAutoTableJson(), null, 0);
+        } catch (e) {
+            autoTableSavedJson = null;
+        }
         console.log("loadAutoTable completed successfully");
 
     } catch (error) {
@@ -1225,125 +1234,144 @@ function emitOptionalNotes(target, entry) {
     }
 }
 
-async function storeAutoTableData() {
-    try {
-        const custom_pid_data = [];
-        const custom_can_filters = [];
+// Build the auto_pid.json POST body from the Logger-page DOM. Throws on a validation
+// failure (the caller surfaces the message). Split out of storeAutoTableData so the
+// same serialization can snapshot a load-time baseline for the skip-unchanged guard.
+function buildAutoTableJson() {
+    const custom_pid_data = [];
+    const custom_can_filters = [];
 
-        const entries = document.querySelectorAll('.pid-entry');
+    const entries = document.querySelectorAll('.pid-entry');
 
-        const initialisationValue = document.getElementById("initialisation")?.value || '';
-        const disableOnSleepVoltageValue = document.getElementById("disable_on_sleep_voltage")?.value || 'automate_threshold';
-        const pidPollingMinVoltageValueRaw = document.getElementById("pid_polling_min_voltage")?.value;
-        const pidPollingMinVoltageValue = (() => {
-            const n = parseFloat(pidPollingMinVoltageValueRaw);
-            return Number.isFinite(n) ? n : 12.0;
-        })();
-        if(entries?.length) {
-            entries.forEach((entry, index) => {
-                const pidData = {
-                    Name: entry.querySelector('.name-input')?.value || '',
-                    Init: entry.querySelector('.init-input')?.value || '',
-                    PID: entry.querySelector('.pid-input')?.value || '',
-                    Expression: entry.querySelector('.expression-input')?.value || '',
-                    Unit: entry.querySelector('.unit-input')?.value || '',
-                    Class: entry.querySelector('.class-input')?.value || '',
-                    MinValue: entry.querySelector('.min-value-input')?.value || '',
-                    MaxValue: entry.querySelector('.max-value-input')?.value || '',
-                    Period: entry.querySelector('.period-input')?.value || '',
-                    enabled: entry.querySelector('.enabled-chk')?.checked !== false
-                };
-                emitOptionalNotes(pidData, entry);
+    const initialisationValue = document.getElementById("initialisation")?.value || '';
+    const disableOnSleepVoltageValue = document.getElementById("disable_on_sleep_voltage")?.value || 'automate_threshold';
+    const pidPollingMinVoltageValueRaw = document.getElementById("pid_polling_min_voltage")?.value;
+    const pidPollingMinVoltageValue = (() => {
+        const n = parseFloat(pidPollingMinVoltageValueRaw);
+        return Number.isFinite(n) ? n : 12.0;
+    })();
+    if(entries?.length) {
+        entries.forEach((entry, index) => {
+            const pidData = {
+                Name: entry.querySelector('.name-input')?.value || '',
+                Init: entry.querySelector('.init-input')?.value || '',
+                PID: entry.querySelector('.pid-input')?.value || '',
+                Expression: entry.querySelector('.expression-input')?.value || '',
+                Unit: entry.querySelector('.unit-input')?.value || '',
+                Class: entry.querySelector('.class-input')?.value || '',
+                MinValue: entry.querySelector('.min-value-input')?.value || '',
+                MaxValue: entry.querySelector('.max-value-input')?.value || '',
+                Period: entry.querySelector('.period-input')?.value || '',
+                enabled: entry.querySelector('.enabled-chk')?.checked !== false
+            };
+            emitOptionalNotes(pidData, entry);
 
-                if (pidData.Name.length === 0 || pidData.Name.length >= 32) {
-                    throw new Error("Name must not be empty and must be less than 32 characters");
-                }
-                if (pidData.PID.length === 0 || pidData.PID.length >= 10) {
-                    throw new Error("PID must not be empty and must be less than 10 characters");
-                }
-                if (pidData.Expression.length === 0 || pidData.Expression.length >= 64) {
-                    throw new Error("Expression must not be empty and must be less than 64 characters");
-                }
-                if (!/^\d+$/.test(pidData.Period) || (parseInt(pidData.Period) < 100 && parseInt(pidData.Period) != 0)) {
-                    throw new Error("Period must be a number greater than 100");
-                }
-                custom_pid_data.push(pidData);
-            });
-        }
-
-        // Custom CAN filters: group CONTIGUOUS runs of the same frame_id, not a global
-        // Map — a global merge cannot represent an interleaved row order, which made
-        // some ▲/▼ moves save byte-identical JSON and silently revert on reload
-        // (issue #33). The firmware parses can_filters[] by array index and every
-        // matcher walks all entries, so a frame_id split across two runs decodes
-        // identically to one merged entry.
-        const customFilterEntries = document.querySelectorAll('.custom-canfilter-entry');
-        if (customFilterEntries.length > 0) {
-            let runKey = null;
-            let runGroup = null;
-            customFilterEntries.forEach(entry => {
-                const fidRaw = entry.querySelector('.frame-id-input')?.value || '';
-                const fidNum = normalizeFrameIdInputToNumber(fidRaw);
-                const frameIdOut = (fidNum !== null) ? fidNum : String(fidRaw).trim();
-                if (!frameIdOut) {
-                    throw new Error('Broadcast PID Frame ID is required');
-                }
-                const key = (fidNum !== null) ? `n:${fidNum}` : `s:${String(fidRaw).trim().toLowerCase()}`;
-                if (key !== runKey) {
-                    runKey = key;
-                    runGroup = { frame_id: frameIdOut, parameters: [] };
-                    custom_can_filters.push(runGroup);
-                }
-                const filterParam = {
-                    name: entry.querySelector('.name-input')?.value || '',
-                    expression: entry.querySelector('.expression-input')?.value || '',
-                    unit: entry.querySelector('.unit-input')?.value || '',
-                    class: entry.querySelector('.class-input')?.value || '',
-                    period: entry.querySelector('.period-input')?.value || '',
-                    min: entry.querySelector('.min-input')?.value || '',
-                    max: entry.querySelector('.max-input')?.value || '',
-                    enabled: entry.querySelector('.enabled-chk')?.checked !== false
-                };
-                emitOptionalNotes(filterParam, entry);
-                runGroup.parameters.push(filterParam);
-            });
-        }
-
-        // Calculated channels (Task #17): collect name/expression/unit/enabled rows. Carried
-        // through verbatim so a UI "Store" never drops imported calculated channels.
-        const calculated_data = [];
-        document.querySelectorAll('.calculated-entry').forEach(entry => {
-            const name = (entry.querySelector('.name-input')?.value || '').trim();
-            const expression = (entry.querySelector('.expression-input')?.value || '').trim();
-            const unit = (entry.querySelector('.unit-input')?.value || '').trim();
-            const enabled = entry.querySelector('.enabled-chk')?.checked !== false;
-            if (!name) return;  // skip unnamed rows
-            if (name.length > 47) {
-                throw new Error("Calculated PID name must be less than 48 characters");
+            if (pidData.Name.length === 0 || pidData.Name.length >= 32) {
+                throw new Error("Name must not be empty and must be less than 32 characters");
             }
-            calculated_data.push({ name, expression, unit, enabled });
+            if (pidData.PID.length === 0 || pidData.PID.length >= 10) {
+                throw new Error("PID must not be empty and must be less than 10 characters");
+            }
+            if (pidData.Expression.length === 0 || pidData.Expression.length >= 64) {
+                throw new Error("Expression must not be empty and must be less than 64 characters");
+            }
+            if (!/^\d+$/.test(pidData.Period) || (parseInt(pidData.Period) < 100 && parseInt(pidData.Period) != 0)) {
+                throw new Error("Period must be a number greater than 100");
+            }
+            custom_pid_data.push(pidData);
         });
+    }
 
-        const jsonData = {
-            initialisation: initialisationValue,
-            disable_on_sleep_voltage: disableOnSleepVoltageValue,
-            pid_polling_min_voltage: pidPollingMinVoltageValue,
-            pids: custom_pid_data,
-            // Standard-PIDs keys are passthrough (no UI after issue #21): re-emit the
-            // values captured by loadAutoTable so a Store never silently drops them.
-            std_pids: loadedStdPids,
-            can_filters: custom_can_filters,
-            calculated: calculated_data,
-            standard_pids: loadedStandardPids,
-            ecu_protocol: loadedEcuProtocol
-        };
+    // Custom CAN filters: group CONTIGUOUS runs of the same frame_id, not a global
+    // Map — a global merge cannot represent an interleaved row order, which made
+    // some ▲/▼ moves save byte-identical JSON and silently revert on reload
+    // (issue #33). The firmware parses can_filters[] by array index and every
+    // matcher walks all entries, so a frame_id split across two runs decodes
+    // identically to one merged entry.
+    const customFilterEntries = document.querySelectorAll('.custom-canfilter-entry');
+    if (customFilterEntries.length > 0) {
+        let runKey = null;
+        let runGroup = null;
+        customFilterEntries.forEach(entry => {
+            const fidRaw = entry.querySelector('.frame-id-input')?.value || '';
+            const fidNum = normalizeFrameIdInputToNumber(fidRaw);
+            const frameIdOut = (fidNum !== null) ? fidNum : String(fidRaw).trim();
+            if (!frameIdOut) {
+                throw new Error('Broadcast PID Frame ID is required');
+            }
+            const key = (fidNum !== null) ? `n:${fidNum}` : `s:${String(fidRaw).trim().toLowerCase()}`;
+            if (key !== runKey) {
+                runKey = key;
+                runGroup = { frame_id: frameIdOut, parameters: [] };
+                custom_can_filters.push(runGroup);
+            }
+            const filterParam = {
+                name: entry.querySelector('.name-input')?.value || '',
+                expression: entry.querySelector('.expression-input')?.value || '',
+                unit: entry.querySelector('.unit-input')?.value || '',
+                class: entry.querySelector('.class-input')?.value || '',
+                period: entry.querySelector('.period-input')?.value || '',
+                min: entry.querySelector('.min-input')?.value || '',
+                max: entry.querySelector('.max-input')?.value || '',
+                enabled: entry.querySelector('.enabled-chk')?.checked !== false
+            };
+            emitOptionalNotes(filterParam, entry);
+            runGroup.parameters.push(filterParam);
+        });
+    }
+
+    // Calculated channels (Task #17): collect name/expression/unit/enabled rows. Carried
+    // through verbatim so a UI "Store" never drops imported calculated channels.
+    const calculated_data = [];
+    document.querySelectorAll('.calculated-entry').forEach(entry => {
+        const name = (entry.querySelector('.name-input')?.value || '').trim();
+        const expression = (entry.querySelector('.expression-input')?.value || '').trim();
+        const unit = (entry.querySelector('.unit-input')?.value || '').trim();
+        const enabled = entry.querySelector('.enabled-chk')?.checked !== false;
+        if (!name) return;  // skip unnamed rows
+        if (name.length > 47) {
+            throw new Error("Calculated PID name must be less than 48 characters");
+        }
+        calculated_data.push({ name, expression, unit, enabled });
+    });
+
+    return {
+        initialisation: initialisationValue,
+        disable_on_sleep_voltage: disableOnSleepVoltageValue,
+        pid_polling_min_voltage: pidPollingMinVoltageValue,
+        pids: custom_pid_data,
+        // Standard-PIDs keys are passthrough (no UI after issue #21): re-emit the
+        // values captured by loadAutoTable so a Store never silently drops them.
+        std_pids: loadedStdPids,
+        can_filters: custom_can_filters,
+        calculated: calculated_data,
+        standard_pids: loadedStandardPids,
+        ecu_protocol: loadedEcuProtocol
+    };
+}
+
+// skipIfUnchanged: set by the combined Submit (postConfig), which re-runs this handler
+// on every save even from the Settings page. When nothing in the logger/PID table
+// changed, skip the POST entirely — it otherwise fires a misleading "PID table applied"
+// toast and triggers a needless live PID-table hot-swap (RCU reload) on the poll task.
+// The dedicated Logger "Store" button calls with the default (false) and always posts.
+async function storeAutoTableData(skipIfUnchanged = false) {
+    try {
+        const serialized = JSON.stringify(buildAutoTableJson(), null, 0);
+
+        // autoTableSavedJson is snapshotted on load and refreshed after each commit.
+        // A null baseline (no clean snapshot) never === the serialized string, so this
+        // correctly falls through to always-POST -- no explicit null check needed.
+        if (skipIfUnchanged && serialized === autoTableSavedJson) {
+            return true;
+        }
 
         await fetch('store_auto_data', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(jsonData, null, 0)
+            body: serialized
         })
         .then(response => response.text())
         .then(result => {
@@ -1358,6 +1386,7 @@ async function storeAutoTableData() {
             } catch (e) {
                 if (result) msg = result;   // legacy plain-text firmware
             }
+            autoTableSavedJson = serialized;   // committed -> this is the new baseline
             showNotification(msg, color, 6000);
         })
         .catch(error => {
@@ -2064,7 +2093,7 @@ async function postConfig() {
     var obj = {};
     document.getElementById("submit_button").disabled = true;
     await new Promise(resolve => setTimeout(resolve, 1000));
-    const storeResult = await storeAutoTableData();
+    const storeResult = await storeAutoTableData(true);   // skip the POST if the PID table is unchanged
     if (!storeResult) {
         document.getElementById("submit_button").disabled = false;
         return;
@@ -2569,6 +2598,7 @@ var PASSTHROUGH_KEYS = ["can_datarate", "can_mode", "imu_threshold", "log_period
 var loadedStdPids = [];             // re-sent by storeAutoTableData
 var loadedStandardPids = "disable"; // re-sent by storeAutoTableData
 var loadedEcuProtocol = "6";        // re-sent by storeAutoTableData
+var autoTableSavedJson = null;      // last committed/loaded auto_pid body; skip-unchanged baseline
 
 async function Load() {
     const xhttp = new XMLHttpRequest();
