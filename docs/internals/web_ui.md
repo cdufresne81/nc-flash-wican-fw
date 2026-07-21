@@ -24,7 +24,9 @@ Since PR #25 this product presents a trimmed UI (Datalogger-only). The disciplin
 
 This guarantees a browser save/revert cycle leaves `/load_config` and `/load_auto_pid` **byte-identical** — the invariant used to validate every streamline change. Verify with a load → save → diff of the two JSON files (mask credentials when diffing).
 
-Hidden this way so far: protocol selector, CAN bitrate/mode, BLE, Battery Alert, Low-Voltage Behavior, Motion Threshold (PR #25); per-PID and per-filter `Class` + `Period(ms)` rows (PR #27 follow-up — inert outside Legacy AutoPID; `Period` is reserved for the sample-groups feature, issue #29).
+**Known exceptions to the byte-identical invariant:** `batt_alert` and `periodic_wakeup` are *retired*, not merely hidden — `config_server_parse_cfg_into()` force-pins both to `"disable"`, so a device whose stored config had either set to `"enable"` shows that one key flipped after a save/revert cycle. Intentional; not a regression.
+
+Hidden this way so far: protocol selector, CAN bitrate/mode, BLE, Battery Alert, Low-Voltage Behavior, Motion Threshold (PR #25); per-PID and per-filter `Class` + `Period(ms)` rows (PR #27 follow-up — inert outside Legacy AutoPID; `Period` is reserved for the sample-groups feature, issue #29); Periodic wake up + Wakeup Every (PR #46 — the wake was only an `esp_restart()` that nothing distinguishes from a cold boot, and this build has no outbound client to report with; issue #24 would revive it).
 
 ## Dynamic entry templates
 

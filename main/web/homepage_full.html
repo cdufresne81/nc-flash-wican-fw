@@ -1311,14 +1311,22 @@
                             <td>Sleep After:</td>
                             <td class="slider-container"><input oninput="document.getElementById('sleep_time_value').textContent = this.value;submit_enable();" id="sleep_time" max="30" min="1" name="sleep_time" step="1" type="range" value="5"> <span id="sleep_time_value">5</span>min</td>
                         </tr>
-                        <tr>
+                        <!-- Periodic wake up is inoperative in this fork: the firmware pins
+                             periodic_wakeup to "disable" in the config parser
+                             (config_server.c), same as batt_alert below. A wake was only an
+                             esp_restart() that nothing distinguishes from a cold boot, and
+                             this build has no outbound client to report anything with. Rows
+                             hidden; both controls stay in the DOM deliberately -- the keys
+                             keep round-tripping, and the battery-guard reimplementation
+                             (GitHub issue #24) can resurrect this as-is. -->
+                        <tr style="display:none">
                             <td>Periodic wake up:</td>
                             <td><select id="periodic_wakeup" name="periodic_wakeup" onchange="submit_enable();">
                                     <option value="enable">Enable</option>
                                     <option value="disable">Disable</option>
                                 </select></td>
                         </tr>
-                        <tr id="wakeup_every_row">
+                        <tr id="wakeup_every_row" style="display:none">
                             <td>Wakeup Every:</td>
                             <td class="slider-container"><input oninput="document.getElementById('wakeup_interval_value').textContent = this.value;submit_enable();" id="wakeup_interval" max="240" min="5" name="wakeup_interval" step="1" type="range" value="60"> <span id="wakeup_interval_value">60</span>min</td>
                         </tr>

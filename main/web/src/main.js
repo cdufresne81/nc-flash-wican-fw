@@ -1750,8 +1750,6 @@ function getElements() {
         sleepDisableAgree: document.getElementById("sleep_disable_agree"),
         protocol: document.getElementById("protocol"),
         portType: document.getElementById("port_type"),
-        periodicWakeup: document.getElementById("periodic_wakeup"),
-        wakeupEveryRow: document.getElementById("wakeup_every_row"),
         sta_ble_info: document.getElementById("sta_ble_info")
     };
 }
@@ -1797,9 +1795,6 @@ function submit_enable() {
     
     // Configure MQTT and battery alert visibility
     configureMqttAndBatteryAlerts(elements);
-    
-    // Configure periodic wakeup settings
-    configurePeriodicWakeup(elements);
 }
 
 function configureWifiModeSettings(elements, wifiMode) {
@@ -1943,19 +1938,6 @@ function configureMqttAndBatteryAlerts(elements) {
     elements.battAlertDiv.style.display = "none";
 }
 
-function configurePeriodicWakeup(elements) {
-    const sleepDisabled = elements.sleepStatus.value === "disable";
-    
-    if (sleepDisabled) {
-        elements.periodicWakeup.disabled = true;
-        elements.periodicWakeup.value = "disable";
-        elements.wakeupEveryRow.style.display = "none";
-    } else {
-        elements.periodicWakeup.disabled = false;
-        const wakeupEnabled = elements.periodicWakeup.value === "enable";
-        elements.wakeupEveryRow.style.display = wakeupEnabled ? "table-row" : "none";
-    }
-}
 document.getElementById("defaultOpen").click();
 function checkStatus() {
     const xhttp = new XMLHttpRequest();
@@ -2669,11 +2651,10 @@ xhttp.onload = async function() {
             document.getElementById("sleep_disable_agree").selectedIndex = "0";
         }
         toggleSleepWarning();
-        if(obj.periodic_wakeup == "enable") {
-            document.getElementById("periodic_wakeup").selectedIndex = "0";
-        } else if(obj.periodic_wakeup == "disable") {
-            document.getElementById("periodic_wakeup").selectedIndex = "1";
-        }
+        // Pinned, not mirrored: periodic wakeup is retired and the firmware force-disables
+        // the key in the config parser. A legacy config.json may still say "enable" (
+        // /load_config streams the raw file), so ignore it and post "disable" back.
+        document.getElementById("periodic_wakeup").value = "disable";
 
         document.getElementById("batt_mqtt_user").value = obj.batt_mqtt_user;
         document.getElementById("batt_mqtt_pass").value = obj.batt_mqtt_pass;
