@@ -1686,6 +1686,8 @@
                     <div class="section-title section-title--no-underline">Polled PIDs</div>
                     <div class="section-title-actions"><button class="primary-button success-button" onclick="addRowAutoTable()">New Polled PID</button></div>
                 </div>
+                <div id="polled_sweep_readout" style="color:#6b7280;font-size:12px;margin:2px 0 6px"></div>
+                <div style="color:#6b7280;font-size:12px;margin-bottom:6px">Sample Rate skips a PID on all but every Nth polling sweep, freeing bus time for the fast channels. Estimates are scaled from the currently measured sweep and update live as you edit &mdash; slowing channels down shortens the sweep, so every other channel speeds up too.</div>
                 <table class="form-table">
                     <tbody>
                         <tr>
