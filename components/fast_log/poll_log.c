@@ -107,6 +107,25 @@ static const char *TAG = "poll_log";
  * genuinely off, un-gated full sweeps still yield no OK and we still quiesce at 5 s. */
 #define POLLLOG_GATE_STALE_MS    (POLLLOG_ENGINE_OFF_MS / 2)
 
+/* HARD RATE CAP: no PID is ever polled more often than every POLLLOG_MIN_SWEEP_MS.
+ * Each PID is requested once per sweep, so a floor on sweep duration IS a per-PID rate
+ * cap: 10 ms -> 100 Hz. Above that is overkill for this vehicle -- nothing on an NC
+ * powertrain bus carries 100 Hz of real information -- and the cost is not free: it is
+ * ECU diag-task load, bus utilisation, and CSV record rate, all spent on samples that
+ * only duplicate their predecessor.
+ *
+ * It also makes the issue-#29 divisors predictable in wall-clock terms: with the floor
+ * engaged, SampleEvery N means "at most every N x 10 ms", so N=4 is <= 25 Hz regardless
+ * of how few PIDs are configured or how fast the ECU answers.
+ *
+ * The pacing delay is applied BEFORE the sweep-rate measurement, so sweep_ms/sweep_hz
+ * (and therefore the Auto CSV grid) report the true achieved cadence and not the
+ * un-paced rate the loop could have run at. The TWAI RX queue is not drained during the
+ * delay: at ~2000 frame/s that is ~20 frames into a 96-slot queue, and the next sweep's
+ * first polllog_poll_one drains stale frames before transmitting. */
+#define POLLLOG_MIN_SWEEP_MS     10
+#define POLLLOG_MIN_SWEEP_US     ((int64_t)POLLLOG_MIN_SWEEP_MS * 1000)
+
 /* GET /poll_status buffer. Was 400 (~285 chars typical); the issue-#29 schedule fields add
  * ~260 at max field widths. snprintf's return is CHECKED at the call site -- silent
  * truncation here emits invalid JSON to the web UI and to any polling tooling. */
@@ -191,6 +210,7 @@ static volatile uint32_t s_sweep_seq    = 0;  /* one tick per gate pass (incl. e
 static volatile uint32_t s_sweep_empty  = 0;  /* of those, how many requested nothing */
 static volatile uint32_t s_sweep_pids   = 0;  /* PIDs actually requested in the last sweep */
 static volatile uint32_t s_gate_skips   = 0;  /* cumulative polls suppressed by the divisor gate */
+static volatile uint32_t s_pace_sweeps  = 0;  /* sweeps held back by the POLLLOG_MIN_SWEEP_MS cap */
 static volatile uint32_t s_pids_gated   = 0;  /* pollable PIDs with sample_every >= 2 */
 static volatile uint32_t s_sched_min_n  = 1;  /* min effective divisor over POLLABLE pids; 1 = nothing gated */
 static volatile bool     s_gating_live  = false; /* the gate is actually in effect right now */
@@ -715,15 +735,13 @@ static void polllog_rx_task(void *arg)
                     polllog_decode_broadcast(&m);
 #endif
                 }
-                /* Calculated channels on an empty sweep: throttled to every 16th (>= ~16 ms
-                 * given the 1 ms yield below, i.e. <= ~60 Hz) so CALC keeps tracking the
-                 * CANFLT inputs just decoded -- a broadcast-only config with all polled rows
-                 * disabled still produces CALC columns -- without flooding the record queue
-                 * at loop rate (each pass takes autopid_lock(20) and pushes one
-                 * csv_logger_record per calc channel). */
-                if ((s_sweep_empty & 0x0Fu) == 0u)
-                    autopid_eval_calculated_channels();
-                vTaskDelay(1);
+                /* Calculated channels on an empty sweep, so CALC keeps tracking the CANFLT
+                 * inputs just decoded -- a broadcast-only config with all polled rows
+                 * disabled still produces CALC columns. Unthrottled: the pacing floor below
+                 * bounds this loop at POLLLOG_MIN_SWEEP_MS, so "every empty sweep" is <= 100
+                 * Hz by construction. (Before the floor existed this path ran at ~1000 Hz and
+                 * needed an explicit every-16th throttle to avoid flooding the record queue.) */
+                autopid_eval_calculated_channels();
             }
             else
             {
@@ -731,6 +749,26 @@ static void polllog_rx_task(void *arg)
                  * channel's p->value is freshest -- evaluate calc expressions over those and record each
                  * as source "CALC". No-op when none configured; takes autopid_lock itself (we hold none here). */
                 autopid_eval_calculated_channels();
+            }
+
+            /* Hard rate cap: hold the sweep to POLLLOG_MIN_SWEEP_MS. See the constant.
+             * Rounded UP so a paced sweep never lands under the floor. This is also the
+             * ONLY guaranteed yield on the empty-sweep path (which is microseconds long, so
+             * it always paces); the polled path additionally yields inside every
+             * polllog_poll_one. The `polled == 0` fallback exists so that a future change
+             * which lifts a sweep past the floor cannot silently produce a yield-free loop. */
+            {
+                const int64_t raw_us = esp_timer_get_time() - sweep_t0;
+                uint32_t pace_ms = 0;
+                if (raw_us < POLLLOG_MIN_SWEEP_US)
+                    pace_ms = (uint32_t)((POLLLOG_MIN_SWEEP_US - raw_us + 999) / 1000);
+                if (pace_ms == 0 && polled == 0)
+                    pace_ms = 1;
+                if (pace_ms > 0)
+                {
+                    s_pace_sweeps++;
+                    vTaskDelay(pdMS_TO_TICKS(pace_ms));
+                }
             }
 
             /* Sweep-rate measurement (issue #23, extended by #29).
@@ -1029,6 +1067,7 @@ char *poll_log_get_status_json(void)
              "\"sweep_ms\":%.1f,\"sweep_hz\":%.2f,\"pids\":%u,"
              "\"pids_gated\":%u,\"sched_min_n\":%u,\"gating_active\":%s,"
              "\"sweep_pids\":%u,\"sweep_seq\":%u,\"sweep_empty\":%u,\"gate_skips\":%u,"
+             "\"pace_sweeps\":%u,\"min_sweep_ms\":%u,"
              "\"sweep_min_ms\":%.1f,\"sweep_max_ms\":%.1f,\"fast_ms\":%.1f,\"fast_hz\":%.2f,"
              "\"win_ok\":%u,\"win_timeout\":%u,\"win_txfail\":%u,"
              "\"engine_running\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s,"
@@ -1043,6 +1082,7 @@ char *poll_log_get_status_json(void)
              s_gating_live ? "true" : "false",
              (unsigned)s_sweep_pids, (unsigned)s_sweep_seq, (unsigned)s_sweep_empty,
              (unsigned)s_gate_skips,
+             (unsigned)s_pace_sweeps, (unsigned)POLLLOG_MIN_SWEEP_MS,
              (double)s_win_sweep_min_ms, (double)s_win_sweep_max_ms,
              (double)s_fast_ms, (double)s_fast_hz,
              (unsigned)s_win_ok, (unsigned)s_win_timeout, (unsigned)s_win_txfail,
