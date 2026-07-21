@@ -193,11 +193,19 @@ void autopid_eval_calculated_channels(void);
 // old table after the swap.
 void autopid_config_deep_free(autopid_config_t *c);
 
+// Returned by autopid_reload_config() when a CSV trip opened between the poll task's
+// safe-point check and the swap (issue #43 P1): NOT a rejection -- the parsed table is
+// fine but swapping under a just-opened trip would mismatch its frozen header. The
+// caller must re-arm s_reload_requested so the swap retries once the trip closes.
+// A distinct non-NULL sentinel (never a real table); the caller must not dereference it.
+#define AUTOPID_RELOAD_DEFERRED ((autopid_config_t *)-1)
+
 // Re-parse auto_pid.json and atomically swap it in for the live autopid_config.
 // MUST be called ONLY from the poll task at its safe point (holds no table pointer).
 // Validates the new table (rejects only enabled pids with no cmd / inconsistent
 // parameter arrays) and keeps the old table on any failure. Returns the new table on
-// success, NULL if the reload was rejected (caller keeps running the old table).
+// success, NULL if the reload was rejected (caller keeps running the old table), or
+// AUTOPID_RELOAD_DEFERRED if a CSV trip opened mid-reload (caller re-arms and retries).
 autopid_config_t *autopid_reload_config(void);
 
 // Serialize auto_pid.json file writes against the reload's count+parse (P2 TOCTOU
