@@ -1359,9 +1359,10 @@ async function storeAutoTableData(skipIfUnchanged = false) {
     try {
         const serialized = JSON.stringify(buildAutoTableJson(), null, 0);
 
-        // autoTableSavedJson is snapshotted on load and refreshed after each commit;
-        // null means "no clean baseline" -> always POST (safe default).
-        if (skipIfUnchanged && autoTableSavedJson !== null && serialized === autoTableSavedJson) {
+        // autoTableSavedJson is snapshotted on load and refreshed after each commit.
+        // A null baseline (no clean snapshot) never === the serialized string, so this
+        // correctly falls through to always-POST -- no explicit null check needed.
+        if (skipIfUnchanged && serialized === autoTableSavedJson) {
             return true;
         }
 
