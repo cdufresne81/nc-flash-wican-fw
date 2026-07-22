@@ -6,14 +6,9 @@
 
 At session open, the column set is enumerated via a registered provider — `autopid_collect_log_columns` (in the autopid component), registered once at boot with `csv_logger_set_column_provider()`. The provider mirrors the producer gates exactly (std/custom/specific enables, `is_vehicle_specific && !pid_specific_en` skip), so every record that can be produced has a column and `cols_unmatched` stays 0. Channel sources are tagged `PID` / `STD` / `CANFLT` / `CALC`; the header only appends the source tag on **name collisions** (`dup_name`) — so don't grep the header for `[CANFLT]` to check hybrid capture, check the channel's column values.
 
-## Grid modes
+## The fixed-rate grid
 
-```
-csv_grid_mode: CSV_GRID_EVENT (0) | CSV_GRID_FIXED (1)
-```
-
-- **EVENT**: every accepted record emits a row immediately (each row = latest snapshot of all columns at that record's timestamp). Historical mode; produces per-event rows.
-- **FIXED**: a grid timer ticks at a configured rate and each tick writes one full-width row of latest values. This is the product mode; rows land at a steady spacing regardless of how records arrive.
+A grid timer ticks at a configured rate and each tick writes one full-width row of latest (LOCF) values — rows land at a steady spacing regardless of how records arrive; records themselves only refresh the LOCF snapshot. This is the **only** row-writing behavior: the per-record Event mode (`csv_grid_mode`, Task #11) was removed in issue #53, along with the config key and the UI "Polling Mode" dropdown. A stored `csv_grid_mode` key is ignored and drops out of `config.json` on the first Submit after the update.
 
 `CSV_GRID_HZ_DEFAULT` is 10 Hz. The rate is latched per session at session open.
 

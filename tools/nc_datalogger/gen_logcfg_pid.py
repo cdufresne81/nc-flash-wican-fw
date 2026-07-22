@@ -196,8 +196,7 @@ def main():
     print(
         f"[grid] {n} polled PIDs | ~{budget:.0f} req/s budget (@{AVG_RTT_MS} ms RTT) "
         f"| ~{budget / n:.1f} Hz/channel -> recommended csv_grid_hz = {hz}\n"
-        f"[grid] set it in Logger Settings -> Grid Rate (device_config.csv_grid_hz, 1..{GRID_HZ_MAX}); "
-        f"use grid_mode=fixed.",
+        f"[grid] set it in Logger Settings -> Grid Rate (device_config.csv_grid_hz, 1..{GRID_HZ_MAX}).",
         file=sys.stderr,
     )
 

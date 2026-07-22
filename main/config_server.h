@@ -151,7 +151,6 @@ typedef struct _device_config
 	char log_storage[16];
 	char log_filesystem[16];
 	char log_period[16];
-	char csv_grid_mode[16];   // wide time grid: "event" | "fixed"
 	char csv_grid_hz[16];     // wide fixed-rate grid frequency, 1..50 Hz or "auto" (issue #23)
 	char csv_require_engine[16]; // gate CSV logging on engine running (ECU answering): "enable" | "disable"
 	char imu_threshold[16];
@@ -220,10 +219,9 @@ int8_t config_server_get_csv_log(void);
 // led_indicator_snap_rate_ms()'s table (26-208 ms)
 int32_t config_server_get_led_blink_ms(void);
 int8_t config_server_get_log_period(uint32_t *log_period);
-// Wide CSV (Task #11): grid_mode 1=fixed / 0=event / -1=invalid; grid_hz writes *hz (1..50,
+// Wide CSV (Task #11; always fixed-rate since issue #53): grid_hz writes *hz (1..50,
 // or 0 for the "auto" sentinel -- issue #23: grid tracks the measured poll sweep rate) and
 // returns 1, or -1 (leaves *hz untouched) on a bad value. Callers MUST handle *hz==0.
-int8_t config_server_get_csv_grid_mode(void);
 int8_t config_server_get_csv_grid_hz(uint32_t *hz);
 // Engine-running CSV gate (default ON): 1=enable, 0=disable.
 int8_t config_server_get_csv_require_engine(void);

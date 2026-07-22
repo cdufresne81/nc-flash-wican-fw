@@ -135,8 +135,6 @@ static volatile int8_t csv_mark_pending = 0;
 #define CSV_WIDE_FIELD_MAX      64      // holds ",%.3f" of any finite float (FLT_MAX ~= 45 chars)
 #define CSV_GRID_HZ_DEFAULT     10
 
-typedef enum { CSV_GRID_EVENT = 0, CSV_GRID_FIXED = 1 } csv_grid_mode_t;
-
 // One wide column. (source,name) is the dedupe + match KEY (the producer emits the same
 // name under different source tags, so name alone would collapse two distinct channels).
 // name holds the RAW (unsanitized) name to string-match rec.name; the header writer
@@ -151,7 +149,7 @@ typedef struct {
 } csv_wide_col_t;
 
 // Latched ONCE per session by the writer task (single-writer thereafter -> no torn reads).
-static csv_grid_mode_t csv_grid_mode  = CSV_GRID_EVENT;
+// The grid is always fixed-rate: the per-record Event mode was removed (issue #53).
 static uint32_t        csv_grid_hz    = CSV_GRID_HZ_DEFAULT;
 static bool            csv_grid_auto  = false;   // csv_grid_hz=="auto": track the measured rate (issue #23)
 static csv_wide_col_t *csv_cols       = NULL;   // [csv_col_count], INTERNAL RAM, session-scoped
@@ -579,10 +577,10 @@ static void csv_logger_task(void *pvParameters)
             csv_guard_cleared = true;
             ESP_LOGI(TAG, "CSV auto-start proven stable (15s) - crash guard cleared");
         }
-        // In WIDE fixed-rate mode shorten the wait to the grid period so a tick can fire on
+        // While a session is open shorten the wait to the grid period so a tick can fire on
         // idle passes (records may be sparse but the grid still emits at 1/hz). Default 250ms.
         TickType_t rx_to = pdMS_TO_TICKS(250);
-        if (csv_session_active && csv_grid_mode == CSV_GRID_FIXED)
+        if (csv_session_active)
         {
             uint32_t gp = csv_grid_period_ms();
             if (gp < 250u) rx_to = pdMS_TO_TICKS(gp);
@@ -649,9 +647,8 @@ static void csv_logger_task(void *pvParameters)
                            csv_file_path, why, (unsigned)closed_bytes);
         }
 
-        // WIDE fixed-rate grid: emit one LOCF snapshot row per 1/hz, even on idle passes.
-        if (csv_session_active && csv_grid_mode == CSV_GRID_FIXED &&
-            wc_timer_is_expired(&grid_timer))
+        // Fixed-rate grid: emit one LOCF snapshot row per 1/hz, even on idle passes.
+        if (csv_session_active && wc_timer_is_expired(&grid_timer))
         {
             wc_timer_set(&grid_timer, csv_grid_period_ms());
             if (!csv_emit_wide_row(esp_timer_get_time() / 1000))
@@ -707,7 +704,6 @@ static void csv_logger_task(void *pvParameters)
             // single-writer thereafter so no torn cross-core read). A reboot/new session re-reads.
             // hz==0 is the "auto" sentinel (issue #23): the period is then re-derived from the
             // measured rate on every tick instead of this latched value.
-            csv_grid_mode = (config_server_get_csv_grid_mode() == 0) ? CSV_GRID_EVENT : CSV_GRID_FIXED;
             uint32_t hz = 0;
             int8_t hz_ok = config_server_get_csv_grid_hz(&hz);
             csv_grid_auto = (hz_ok == 1 && hz == 0);
@@ -739,27 +735,13 @@ static void csv_logger_task(void *pvParameters)
             // Not emitted on rotation (which calls csv_open_new_file directly, not this block).
             event_log_emit(EVL_DATALOG_OPEN, "%s (%d cols)", csv_file_path, csv_col_count);
             wc_timer_set(&flush_timer, CSV_LOGGER_FLUSH_PERIOD_MS);
-            if (csv_grid_mode == CSV_GRID_FIXED)
-            {
-                wc_timer_set(&grid_timer, csv_grid_period_ms());
-            }
+            wc_timer_set(&grid_timer, csv_grid_period_ms());
         }
 
-        // Update the LOCF row; in EVENT mode emit a wide row now (FIXED mode emits on the grid
-        // tick above). The long per-record format was removed (Task #16).
+        // Records only refresh the LOCF snapshot; rows are written solely by the grid tick
+        // above. (The per-record Event emit was removed with the mode itself, issue #53;
+        // the long per-record format was removed earlier, Task #16.)
         csv_locf_update(&rec);
-        bool wrote_ok = (csv_grid_mode == CSV_GRID_EVENT) ? csv_emit_wide_row(rec.t_ms) : true;
-        if (!wrote_ok)
-        {
-            ESP_LOGE(TAG, "Write failed on %s, closing", csv_file_path);
-            csv_close_file();
-            csv_session_active = false;
-            csv_free_wide_state();
-            event_log_emit(EVL_DATALOG_CLOSE, "%s (write_error)", csv_file_path);
-            csv_sd_retry_after_ms = (esp_timer_get_time() / 1000) + CSV_LOGGER_SD_RETRY_MS;
-            continue;
-        }
-        flush_pending = true;
 
         if (wc_timer_is_expired(&flush_timer))
         {
