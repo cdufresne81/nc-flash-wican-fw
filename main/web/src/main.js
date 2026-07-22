@@ -431,20 +431,141 @@ const pidEntryStyles = `
 // error, which was the "doesn't display the message fully" bug.
 function showTestOutcome(resultEl, ok, chipText, detail, toastColor) {
     if (resultEl) {
+        // A yellow toast means "can't test right now" (trip running, engine off) rather than a hard
+        // failure — give the on-row chip a matching amber state instead of the red error chip.
+        const warn = !ok && toastColor === 'yellow';
         resultEl.style.display = 'inline-flex';
         resultEl.classList.add('status-indicator');
         resultEl.classList.toggle('status-connected', ok);
-        resultEl.classList.toggle('status-disconnected', !ok);
+        resultEl.classList.toggle('status-warning', warn);
+        resultEl.classList.toggle('status-disconnected', !ok && !warn);
         resultEl.textContent = chipText;
     }
     showNotification(safe(detail), toastColor || (ok ? 'green' : 'red'), ok ? 4000 : 7000);
+}
+
+// Live per-row Test (issue #41). Under AutoPID this drives the ELM327; under the poll_log
+// logger protocol the firmware runs the same test in-band on the poll task (identical JSON
+// contract). Two poll_log-only outcomes get a yellow "can't test now" chip instead of a hard
+// red error: a recording CSV trip blocks the test (code "trip_running"), and an engine-off /
+// quiesced device can't transmit a PID request (code "engine_off").
+async function runPidTest(entry) {
+    const resultEl = entry.querySelector('.test-result');
+    const buttonEl = entry.querySelector('.test-btn');
+    if (!resultEl || !buttonEl) return;
+
+    const payload = { kind: 'custom' };
+    // #31 replaced the per-row free-text "Init" with a Mode dropdown and shows the PID box as
+    // identifier-only, so compose the full wire string a Store would (rowPidWire) -- otherwise the
+    // test would poll e.g. "0C" instead of "010C1". The row-level Init is gone; poll_log ignores
+    // init/pid_init anyway (fixed 0x7E0 addressing), and poll_log is the only protocol this fork runs.
+    const init = document.getElementById('initialisation')?.value || '';
+    if (init.trim()) payload.init = init;
+    payload.pid = rowPidWire(entry);
+    payload.expr = entry.querySelector('.expression-input')?.value || '';
+
+    buttonEl.disabled = true;
+    resultEl.style.display = 'inline-flex';
+    resultEl.classList.add('status-indicator');
+    resultEl.classList.remove('status-connected', 'status-disconnected', 'status-warning');
+    resultEl.textContent = 'Testing…';
+
+    try {
+        const res = await fetch('/autopid/test_pid', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data) {
+            showTestOutcome(resultEl, false, 'Error', `Test request failed (HTTP ${res.status}).`);
+            return;
+        }
+        if (data.ok) {
+            let unit = (data.unit || '').trim();
+            if (!unit) {
+                unit = (entry.querySelector('.unit-input')?.value || '').trim();
+            }
+            const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
+            const shown = (unit ? `${valueText} ${unit}` : valueText).trim();
+            showTestOutcome(resultEl, true, shown || 'OK', `Test OK — read ${shown || 'no value'}.`);
+        } else if (data.code === 'trip_running') {
+            showTestOutcome(resultEl, false, 'Trip running', data.error, 'yellow');
+        } else if (data.code === 'engine_off') {
+            showTestOutcome(resultEl, false, 'Engine off', data.error, 'yellow');
+        } else {
+            showTestOutcome(resultEl, false, 'Error', data.error ? `Test failed: ${data.error}` : 'Test failed.');
+        }
+    } catch (e) {
+        showTestOutcome(resultEl, false, 'Error', `Test failed: ${e.message || e}`);
+    } finally {
+        buttonEl.disabled = false;
+    }
+}
+
+async function runCanFilterTest(kind, entry) {
+    const resultEl = entry.querySelector('.test-result');
+    const buttonEl = entry.querySelector('.test-btn');
+    if (!resultEl || !buttonEl) return;
+
+    const frameIdStr = entry.querySelector('.frame-id-input')?.value || '';
+    const expr = entry.querySelector('.expression-input')?.value || '';
+    const unit = (entry.querySelector('.unit-input')?.value || '').trim();
+
+    const frameIdNum = normalizeFrameIdInputToNumber(frameIdStr);
+    if (frameIdNum === null) {
+        showTestOutcome(resultEl, false, 'Bad ID', 'Invalid Frame ID — enter a hex value like 201 or 0x201.');
+        return;
+    }
+    if (!expr.trim()) {
+        showTestOutcome(resultEl, false, 'Empty', 'Missing expression.');
+        return;
+    }
+
+    const payload = {
+        kind,
+        frame_id: frameIdNum,
+        expr: expr,
+    };
+
+    buttonEl.disabled = true;
+    resultEl.style.display = 'inline-flex';
+    resultEl.classList.add('status-indicator');
+    resultEl.classList.remove('status-connected', 'status-disconnected', 'status-warning');
+    resultEl.textContent = 'Testing…';
+
+    try {
+        const res = await fetch('/autopid/test_can_filter', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data) {
+            showTestOutcome(resultEl, false, 'Error', `Test request failed (HTTP ${res.status}).`);
+            return;
+        }
+        if (data.ok) {
+            const valueText = (data.value === null || data.value === undefined) ? '' : String(data.value);
+            const shown = (unit ? `${valueText} ${unit}` : valueText).trim();
+            showTestOutcome(resultEl, true, shown || 'OK', `Test OK — read ${shown || 'no value'}.`);
+        } else if (data.code === 'trip_running') {
+            showTestOutcome(resultEl, false, 'Trip running', data.error, 'yellow');
+        } else {
+            showTestOutcome(resultEl, false, 'Error', data.error ? `Test failed: ${data.error}` : 'Test failed.');
+        }
+    } catch (e) {
+        showTestOutcome(resultEl, false, 'Error', `Test failed: ${e.message || e}`);
+    } finally {
+        buttonEl.disabled = false;
+    }
 }
 
 // A calculated channel is derived on-device from OTHER channels' values, so there
 // is nothing to poll from the ECU to "test" — instead validate the expression the
 // way the firmware parser reads it: check the syntax, then that every name it
 // references is a channel configured on this page. Pure client-side, so it works
-// regardless of the running protocol (the live PID/filter tests need AutoPID).
+// regardless of the running protocol (the live PID/filter tests run under AutoPID or poll_log).
 function runCalcTest(entry) {
     const resultEl = entry.querySelector('.test-result');
     const expr = (entry.querySelector('.expression-input')?.value || '').trim();
@@ -702,6 +823,18 @@ const parsePidText = txt => {
     return null;
 };
 const composePidText = (service, ident, hint) => service + ident + hint;
+// The wire-format PID string a row would STORE, so the live Test (issue #41) polls the exact
+// bytes poll_log will: canonical rows compose service+ident+hint (mirrors storeAutoTableData's
+// compose), legacy rows hold the full string in the box verbatim.
+function rowPidWire(entry) {
+    const box = entry.querySelector('.pid-input')?.value || '';
+    if (entry.dataset.pidCanonical === '1') {
+        const mode = entry.querySelector('.mode-select')?.value || '01';
+        const hint = entry.dataset.pidHint !== undefined ? entry.dataset.pidHint : PID_HINT_DEFAULT;
+        return composePidText(mode, box, hint);
+    }
+    return box;
+}
 
 function addCollapsibleRow(rowData = {}) {
     const container = document.querySelector('.pid-entries');
@@ -718,6 +851,8 @@ function addCollapsibleRow(rowData = {}) {
             </div>
             <div class="header-right">
                 <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
+                <span class="test-result status-indicator" style="display:none"></span>
+                <button type="button" class="test-btn">Test</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
                     <input type="checkbox" class="enabled-chk" ${enabledChecked}>
                     Enabled
@@ -845,6 +980,14 @@ deleteBtn.addEventListener('click', () => {
     entry.remove();
     enableAutoStoreButton();
 });
+
+const testBtn = entry.querySelector('.test-btn');
+if (testBtn) {
+    testBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        runPidTest(entry);
+    });
+}
 
 const toggleCollapse = (e) => {
     e.stopPropagation();
@@ -979,6 +1122,8 @@ function addCustomCanFilterEntry(rowData = {}) {
             </div>
             <div class="header-right">
                 <button type="button" class="drag-handle" title="Drag to reorder (Arrow keys move the row)" aria-label="Reorder">⋮⋮</button>
+                <span class="test-result status-indicator" style="display:none"></span>
+                <button type="button" class="test-btn">Test</button>
                 <label class="enabled-label" style="display:flex; align-items:center; gap:4px; font-size:0.7rem;">
                     <input type="checkbox" class="enabled-chk" ${(p.enabled === false || rowData.enabled === false) ? '' : 'checked'}>
                     Enabled
@@ -1057,6 +1202,14 @@ function addCustomCanFilterEntry(rowData = {}) {
         entry.remove();
         enableAutoStoreButton();
     });
+
+    const testBtn = entry.querySelector('.test-btn');
+    if (testBtn) {
+        testBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            runCanFilterTest('custom', entry);
+        });
+    }
 
     const toggleCollapse = (e) => {
         e.stopPropagation();

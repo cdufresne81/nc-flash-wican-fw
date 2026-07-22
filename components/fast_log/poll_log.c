@@ -59,6 +59,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -230,6 +231,19 @@ static volatile bool    s_confirmed      = false; /* got an OK in the CURRENT NO
 static volatile int64_t s_norm_start_us  = 0;     /* when the current NORMAL session began (boot/resume) = probe-window ref */
 static volatile int64_t s_last_rx_us     = 0;     /* esp_timer stamp of last received frame (any id) */
 static volatile int64_t s_last_flip_us   = 0;     /* dwell timer for POLLLOG_FLIP_MIN_MS */
+
+/* Live per-row Test under POLL_LOG (issue #41). The httpd handler stages ONE request here and
+ * blocks on s_test_done_sem; the poll task (sole TWAI consumer) picks it up at the top-of-loop
+ * safe point -- AFTER can_should_park() -- runs it, and gives the semaphore back. s_test_req_mtx
+ * admits one test at a time. The test is REFUSED (never queued) while a CSV trip is recording, so
+ * it can never perturb a trip's frozen columns. */
+static SemaphoreHandle_t s_test_req_mtx   = NULL;  /* one live test in flight */
+static SemaphoreHandle_t s_test_done_sem  = NULL;  /* binary; poll task -> httpd task */
+static volatile bool     s_test_requested = false;
+static autopid_live_test_req_t s_test_req;
+static autopid_live_test_res_t s_test_res;
+#define POLLLOG_TEST_PID_RESP_MS   200   /* poll-task wait for the PID response (>> POLLLOG_RESP_TIMEOUT_MS) */
+#define POLLLOG_TEST_CANFLT_MS     600   /* poll-task passive-capture window for a broadcast frame */
 
 /*
  * Parse a polled-PID command string into request bytes.
@@ -595,6 +609,182 @@ static void polllog_prepare_schedule(autopid_config_t *c)
                  (unsigned)gated, (unsigned)c->pid_count, (unsigned)s_sched_min_n);
 }
 
+/* Live per-row Test executor (issue #41) -- runs ON the poll task (sole TWAI consumer), so it
+ * borrows the adapter for exactly one request with no lock and no lease. It writes NO CSV and
+ * mutates NO poll stats: expr/frame_id come from the copied request slot, not the swappable
+ * s_cfg, so it needs no autopid_lock. Its caller places it BEHIND can_should_park(), so a
+ * flash/park/host-claim always preempts it and no stray 0x7E0 is injected mid-ISO-TP. */
+static void polllog_execute_test(const autopid_live_test_req_t *req, autopid_live_test_res_t *res)
+{
+    memset(res, 0, sizeof(*res));
+
+    /* Trip-open TOCTOU re-check: a trip may have opened between the httpd fail-fast check and
+     * this pickup. Refuse before any bus action so a trip's frozen columns are never perturbed. */
+    if (csv_logger_session_active())
+    {
+        res->status = AUTOPID_TEST_TRIP_BUSY;
+        return;
+    }
+
+    twai_message_t msg;
+
+    if (req->kind == AUTOPID_LIVE_TEST_PID)
+    {
+        /* A PID test must transmit; if the bus is quiesced (engine/key off -> LISTEN_ONLY) we
+         * cannot send. Report engine-off rather than flip the bus (anti-thrash). */
+        if (s_quiesced || !s_engine_running)
+        {
+            res->status = AUTOPID_TEST_ENGINE_OFF;
+            return;
+        }
+
+        uint8_t reqb[3];
+        size_t rl = polllog_req_bytes(req->cmd, reqb);
+        if (rl == 0)
+        {
+            res->status = AUTOPID_TEST_DONE;
+            snprintf(res->error, sizeof(res->error), "Unparseable PID command");
+            return;
+        }
+
+        twai_message_t tx = {0};
+        tx.identifier = POLLLOG_TX_ID;
+        tx.data_length_code = 8;
+        tx.data[0] = (uint8_t)rl;                 /* SF PCI = number of payload bytes */
+        memcpy(&tx.data[1], reqb, rl);
+        for (int i = 1 + (int)rl; i < 8; i++)
+            tx.data[i] = POLLLOG_PAD;
+
+        while (can_receive(&msg, 0) == ESP_OK) { /* drain stale frames -> time THIS response */ }
+
+        if (can_send(&tx, 0) != ESP_OK)           /* timeout 0: enqueue-or-fail, teardown-safe */
+        {
+            res->status = AUTOPID_TEST_DONE;
+            snprintf(res->error, sizeof(res->error), "TX failed (bus busy)");
+            return;
+        }
+
+        const int64_t deadline = esp_timer_get_time() + (int64_t)POLLLOG_TEST_PID_RESP_MS * 1000;
+        while (esp_timer_get_time() < deadline)
+        {
+            while (can_receive(&msg, 0) == ESP_OK)
+            {
+                if (!polllog_match(&msg, reqb, rl))
+                    continue;                     /* not our positive response */
+                double val = 0;
+                bool ok = evaluate_expression((uint8_t *)req->expr, (uint8_t *)msg.data, 0, &val)
+                          && isfinite(val);
+                res->ok = ok;
+                res->value = val;
+                if (!ok)
+                    snprintf(res->error, sizeof(res->error), "Expression did not evaluate");
+                int n = 0;
+                for (int b = 0; b < msg.data_length_code && n < (int)sizeof(res->raw) - 3; b++)
+                    n += snprintf(res->raw + n, sizeof(res->raw) - n, "%02X ", msg.data[b]);
+                res->status = AUTOPID_TEST_DONE;
+                return;
+            }
+            vTaskDelay(1);                        /* WDT-safe: same non-blocking drain as the sweep */
+        }
+        res->status = AUTOPID_TEST_DONE;
+        snprintf(res->error, sizeof(res->error), "Timeout - no response");
+        return;
+    }
+
+    /* CANFLT: passive capture -- works even while quiesced (no transmit). */
+    const int64_t deadline = esp_timer_get_time() + (int64_t)POLLLOG_TEST_CANFLT_MS * 1000;
+    while (esp_timer_get_time() < deadline)
+    {
+        while (can_receive(&msg, 0) == ESP_OK)
+        {
+            if (msg.identifier != req->frame_id || ((msg.extd != 0) != req->is_extended) || msg.rtr)
+                continue;
+            uint8_t buf[8] = {0};                 /* evaluate_expression reads B0..B7 unchecked */
+            uint8_t n8 = msg.data_length_code;
+            if (n8 > 8) n8 = 8;
+            memcpy(buf, msg.data, n8);
+            double val = 0;
+            bool ok = evaluate_expression((uint8_t *)req->expr, buf, 0, &val) && isfinite(val);
+            res->ok = ok;
+            res->value = val;
+            if (!ok)
+                snprintf(res->error, sizeof(res->error), "Expression did not evaluate");
+            int m = 0;
+            for (int b = 0; b < n8 && m < (int)sizeof(res->raw) - 3; b++)
+                m += snprintf(res->raw + m, sizeof(res->raw) - m, "%02X ", buf[b]);
+            res->status = AUTOPID_TEST_DONE;
+            return;
+        }
+        vTaskDelay(1);
+    }
+    res->status = AUTOPID_TEST_DONE;
+    snprintf(res->error, sizeof(res->error), "No matching frame seen");
+}
+
+/* Live per-row Test entry (issue #41) -- runs on the httpd task. Registered via
+ * autopid_set_live_test_fn() and reached through autopid_live_test() from the test handlers.
+ * Stages one request for the poll task and blocks up to timeout_ms for the result; refuses
+ * (never queues) while a CSV trip records. */
+static autopid_live_test_status_t polllog_live_test_entry(const autopid_live_test_req_t *req,
+                                                          autopid_live_test_res_t *res,
+                                                          uint32_t timeout_ms)
+{
+    memset(res, 0, sizeof(*res));
+
+    if (!s_active || s_test_req_mtx == NULL || s_test_done_sem == NULL)
+    {
+        res->status = AUTOPID_TEST_INACTIVE;      /* POLL_LOG task not running */
+        return res->status;
+    }
+
+    /* One test at a time. A short wait covers a concurrent tester; a longer stall means the poll
+     * task is parked (flash) -- report busy rather than block the httpd worker indefinitely. */
+    if (xSemaphoreTake(s_test_req_mtx, pdMS_TO_TICKS(500)) != pdTRUE)
+    {
+        res->status = AUTOPID_TEST_TIMEOUT;
+        return res->status;
+    }
+
+    /* Fail fast: do not even stage the request if a trip is recording. */
+    if (csv_logger_session_active())
+    {
+        xSemaphoreGive(s_test_req_mtx);
+        res->status = AUTOPID_TEST_TRIP_BUSY;
+        return res->status;
+    }
+
+    /* Absorb any stale completion from a previous timed-out test before publishing this one. */
+    xSemaphoreTake(s_test_done_sem, 0);
+    s_test_req = *req;
+    __sync_synchronize();                          /* payload committed before the flag is raised */
+    s_test_requested = true;                       /* publish to the poll task */
+
+    if (xSemaphoreTake(s_test_done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE)
+    {
+        *res = s_test_res;
+    }
+    else
+    {
+        /* Timed out. The poll task can pick our request up LATE (it only runs after a possibly-
+         * long can_should_park(), then the executor itself runs up to POLLLOG_TEST_CANFLT_MS), so
+         * it may still be reading s_test_req / about to write s_test_res right now. Cancel it, then
+         * -- STILL holding s_test_req_mtx so no other tester can reuse the shared slot -- wait
+         * (bounded, generous) for a possible in-flight completion. This guarantees the executor is
+         * done with s_test_req before we release the mutex (no torn read by the next tester) and
+         * consumes its late give here so it can't be mis-delivered to that next tester (issue #41
+         * review: cross-caller stale/torn result). If the request was never picked up, no give
+         * comes and this simply expires; any ultra-late give is still absorbed by the pre-publish
+         * drain above before the next request blocks. */
+        s_test_requested = false;
+        __sync_synchronize();
+        (void)xSemaphoreTake(s_test_done_sem, pdMS_TO_TICKS(POLLLOG_TEST_CANFLT_MS * 2));
+        res->status = AUTOPID_TEST_TIMEOUT;
+    }
+
+    xSemaphoreGive(s_test_req_mtx);
+    return res->status;
+}
+
 static void polllog_rx_task(void *arg)
 {
     (void)arg;
@@ -655,6 +845,19 @@ static void polllog_rx_task(void *arg)
                 s_last_reload_ok = false;
                 ESP_LOGW(TAG, "PID reload rejected -- keeping old table");
             }
+        }
+
+        /* Live per-row Test one-shot (issue #41). Same safe point as the reload above and,
+         * critically, AFTER can_should_park(): a real flash/park/host-claim preempts the test so
+         * no stray 0x7E0 lands mid-ISO-TP. Claim the flag BEFORE running so we stay the sole
+         * consumer, then hand the result back to the blocked httpd task. Refused (not deferred)
+         * under an open trip -- the executor re-checks csv_logger_session_active() itself. */
+        if (s_test_requested)
+        {
+            s_test_requested = false;
+            __sync_synchronize();                  /* read the payload only after observing the flag */
+            polllog_execute_test(&s_test_req, &s_test_res);
+            xSemaphoreGive(s_test_done_sem);
         }
 
         const int64_t now = esp_timer_get_time();
@@ -985,6 +1188,10 @@ void poll_log_init(char *id, uint32_t log_period)
         return;
     }
 
+    /* ---- Live-test one-shot handshake (issue #41): create BEFORE the task exists ------- */
+    s_test_req_mtx  = xSemaphoreCreateMutex();
+    s_test_done_sem = xSemaphoreCreateBinary();
+
     /* ---- Create the sole-consumer poll task ----------------------------- */
     TaskHandle_t h = xTaskCreateStatic(polllog_rx_task, "polllog_rx",
                                        POLLLOG_RX_STACK_BYTES, NULL, POLLLOG_RX_TASK_PRIO,
@@ -1004,6 +1211,11 @@ void poll_log_init(char *id, uint32_t log_period)
     /* Same registration pattern for the measured sweep rate (issue #23): the CSV writer's
      * "Auto" fixed-rate grid tracks poll_log's real sweep frequency with no reverse dep. */
     csv_logger_set_rate_fn(poll_log_sweep_hz);
+
+    /* Live per-row Test under POLL_LOG (issue #41): expose our in-band one-shot executor to the
+     * /autopid/test_pid and /autopid/test_can_filter handlers via the autopid registry -- no
+     * reverse fast_log dependency, same registration pattern as the two calls above. */
+    autopid_set_live_test_fn(polllog_live_test_entry);
 
     ESP_LOGI(TAG, "Phase B (measure-first) up: %lu polled PID(s), NORMAL/on-bus, single-PID round-robin",
              (unsigned long)s_cfg->pid_count);

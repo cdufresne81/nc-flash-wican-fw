@@ -454,14 +454,128 @@ static void send_can_filter_cmd_http(uint32_t frame_id)
     (void)autopid_test_pid_send_cmd_sync(cmd, 1200, false);
 }
 
+/* POLL_LOG live-test path (issue #41). Passive broadcast capture -- the poll_log analogue of the
+ * AUTO_PID ATMA sniff. No autopid_lock / no ELM327: parse frame_id+expr, hand a one-shot to the
+ * poll task via autopid_live_test(), map to the same {ok,value,error,raw} JSON runCanFilterTest
+ * consumes. Works even while the bus is quiesced (capture never transmits). */
+static esp_err_t test_can_filter_handler_polllog(httpd_req_t *req)
+{
+    if (test_canflt_lock == NULL)
+        test_canflt_lock = xSemaphoreCreateMutexStatic(&test_canflt_lock_buf);
+    if (xSemaphoreTake(test_canflt_lock, pdMS_TO_TICKS(500)) != pdTRUE)
+    {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Busy\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    size_t body_len = 0;
+    char *body = read_json_body(req, &body_len);
+    if (!body)
+    {
+        xSemaphoreGive(test_canflt_lock);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Missing JSON\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    cJSON *json = cJSON_Parse(body);
+    heap_caps_free(body);
+    if (!json)
+    {
+        xSemaphoreGive(test_canflt_lock);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Invalid JSON\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    const cJSON *jfid  = cJSON_GetObjectItemCaseSensitive(json, "frame_id");
+    const cJSON *jexpr = cJSON_GetObjectItemCaseSensitive(json, "expr");
+    uint32_t frame_id = 0;
+    char expr[128] = {0};
+    bool bad = false;
+    if (!parse_frame_id_any(jfid, &frame_id) || frame_id == 0)
+        bad = true;
+    if (!cJSON_IsString(jexpr) || !jexpr->valuestring || jexpr->valuestring[0] == '\0')
+        bad = true;
+    else
+        strlcpy(expr, jexpr->valuestring, sizeof(expr));
+    cJSON_Delete(json);
+
+    if (bad)
+    {
+        xSemaphoreGive(test_canflt_lock);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Invalid frame_id/expr\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    autopid_live_test_req_t treq = {
+        .kind = AUTOPID_LIVE_TEST_CANFLT,
+        .frame_id = frame_id,
+        .is_extended = (frame_id > 0x7FFu),   // inferred, same rule as can_filter_t
+    };
+    strlcpy(treq.expr, expr, sizeof(treq.expr));
+    autopid_live_test_res_t tres = {0};   // defense in depth: never switch on an unset status
+    autopid_live_test(&treq, &tres, 3000);
+
+    cJSON *root = cJSON_CreateObject();
+    switch (tres.status)
+    {
+    case AUTOPID_TEST_DONE:
+        cJSON_AddBoolToObject(root, "ok", tres.ok);
+        if (tres.ok)
+            cJSON_AddNumberToObject(root, "value", tres.value);
+        else
+            cJSON_AddStringToObject(root, "error", tres.error[0] ? tres.error : "Failed");
+        if (tres.raw[0])
+            cJSON_AddStringToObject(root, "raw", tres.raw);
+        break;
+    case AUTOPID_TEST_TRIP_BUSY:
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddStringToObject(root, "code", "trip_running");
+        cJSON_AddStringToObject(root, "error",
+            "A trip log is running - tests can't run during a trip. Stop the trip and retry, or abort.");
+        break;
+    case AUTOPID_TEST_TIMEOUT:
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddStringToObject(root, "error", "Adapter busy - try again.");
+        break;
+    case AUTOPID_TEST_INACTIVE:
+    default:
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddStringToObject(root, "error", "Set Protocol to AutoPID or Poll Log and Submit Changes");
+        break;
+    }
+    // ENGINE_OFF cannot occur for CANFLT: passive capture works while quiesced.
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    if (out)
+    {
+        httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+        cJSON_free(out);
+    }
+    else
+    {
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"OOM\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    xSemaphoreGive(test_canflt_lock);
+    return ESP_OK;
+}
+
 static esp_err_t test_can_filter_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "HTTP /autopid/test_can_filter hit");
 
-    if (config_server_protocol() != AUTO_PID)
+    int proto = config_server_protocol();
+    if (proto == POLL_LOG)                 // issue #41: passive capture in-band on the poll_log task
+        return test_can_filter_handler_polllog(req);
+    if (proto != AUTO_PID)
     {
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Set Protocol to AutoPID and Submit Changes\"}", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Set Protocol to AutoPID or Poll Log and Submit Changes\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
 

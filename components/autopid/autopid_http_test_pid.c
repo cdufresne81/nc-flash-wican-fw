@@ -125,14 +125,137 @@ static char *normalize_init_string_heap(const char *src)
     return out;
 }
 
+/* POLL_LOG live-test path (issue #41). Under the poll_log protocol the ELM327 stack is dormant
+ * and the poll task owns the TWAI bus, so we do NOT take autopid_lock or touch ELM327 here:
+ * parse pid+expr, hand a one-shot to the poll task via autopid_live_test(), and map the result
+ * to the SAME {ok,value,error,raw} JSON the AUTO_PID path (and the runPidTest UI) consume.
+ * `init`/`pid_init`/`rxheader` are intentionally ignored -- the native poller uses fixed
+ * physical addressing (0x7E0->0x7E8) with no ELM AT setup, so the test reflects exactly what
+ * poll_log will read. */
+static esp_err_t test_pid_handler_polllog(httpd_req_t *req)
+{
+    if (test_pid_lock == NULL)
+        test_pid_lock = xSemaphoreCreateMutexStatic(&test_pid_lock_buf);
+    if (xSemaphoreTake(test_pid_lock, pdMS_TO_TICKS(500)) != pdTRUE)
+    {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Busy\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    char pid_cmd[64] = {0};
+    char expr[128]   = {0};
+
+    // POST JSON body takes precedence; fall back to GET query params.
+    size_t body_len = 0;
+    char *body = read_json_body(req, &body_len);
+    if (body)
+    {
+        cJSON *j = cJSON_Parse(body);
+        if (j)
+        {
+            const cJSON *jpid = cJSON_GetObjectItemCaseSensitive(j, "pid");
+            const cJSON *je   = cJSON_GetObjectItemCaseSensitive(j, "expr");
+            if (cJSON_IsString(jpid) && jpid->valuestring)
+                snprintf(pid_cmd, sizeof(pid_cmd), "%s", jpid->valuestring);
+            if (cJSON_IsString(je) && je->valuestring)
+                snprintf(expr, sizeof(expr), "%s", je->valuestring);
+            cJSON_Delete(j);
+        }
+        heap_caps_free(body);
+    }
+    else
+    {
+        size_t qlen = httpd_req_get_url_query_len(req);
+        if (qlen > 0)
+        {
+            char *query = (char *)heap_caps_malloc(qlen + 1, MALLOC_CAP_8BIT);
+            if (query && httpd_req_get_url_query_str(req, query, qlen + 1) == ESP_OK)
+            {
+                (void)httpd_query_key_value(query, "pid", pid_cmd, sizeof(pid_cmd));
+                (void)httpd_query_key_value(query, "expr", expr, sizeof(expr));
+            }
+            if (query)
+                heap_caps_free(query);
+        }
+    }
+
+    if (pid_cmd[0] == '\0' || expr[0] == '\0')
+    {
+        xSemaphoreGive(test_pid_lock);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Missing pid/expr\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    autopid_live_test_req_t treq = { .kind = AUTOPID_LIVE_TEST_PID };
+    strlcpy(treq.cmd, pid_cmd, sizeof(treq.cmd));
+    strlcpy(treq.expr, expr, sizeof(treq.expr));
+    autopid_live_test_res_t tres = {0};   // defense in depth: never switch on an unset status
+    autopid_live_test(&treq, &tres, 3000);
+
+    cJSON *root = cJSON_CreateObject();
+    switch (tres.status)
+    {
+    case AUTOPID_TEST_DONE:
+        cJSON_AddBoolToObject(root, "ok", tres.ok);
+        if (tres.ok)
+            cJSON_AddNumberToObject(root, "value", tres.value);
+        else
+            cJSON_AddStringToObject(root, "error", tres.error[0] ? tres.error : "Failed");
+        if (tres.raw[0])
+            cJSON_AddStringToObject(root, "raw", tres.raw);
+        break;
+    case AUTOPID_TEST_TRIP_BUSY:
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddStringToObject(root, "code", "trip_running");
+        cJSON_AddStringToObject(root, "error",
+            "A trip log is running - tests can't run during a trip. Stop the trip and retry, or abort.");
+        break;
+    case AUTOPID_TEST_ENGINE_OFF:
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddStringToObject(root, "code", "engine_off");
+        cJSON_AddStringToObject(root, "error", "Engine off - start the engine to test a polled PID.");
+        break;
+    case AUTOPID_TEST_TIMEOUT:
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddStringToObject(root, "error", "Adapter busy - try again.");
+        break;
+    case AUTOPID_TEST_INACTIVE:
+    default:
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddStringToObject(root, "error", "Set Protocol to AutoPID or Poll Log and Submit Changes");
+        break;
+    }
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    if (out)
+    {
+        httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+        cJSON_free(out);
+    }
+    else
+    {
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"OOM\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    xSemaphoreGive(test_pid_lock);
+    return ESP_OK;
+}
+
 static esp_err_t test_pid_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "HTTP /autopid/test_pid hit (qlen=%u)", (unsigned)httpd_req_get_url_query_len(req));
 
-    if (config_server_protocol() != AUTO_PID)
+    int proto = config_server_protocol();
+    if (proto == POLL_LOG)                 // issue #41: run the test in-band on the poll_log task
+        return test_pid_handler_polllog(req);
+    if (proto != AUTO_PID)
     {
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Set Protocol to AutoPID and Submit Changes\"}", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Set Protocol to AutoPID or Poll Log and Submit Changes\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
 

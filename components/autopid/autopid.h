@@ -242,4 +242,46 @@ autopid_config_t *autopid_reload_config(void);
 // around load_autopid_config(). No-op if the lock was never created (non-autopid modes).
 void autopid_file_lock(void);
 void autopid_file_unlock(void);
+
+// --- Live per-row Test under POLL_LOG (issue #41) -----------------------------
+// The Polled-PID and Broadcast (CAN-filter) "Test" buttons POST to /autopid/test_pid and
+// /autopid/test_can_filter. Under POLL_LOG the httpd handlers must NOT touch the bus (the
+// poll_log task is the sole TWAI consumer), so they hand a one-shot request to that task
+// via this registry -- the same dependency inversion csv_logger_set_rate_fn uses, which
+// keeps autopid free of any fast_log #include. poll_log registers its executor at init; the
+// handlers dispatch through autopid_live_test().
+typedef enum { AUTOPID_LIVE_TEST_PID, AUTOPID_LIVE_TEST_CANFLT } autopid_live_test_kind_t;
+typedef enum {
+    AUTOPID_TEST_DONE,       // executor ran: inspect .ok / .value / .error / .raw
+    AUTOPID_TEST_INACTIVE,   // no executor registered (POLL_LOG task not running)
+    AUTOPID_TEST_TRIP_BUSY,  // refused: a CSV trip is recording (must not perturb it)
+    AUTOPID_TEST_ENGINE_OFF, // refused: bus quiesced/LISTEN_ONLY, cannot transmit a request
+    AUTOPID_TEST_TIMEOUT     // executor did not pick up in time (adapter busy) -- retry
+} autopid_live_test_status_t;
+
+typedef struct {
+    autopid_live_test_kind_t kind;
+    char     cmd[24];    // raw PID command string from the row (PID test), e.g. "010C1"
+    uint32_t frame_id;   // target broadcast id (CANFLT test)
+    bool     is_extended;
+    char     expr[128];  // decode expression, evaluated on the captured bytes
+} autopid_live_test_req_t;
+
+typedef struct {
+    bool   ok;           // a finite value was decoded
+    double value;
+    char   error[48];
+    char   raw[64];      // hex dump of the captured frame bytes
+    autopid_live_test_status_t status;
+} autopid_live_test_res_t;
+
+typedef autopid_live_test_status_t (*autopid_live_test_fn_t)(
+        const autopid_live_test_req_t *req, autopid_live_test_res_t *res, uint32_t timeout_ms);
+
+// Registered once by poll_log_init (NULL before that / in non-POLL_LOG modes).
+void autopid_set_live_test_fn(autopid_live_test_fn_t fn);
+// Called by the HTTP test handlers under POLL_LOG. Returns AUTOPID_TEST_INACTIVE (doing
+// nothing) when no executor is registered, so the handler emits the "set protocol" reply.
+autopid_live_test_status_t autopid_live_test(
+        const autopid_live_test_req_t *req, autopid_live_test_res_t *res, uint32_t timeout_ms);
 #endif
