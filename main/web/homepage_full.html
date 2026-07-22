@@ -1623,13 +1623,8 @@
                             <div style="color:#6b7280;margin-top:4px;font-size:12px">On: CSV logs only while the ECU is answering (engine running) and closes the file per drive. Off: logs whenever powered (bench use). A trip started from the Console always logs regardless of this setting.</div>
                         </td>
                     </tr>
-                    <tr id="csv_grid_mode_row" style="display:none">
-                        <td>Polling Mode:</td>
-                        <td><select id="csv_grid_mode" name="csv_grid_mode" onchange="applyLoggerXor();submit_enable();">
-                                <option value="event">Event (per record)</option>
-                                <option value="fixed">Fixed-rate (periodic)</option>
-                            </select></td>
-                    </tr>
+                    <!-- "Polling Mode" (csv_grid_mode) removed with the Event grid mode
+                         (issue #53): fixed-rate is the only row-writing behavior. -->
                     <tr id="csv_grid_hz_row" style="display:none">
                         <td>Polling Rate (Hz):</td>
                         <td>

@@ -2393,13 +2393,11 @@ function applyLoggerXor() {
     if (!masterEl || !cs) { return; }
     var csvShow = (masterEl.value === "enable");
     cs.value = csvShow ? "enable" : "disable";
-    // Wide CSV (Task #11) controls, progressive: Polling Mode shown when CSV is active; Polling
-    // Rate only when Fixed-rate. (Format toggle removed in Task #16 -- output is always Wide.)
-    var gmEl = document.getElementById("csv_grid_mode");
-    var gmRow = document.getElementById("csv_grid_mode_row");
+    // Wide CSV (Task #11) controls, progressive: Polling Rate shown when CSV is active.
+    // (Format toggle removed in Task #16 -- output is always Wide; the Polling Mode
+    // dropdown removed in issue #53 -- the grid is always fixed-rate.)
     var hzRow = document.getElementById("csv_grid_hz_row");
-    if (gmRow) gmRow.style.display = csvShow ? "" : "none";
-    if (hzRow) hzRow.style.display = (csvShow && gmEl && gmEl.value === "fixed") ? "" : "none";
+    if (hzRow) hzRow.style.display = csvShow ? "" : "none";
     // Auto rate (issue #23): the manual Hz input is inert while the device tracks the
     // measured polling sweep, so grey it out.
     var hzAuto = document.getElementById("csv_grid_auto");
@@ -2483,7 +2481,8 @@ async function postConfig() {
     // supported values) -- send the constants the firmware expects.
     obj["log_filesystem"] = "fatfs";
     obj["log_storage"] = "sdcard";
-    obj["csv_grid_mode"] = document.getElementById("csv_grid_mode").value;
+    // csv_grid_mode retired with the Event grid mode (issue #53) -- deliberately NOT sent,
+    // so the key disappears from config.json on the first Submit after the update.
     // "auto" (issue #23): the grid tracks the measured polling sweep instead of a fixed Hz.
     obj["csv_grid_hz"] = document.getElementById("csv_grid_auto").checked
         ? "auto" : document.getElementById("csv_grid_hz").value;
@@ -3014,11 +3013,11 @@ xhttp.onload = async function() {
         // --- Restored settings population (regression fix: commit d372fc9 over-cut this block,
         //     causing every Submit to persist stock HTML defaults). MQTT-gateway lines intentionally
         //     omitted (feature removed by the trim); protocol is populated by checkStatus(). ---
-        // Datalogger master + wide-CSV grid controls (firmware defaults are fixed/10).
+        // Datalogger master + wide-CSV grid controls (firmware default is 10 Hz; the grid
+        // is always fixed-rate -- csv_grid_mode retired in issue #53, ignored if present).
         var _cs_on = (obj.csv_log === "enable");
         document.getElementById("csv_log").value = _cs_on ? "enable" : "disable";
         document.getElementById("logging_master").value = _cs_on ? "enable" : "disable";
-        document.getElementById("csv_grid_mode").value = (obj.csv_grid_mode === "event") ? "event" : "fixed";
         document.getElementById("csv_grid_auto").checked = (obj.csv_grid_hz === "auto");
         var _hz = parseInt(obj.csv_grid_hz, 10);   // NaN when "auto" -> input keeps the 10 default
         document.getElementById("csv_grid_hz").value = (_hz >= 1 && _hz <= 50) ? _hz : 10;
