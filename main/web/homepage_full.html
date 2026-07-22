@@ -1690,7 +1690,15 @@
                 <div style="color:#6b7280;font-size:12px;margin-bottom:6px">Sample Rate skips a PID on all but every Nth polling sweep, freeing bus time for the fast channels. Estimates are scaled from the currently measured sweep and update live as you edit &mdash; slowing channels down shortens the sweep, so every other channel speeds up too.</div>
                 <table class="form-table">
                     <tbody>
-                        <tr>
+                        <!-- Custom Initialisation hidden (issue #57): the string is an ELM327 init
+                             sequence only the legacy AutoPID runtime executes; the Datalogger
+                             (poll_log) protocol never runs ELM strings and hardcodes physical
+                             addressing (POLLLOG_TX_ID 0x7E0), so the shipped "ATSP6" is a no-op.
+                             The input stays in the DOM deliberately: loadAutoTable()/
+                             storeAutoTableData() keep round-tripping the `initialisation`
+                             auto_pid.json key so existing configs survive a Store unchanged.
+                             Delete for real with the legacy runtime (issue #28 ledger). -->
+                        <tr style="display:none">
                             <td>Custom Initialisation:</td>
                             <td><input id="initialisation" name="initialisation" oninput="enableAutoStoreButton()"></td>
                         </tr>
