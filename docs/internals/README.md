@@ -13,7 +13,7 @@ Ground rules for these docs:
 | Doc | Covers |
 |---|---|
 | [poll_log.md](poll_log.md) | The Datalogger protocol: free-running PID polling, hybrid broadcast capture, engine-off quiesce, sweep-rate measurement, `/poll_status` |
-| [csv_logger.md](csv_logger.md) | The wide-CSV trip logger: grid modes, the Auto (fastest) rate, registration patterns, RTC crash guard |
+| [csv_logger.md](csv_logger.md) | The wide-CSV trip logger: the fixed-rate grid, the Auto (fastest) rate, registration patterns, RTC crash guard |
 | [web_ui.md](web_ui.md) | Web UI build pipeline, lint gates, and the hidden-feature (streamline) pattern |
 
 ## Not yet written
