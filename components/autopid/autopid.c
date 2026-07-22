@@ -261,6 +261,36 @@ void autopid_unlock(void)
     xSemaphoreGive(s_autopid_mutex);
 }
 
+// --- Live per-row Test under POLL_LOG (issue #41) -----------------------------
+// Dependency-inversion registry (mirrors csv_logger_set_rate_fn): poll_log registers its
+// in-band one-shot executor here; the /autopid/test_pid and /autopid/test_can_filter
+// handlers dispatch through autopid_live_test(), so autopid never #includes fast_log.
+static autopid_live_test_fn_t s_live_test_fn = NULL;   // single-writer, set once at poll_log_init
+
+void autopid_set_live_test_fn(autopid_live_test_fn_t fn)
+{
+    s_live_test_fn = fn;
+}
+
+autopid_live_test_status_t autopid_live_test(const autopid_live_test_req_t *req,
+                                             autopid_live_test_res_t *res, uint32_t timeout_ms)
+{
+    if (!s_live_test_fn)
+    {
+        // No executor: non-POLL_LOG mode, or poll_log_init() returned early (0-PID broadcast-only
+        // config, crash-guard, bring-up failure) before registering. The handlers key their JSON
+        // off res->status, NOT this return value, so res MUST be filled -- otherwise they switch on
+        // an uninitialized stack struct and can over-read res->raw (issue #41 review).
+        if (res)
+        {
+            memset(res, 0, sizeof(*res));
+            res->status = AUTOPID_TEST_INACTIVE;
+        }
+        return AUTOPID_TEST_INACTIVE;   // POLL_LOG not running -> handler emits "set protocol"
+    }
+    return s_live_test_fn(req, res, timeout_ms);
+}
+
 // --- Live PID-table hot-swap (issue #39) --------------------------------------
 // File lock (P2): serialize auto_pid.json writes against the reload's count+parse so a
 // write landing between load_autopid_config()'s count and parse can't make parse iterate
