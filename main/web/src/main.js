@@ -5,6 +5,12 @@
 const FW_UPDATE_REPO = 'cdufresne81/nc-flash-wican-fw';
 const FW_RELEASES_URL = `https://github.com/${FW_UPDATE_REPO}/releases`;
 
+// Firmware log-rate ceiling, mirrored from WICAN_LOG_MAX_HZ / WICAN_LOG_MIN_PERIOD_MS in
+// main/config_server.h (C can't reach JS). Single JS source for the grid-Hz validator and the
+// "grid will clamp" warning below -- keep in sync with the C header on any change.
+const WICAN_LOG_MAX_HZ = 100;
+const WICAN_LOG_MIN_PERIOD_MS = 10;
+
 // LED activity-indicator blink half-periods (ms), ~19 Hz to ~2.4 Hz. The blink
 // is software-timed in led_indicator.c (the AW2023 pattern engine can't go
 // below 130 ms) — the slider stores an index into this list, the config stores
@@ -1661,12 +1667,12 @@ function updateAllSampleHints() {
     if (!ro) return;
     if (!pollSweepMs) { ro.textContent = 'Measured sweep: not available (' + sampleUnknownReason() + ')'; return; }
     // Warn on the predicted FAST-CHANNEL period, which is what csv_grid_period_ms() clamps
-    // at 20 ms -- NOT on the predicted sweep. Warning on the sweep false-alarms on every
+    // at 10 ms (WICAN_LOG_MIN_PERIOD_MS) -- NOT on the predicted sweep. Warning on the sweep false-alarms on every
     // uniformly-gated table (all 19 at N=8 -> 5.9 ms sweep but a 47.5 ms grid period,
     // nowhere near the cap).
     var fastMs = pred * currentMinN();
-    var warn = (fastMs > 0 && fastMs < 20)
-        ? '   ⚠ predicted fastest channel is above the 50 Hz CSV grid cap — the grid will clamp'
+    var warn = (fastMs > 0 && fastMs < WICAN_LOG_MIN_PERIOD_MS)
+        ? '   ⚠ predicted fastest channel is above the ' + WICAN_LOG_MAX_HZ + ' Hz CSV grid cap — the grid will clamp'
         : '';
     ro.textContent = 'Measured sweep: ' + pollSweepMs.toFixed(1) + ' ms (' +
                      (1000 / pollSweepMs).toFixed(1) + ' Hz)' +
@@ -3172,7 +3178,7 @@ xhttp.onload = async function() {
         document.getElementById("logging_master").value = _cs_on ? "enable" : "disable";
         document.getElementById("csv_grid_auto").checked = (obj.csv_grid_hz === "auto");
         var _hz = parseInt(obj.csv_grid_hz, 10);   // NaN when "auto" -> input keeps the 10 default
-        document.getElementById("csv_grid_hz").value = (_hz >= 1 && _hz <= 50) ? _hz : 10;
+        document.getElementById("csv_grid_hz").value = (_hz >= 1 && _hz <= WICAN_LOG_MAX_HZ) ? _hz : 10;
         document.getElementById("csv_require_engine").value = (obj.csv_require_engine === "disable") ? "disable" : "enable";
         applyLoggerXor();
 

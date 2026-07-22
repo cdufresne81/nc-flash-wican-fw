@@ -2834,12 +2834,12 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	else
 	{
 		strlcpy(dst->csv_grid_hz, key->valuestring, sizeof(dst->csv_grid_hz));
-		//***** "auto" (issue #23): grid tracks the measured poll sweep rate; otherwise 1-50 Hz.
+		//***** "auto" (issue #23): grid tracks the measured poll sweep rate; otherwise 1-100 Hz.
 		if(strcmp(dst->csv_grid_hz, "auto") != 0)
 		{
 			char *gh_end;
 			long gh = strtol(dst->csv_grid_hz, &gh_end, 10);
-			if(*gh_end != '\0' || gh_end == dst->csv_grid_hz || gh < 1 || gh > 50)
+			if(*gh_end != '\0' || gh_end == dst->csv_grid_hz || gh < 1 || gh > (long)WICAN_LOG_MAX_HZ)
 			{
 				strlcpy(dst->csv_grid_hz, "10", sizeof(dst->csv_grid_hz));
 			}
@@ -3633,7 +3633,7 @@ int8_t config_server_get_csv_grid_hz(uint32_t *hz)
 	{
 		return -1;
 	}
-	if(v < 1 || v > 50)
+	if(v < 1 || v > (long)WICAN_LOG_MAX_HZ)
 	{
 		return -1;
 	}

@@ -110,7 +110,8 @@ static const char *TAG = "poll_log";
 
 /* HARD RATE CAP: no PID is ever polled more often than every POLLLOG_MIN_SWEEP_MS.
  * Each PID is requested once per sweep, so a floor on sweep duration IS a per-PID rate
- * cap: 10 ms -> 100 Hz. Above that is overkill for this vehicle -- nothing on an NC
+ * cap: 10 ms -> 100 Hz, the shared product ceiling WICAN_LOG_MAX_HZ (config_server.h) that
+ * also bounds the CSV grid and the broadcast throttle. Above that is overkill for this vehicle -- nothing on an NC
  * powertrain bus carries 100 Hz of real information -- and the cost is not free: it is
  * ECU diag-task load, bus utilisation, and CSV record rate, all spent on samples that
  * only duplicate their predecessor.
@@ -124,7 +125,7 @@ static const char *TAG = "poll_log";
  * un-paced rate the loop could have run at. The TWAI RX queue is not drained during the
  * delay: at ~2000 frame/s that is ~20 frames into a 96-slot queue, and the next sweep's
  * first polllog_poll_one drains stale frames before transmitting. */
-#define POLLLOG_MIN_SWEEP_MS     10
+#define POLLLOG_MIN_SWEEP_MS     WICAN_LOG_MIN_PERIOD_MS   /* shared 100 Hz ceiling (config_server.h) */
 #define POLLLOG_MIN_SWEEP_US     ((int64_t)POLLLOG_MIN_SWEEP_MS * 1000)
 
 /* GET /poll_status buffer. Was 400 (~285 chars typical); the issue-#29 schedule fields add
@@ -142,7 +143,12 @@ static const char *TAG = "poll_log";
  * values on the vehicle (~325 req/s, 0 timeouts). Set to 0 to compile it back out entirely
  * (bit-identical poll-only behaviour) if a capture ever needs to isolate the polled path. */
 #define POLLLOG_HYBRID           1
-#define POLLLOG_BCAST_PERIOD_MS  20      /* per-broadcast-channel record throttle (~50 Hz/ch) */
+/* Per-broadcast-channel record throttle. Feeds the SAME wide CSV as the polled columns, so it
+ * must not cap below the grid or broadcast columns staircase (repeat every other row) at a fast
+ * grid. Unified onto the shared 100 Hz ceiling in #56 (was 20 ms / 50 Hz/ch). The 256-slot record
+ * queue is the resource this guards; if 100 Hz/ch ever threatens it, grow the queue from
+ * WICAN_LOG_MAX_HZ rather than throttling the rate back down. */
+#define POLLLOG_BCAST_PERIOD_MS  WICAN_LOG_MIN_PERIOD_MS
 
 /* ---- Independent one-shot RTC crash-guard ------------------------------- */
 /* Distinct magic from fast_log (0xFA571A6D) and the CSV logger (0xA11C0DE5). If a prior boot
