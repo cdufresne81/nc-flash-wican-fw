@@ -457,10 +457,9 @@ async function runPidTest(entry) {
     const payload = { kind: 'custom' };
     // #31 replaced the per-row free-text "Init" with a Mode dropdown and shows the PID box as
     // identifier-only, so compose the full wire string a Store would (rowPidWire) -- otherwise the
-    // test would poll e.g. "0C" instead of "010C1". The row-level Init is gone; poll_log ignores
-    // init/pid_init anyway (fixed 0x7E0 addressing), and poll_log is the only protocol this fork runs.
-    const init = document.getElementById('initialisation')?.value || '';
-    if (init.trim()) payload.init = init;
+    // test would poll e.g. "0C" instead of "010C1". No init is sent (#57): the poll_log test
+    // handler intentionally ignores init/pid_init (fixed 0x7E0 addressing, no ELM AT setup),
+    // and the Custom Initialisation row is hidden -- poll_log is the only protocol this fork runs.
     payload.pid = rowPidWire(entry);
     payload.expr = entry.querySelector('.expression-input')?.value || '';
 
