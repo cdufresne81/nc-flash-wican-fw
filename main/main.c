@@ -79,6 +79,7 @@
 #include "filesystem.h"
 #include "safemode.h"
 #include "restart_tracker.h"
+#include "crash_report.h"
 #include "sync_sys_time.h"
 #include "config_mode.h"
 #include "driver/rtc_io.h"
@@ -690,6 +691,12 @@ void app_main(void)
 			event_log_emit(EVL_BOOT, "reason=%s fw=%s sd=%s", ev_reason, ev_fw, ev_sd);
 		}
 	}
+
+	// Serial-free crash report (Task #24 sibling): if the PREVIOUS boot ended in a panic, the wrapped
+	// esp_panic_handler stashed its backtrace in RTC_NOINIT RAM. Replay it into the event_log now --
+	// right after EVL_BOOT so it sits next to the boot it caused -- so it is retrievable over WiFi
+	// (GET /event_log) on this cable-less device. Cheap no-op when the previous boot was clean.
+	crash_report_emit_pending();
 
 	gpio_reset_pin(0);
 	gpio_set_direction(0, GPIO_MODE_INPUT);
