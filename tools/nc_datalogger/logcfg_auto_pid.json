@@ -8,6 +8,7 @@
     "pids": [
         {
             "PID": "010B1",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "MAP",
@@ -17,6 +18,7 @@
         },
         {
             "PID": "01101",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "MAF",
@@ -26,6 +28,7 @@
         },
         {
             "PID": "010E1",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "SPARKADV",
@@ -35,6 +38,7 @@
         },
         {
             "PID": "01061",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "STFT",
@@ -44,6 +48,7 @@
         },
         {
             "PID": "01071",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "LTFT",
@@ -53,6 +58,7 @@
         },
         {
             "PID": "01341",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "EQ_RATIO",
@@ -62,6 +68,7 @@
         },
         {
             "PID": "01031",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "FUELSYS",
@@ -71,6 +78,7 @@
         },
         {
             "PID": "01331",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "BARO",
@@ -80,6 +88,7 @@
         },
         {
             "PID": "01431",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "LOAD",
@@ -89,46 +98,47 @@
         },
         {
             "PID": "2217461",
+            "Mode": "22",
             "Period": "200",
             "enabled": true,
             "Name": "KNOCKR",
             "Expression": "B4*0.3521126761",
             "unit": "deg",
-            "class": "none",
-            "Init": "ATSH7E0;"
+            "class": "none"
         },
         {
             "PID": "2214101",
+            "Mode": "22",
             "Period": "200",
             "enabled": true,
             "Name": "FUEL_PW",
             "Expression": "[B4:B5]*0.008",
             "unit": "ms",
-            "class": "none",
-            "Init": "ATSH7E0;"
+            "class": "none"
         },
         {
             "PID": "2216CD1",
+            "Mode": "22",
             "Period": "200",
             "enabled": true,
             "Name": "VCT_ACT",
             "Expression": "[B4:B5]*0.0625",
             "unit": "deg",
-            "class": "none",
-            "Init": "ATSH7E0;"
+            "class": "none"
         },
         {
             "PID": "2217061",
+            "Mode": "22",
             "Period": "200",
             "enabled": true,
             "Name": "HIDET_SW",
             "Expression": "B4&1",
             "unit": "on/off",
-            "class": "none",
-            "Init": "ATSH7E0;"
+            "class": "none"
         },
         {
             "PID": "010C1",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "RPM",
@@ -138,6 +148,7 @@
         },
         {
             "PID": "010D1",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "VSS",
@@ -147,6 +158,7 @@
         },
         {
             "PID": "01051",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "ECT",
@@ -156,6 +168,7 @@
         },
         {
             "PID": "010F1",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "IAT",
@@ -165,6 +178,7 @@
         },
         {
             "PID": "01111",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "TPS",
@@ -174,6 +188,7 @@
         },
         {
             "PID": "01491",
+            "Mode": "01",
             "Period": "200",
             "enabled": true,
             "Name": "APP",

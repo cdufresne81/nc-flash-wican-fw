@@ -2619,14 +2619,19 @@ static void autopid_task(void *pvParameters)
                         param->timer += ((int64_t)(esp_random() % ((AUTOPID_POLL_JITTER_MS * 2) + 1)) - AUTOPID_POLL_JITTER_MS) * 1000;
                         if (curr_pid->cmd != NULL && strlen(curr_pid->cmd) > 0)
                         {
-                            // twai_message_t tx_msg;
-
-                            if (curr_pid->pid_type == PID_CUSTOM || curr_pid->pid_type == PID_SPECIFIC)
+                            /* Mode-22 physical-addressing prologue (issue #31). The deleted
+                             * free-text per-PID "Init" was, on every shipped NC config,
+                             * exactly an "ATSH7E0;" before each mode-22 request; without it
+                             * the ELM emulation stays functional (0x7DF, elm327.c header
+                             * default) and the NC PCM never answers mode 22. Re-derived here
+                             * from the declarative mode byte instead of free text. This
+                             * legacy scheduler is the ONLY path that needs it -- poll_log
+                             * hardcodes physical 0x7E0 -- and it is slated for removal
+                             * under issue #28, taking this prologue with it. */
+                            if (curr_pid->mode == 0x22 &&
+                                (curr_pid->pid_type == PID_CUSTOM || curr_pid->pid_type == PID_SPECIFIC))
                             {
-                                if (curr_pid->init != NULL && strlen(curr_pid->init) > 0)
-                                {
-                                    send_commands(curr_pid->init, 2);
-                                }
+                                send_commands("ATSH7E0\r", 2);
                             }
 
                             ESP_LOGI(TAG, "Executing command: %s", curr_pid->cmd);
@@ -2887,7 +2892,7 @@ void print_pids(autopid_config_t *autopid_config)
         printf("\nPID %d:\n", i + 1);
         printf("  Type: %s\n", pid_type_str[pid->pid_type]);
         printf("  Command: %s\n", pid->cmd ? pid->cmd : "NULL");
-        printf("  Init: %s\n", pid->init ? pid->init : "NULL");
+        printf("  Mode: 0x%02X\n", pid->mode);
         printf("  Period: %lu\n", pid->period);
 
         printf("  Parameter Count: %lu\n", pid->parameters_count);

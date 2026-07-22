@@ -14,7 +14,7 @@ Key constants (top of `poll_log.c`):
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `POLLLOG_TX_ID` | `0x7E0` | **All** requests go physically to the PCM. The per-PID `Init` string (e.g. `ATSH7E0;`) is **ignored** by poll_log — it only matters for the legacy ELM paths and the Test button. Physical 7E0 works for both Mode 01 and Mode 22. |
+| `POLLLOG_TX_ID` | `0x7E0` | **All** requests go physically to the PCM; works for both Mode 01 and Mode 22. The per-PID `Init` string that used to *look* like it controlled this was deleted in issue #31 — replaced by the declarative `Mode` key (`pid_data_t.mode`), which is derived from the PID text's leading service byte and is informational: poll_log still frames requests from `cmd` verbatim. |
 | `POLLLOG_STATS_PERIOD_US` | 3 s | Rolling stats window (`win_*` fields in `/poll_status`). |
 | `POLLLOG_BCAST_PERIOD_MS` | 20 ms | Per-broadcast-channel record throttle (~50 Hz/ch), hybrid capture only. |
 | `POLLLOG_MIN_SWEEP_MS` | 10 ms | **Hard rate cap.** One request per PID per sweep, so a floor on sweep duration caps every channel at 100 Hz. Paced before the rate measurement, so the reported rate is the achieved one. |
@@ -163,4 +163,5 @@ Note the 100 Hz cap makes the specific rate at which this was seen unreachable, 
 ## Related
 
 - Per-PID rate limiting: issue #29 — shipped as `SampleEvery` (above). The legacy `Period` field was deliberately left untouched.
-- Hidden/legacy fields (`Init`, `Period`, `Class`) and what still consumes them: issue #28.
+- Per-PID `Mode` (issue #31): `Init` is deleted (one-time config migration, see `web_ui.md`); `Mode` is `01`/`22` today. Mode `23` (ReadMemoryByAddress — wire spec proven in `main/ncflash_fastread.c`) is **not** a poll channel yet: it needs an addr+size config schema, ISO-TP multi-frame reassembly, and a no-echo match — follow-up issue.
+- Hidden/legacy fields (`Period`, `Class`) and what still consumes them: issue #28.
