@@ -52,11 +52,11 @@ import sys
 # device_config.csv_grid_hz for the current POLLED set every time this file is generated.
 AVG_RTT_MS  = 2.5     # measured per-request round-trip on the NC PCM via poll_log
 GRID_SAFETY = 0.95    # sit just under the per-channel rate so each grid row lands a fresh sample
-GRID_HZ_MAX = 50      # firmware clamps csv_grid_hz to 1..50
+GRID_HZ_MAX = 100     # firmware clamps csv_grid_hz to 1..100 (WICAN_LOG_MAX_HZ; raised from 50 in #56)
 
 
 def recommend_grid_hz(num_pids):
-    """Best fixed-grid Hz for num_pids polled channels = per-channel poll rate, floored to 1..50."""
+    """Best fixed-grid Hz for num_pids polled channels = per-channel poll rate, floored to 1..100."""
     budget_req_s = 1000.0 / AVG_RTT_MS                 # achievable aggregate poll rate
     per_channel_hz = budget_req_s / max(1, num_pids)
     return max(1, min(GRID_HZ_MAX, int(per_channel_hz * GRID_SAFETY)))

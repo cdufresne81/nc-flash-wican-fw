@@ -24,6 +24,22 @@
 #include "esp_tls_crypto.h"
 #include <esp_http_server.h>
 
+/* Product-wide maximum logging rate: ONE ceiling shared by the polled sweep
+ * (POLLLOG_MIN_SWEEP_MS), the CSV grid (csv_grid_period_ms), the broadcast-column
+ * throttle (POLLLOG_BCAST_PERIOD_MS), and the csv_grid_hz validators. 100 Hz -> 10 ms
+ * minimum period. Nothing on an NC powertrain bus carries more than 100 Hz of real
+ * information, so this is the whole-product promise, enforced at each chokepoint.
+ *
+ * If one specific resource later cannot sustain this rate (e.g. the SD write path stalls
+ * at 100 Hz), do NOT edit the call sites down: introduce a named sub-ceiling
+ * (e.g. CSV_SD_MAX_HZ), set it lower, and add
+ *     _Static_assert(CSV_SD_MAX_HZ <= WICAN_LOG_MAX_HZ, "...");
+ * so the divergence is deliberate, named, and compile-checked instead of a magic number
+ * rotting in one file. The web UI (main.js / homepage_full.html) hard-codes the same 100
+ * in the input max + validator -- C cannot reach JS, so keep those two in sync by hand. */
+#define WICAN_LOG_MAX_HZ		100u
+#define WICAN_LOG_MIN_PERIOD_MS	(1000u / WICAN_LOG_MAX_HZ)	/* 10 ms; derived so the pair can't drift (assumes MAX_HZ divides 1000) */
+
 #define AP_MODE				0
 #define APSTA_MODE			1
 #define SMARTCONNECT_MODE	2
@@ -151,7 +167,7 @@ typedef struct _device_config
 	char log_storage[16];
 	char log_filesystem[16];
 	char log_period[16];
-	char csv_grid_hz[16];     // wide fixed-rate grid frequency, 1..50 Hz or "auto" (issue #23)
+	char csv_grid_hz[16];     // wide fixed-rate grid frequency, 1..100 Hz or "auto" (issue #23)
 	char csv_require_engine[16]; // gate CSV logging on engine running (ECU answering): "enable" | "disable"
 	char imu_threshold[16];
 	char led_blink_ms[16];    // LED activity-indicator blink half-period (ms), normalized at load to led_indicator_snap_rate_ms()'s table
@@ -219,7 +235,7 @@ int8_t config_server_get_csv_log(void);
 // led_indicator_snap_rate_ms()'s table (26-208 ms)
 int32_t config_server_get_led_blink_ms(void);
 int8_t config_server_get_log_period(uint32_t *log_period);
-// Wide CSV (Task #11; always fixed-rate since issue #53): grid_hz writes *hz (1..50,
+// Wide CSV (Task #11; always fixed-rate since issue #53): grid_hz writes *hz (1..100,
 // or 0 for the "auto" sentinel -- issue #23: grid tracks the measured poll sweep rate) and
 // returns 1, or -1 (leaves *hz untouched) on a bad value. Callers MUST handle *hz==0.
 int8_t config_server_get_csv_grid_hz(uint32_t *hz);

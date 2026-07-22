@@ -136,7 +136,7 @@ Two things that surprise people reading `/poll_status`:
 
 Divisor scheduling was verified arithmetically on device: over 924 sweeps with divisors {16,8,8,4,4}, predicted skips Σ(1−1/N)×924 = 3869, device reported **3869**.
 
-**Auto grid at the clamp — verified.** With the sweep measured at 126 Hz (i.e. the grid pinned to its 50 Hz / 20 ms ceiling), an 11m23s trip wrote **31,995 rows / 5.9 MB at 46.8 Hz with 0 dropped rows, 0 pending drops and 0 unmatched columns**. The SD writer and the 256-slot record queue keep up at the clamp with margin; record rate there was ~1100 rec/s (6 PID + 3 CALC per sweep).
+**Auto grid at the clamp — verified (at the pre-#56 50 Hz ceiling).** With the sweep measured at 126 Hz (i.e. the grid pinned to its then-50 Hz / 20 ms ceiling), an 11m23s trip wrote **31,995 rows / 5.9 MB at 46.8 Hz with 0 dropped rows, 0 pending drops and 0 unmatched columns**. The SD writer and the 256-slot record queue keep up at that clamp with margin; record rate there was ~1100 rec/s (6 PID + 3 CALC per sweep). **#56 raised the ceiling to 100 Hz; re-validation at 100 Hz (0 dropped rows on a full trip) is pending — see the #56 acceptance check.**
 
 ## Known issue: one unreproduced `interrupt_wdt` panic
 

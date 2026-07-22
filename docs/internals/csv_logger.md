@@ -14,13 +14,13 @@ A grid timer ticks at a configured rate and each tick writes one full-width row 
 
 ## The Auto (fastest) rate (issue #23)
 
-`csv_grid_hz` is a string config key that accepts `1..50` **or `"auto"`**:
+`csv_grid_hz` is a string config key that accepts `1..100` **or `"auto"`**:
 
 - `main/config_server.c` parses `"auto"` as a valid sentinel; the getter `config_server_get_csv_grid_hz()` then returns 1 with `*hz = 0` — **callers must treat `*hz == 0` as "auto"**, it is never a literal 0 Hz.
-- At session open csv_logger latches `csv_grid_auto` from that sentinel. In auto mode, `csv_grid_period_ms()` re-derives the tick period *on every use* from the registered rate callback (`csv_logger_set_rate_fn()` — poll_log registers `poll_log_sweep_hz`), clamped to 20–1000 ms (50–1 Hz). If the callback is missing or returns 0 (rate not yet measured, or a protocol that never registers one), it falls back to `CSV_GRID_HZ_DEFAULT`.
+- At session open csv_logger latches `csv_grid_auto` from that sentinel. In auto mode, `csv_grid_period_ms()` re-derives the tick period *on every use* from the registered rate callback (`csv_logger_set_rate_fn()` — poll_log registers `poll_log_sweep_hz`), clamped to 10–1000 ms (100–1 Hz). If the callback is missing or returns 0 (rate not yet measured, or a protocol that never registers one), it falls back to `CSV_GRID_HZ_DEFAULT`.
 - Net effect: the grid tracks the *measured* polled-sweep rate live. Bench-verified on `v1.6.0-2-ga4082fd`: 19-PID sweep measured 20.9 Hz → auto trip logged 402 rows in 19.8 s (20.2 Hz, 48–49 ms spacing, every polled column fresh each row).
 - Since issue #29, `poll_log_sweep_hz()` reports the **fastest channel's** cadence, not the mean sweep — with per-PID `SampleEvery` divisors the two differ, and slaving the grid to the sweep would oversample every channel. Nothing here changed; the callback contract is the same float. See [poll_log.md](poll_log.md).
-- **The 20 ms (50 Hz) clamp is the real ceiling.** Shortening the sweep — pushing channels onto CAN filters, or slowing them with `SampleEvery` — can drive the measured rate past 50 Hz, at which point the grid pins to 50 and rows stop tracking the sweep 1:1. That is intended (it bounds SD write rate and row width), but it means a very fast config silently logs slower than it polls.
+- **The 10 ms (100 Hz) clamp is the real ceiling, now aligned with the poll-log hard cap** (`POLLLOG_MIN_SWEEP_MS`, also 100 Hz — see [poll_log.md](poll_log.md)). Because the polled sweep is itself capped at 100 Hz, the auto grid can track it 1:1 all the way to the cap: the pre-#56 gap, where a fast config logged at 50 Hz while polling at up to 100 Hz, is closed. The clamp still bounds SD write rate and row width. Raised from 50 Hz in #56.
 
 ### Why slave the grid to the sweep
 

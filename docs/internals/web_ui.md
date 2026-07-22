@@ -38,4 +38,4 @@ PID entries and Custom CAN Filter entries are not static HTML — they're templa
 - `POST /store_config` replaces the whole file and **always reboots** — to change one key: load → modify → post the full object.
 - `POST /store_auto_data` writes `auto_pid.json` **without** rebooting and hot-swaps the live PID table on the poll task (issue #39). The reply envelope says which happened: `"applied":"live"`, or `"applied":"deferred"` when a CSV trip was open (the swap retries once it closes).
 - Per-PID `SampleEvery` (issue #29) is **omitted when it is 0 or 1**, so a config that uses no divisors round-trips byte-identically. Only 2..64 is emitted; the UI validator's cap must stay equal to `AUTOPID_MAX_SAMPLE_EVERY` in `components/autopid/autopid.h`.
-- `csv_grid_hz` is a string key holding `"1".."50"` or `"auto"` (see [csv_logger.md](csv_logger.md)).
+- `csv_grid_hz` is a string key holding `"1".."100"` or `"auto"` (see [csv_logger.md](csv_logger.md)).

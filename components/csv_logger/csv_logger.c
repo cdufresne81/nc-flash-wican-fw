@@ -530,7 +530,7 @@ void csv_logger_set_rate_fn(csv_rate_fn_t fn)
 
 // Current FIXED-grid period in ms. Manual mode derives it from the latched csv_grid_hz; Auto
 // mode (issue #23) re-derives it from the provider's live measured rate on EVERY call, clamped
-// to the same 1-50 Hz envelope as the manual range, so the grid follows the real sweep rate as
+// to the same 1-100 Hz envelope as the manual range, so the grid follows the real sweep rate as
 // it settles (the EMA needs a few sweeps after engine start). No provider / no measurement yet
 // -> CSV_GRID_HZ_DEFAULT. Called only from the writer task (grid ticks + queue-timeout sizing).
 static uint32_t csv_grid_period_ms(void)
@@ -541,13 +541,13 @@ static uint32_t csv_grid_period_ms(void)
         if (hz > 0.0f)
         {
             uint32_t gp = (uint32_t)(1000.0f / hz + 0.5f);
-            if (gp < 20u)   { gp = 20u; }     // 50 Hz cap (matches the manual range)
+            if (gp < WICAN_LOG_MIN_PERIOD_MS) { gp = WICAN_LOG_MIN_PERIOD_MS; }  // shared 100 Hz cap (config_server.h)
             if (gp > 1000u) { gp = 1000u; }   // 1 Hz floor
             return gp;
         }
         return 1000u / CSV_GRID_HZ_DEFAULT;
     }
-    return 1000u / csv_grid_hz;   /* latched to [1,50] at session open, so 20..1000 ms */
+    return 1000u / csv_grid_hz;   /* latched to [1,100] at session open, so 10..1000 ms */
 }
 
 static void csv_logger_task(void *pvParameters)
@@ -708,7 +708,7 @@ static void csv_logger_task(void *pvParameters)
             int8_t hz_ok = config_server_get_csv_grid_hz(&hz);
             csv_grid_auto = (hz_ok == 1 && hz == 0);
             csv_grid_hz = (hz_ok == 1 && hz >= 1) ? hz : CSV_GRID_HZ_DEFAULT;
-            if (csv_grid_hz > 50) csv_grid_hz = 50;
+            if (csv_grid_hz > WICAN_LOG_MAX_HZ) csv_grid_hz = WICAN_LOG_MAX_HZ;
 
             // Build the fixed column set from the AutoPID config. May briefly defer if the autopid
             // mutex is busy (held across an ELM read); we NEVER block the writer, and there is NO
