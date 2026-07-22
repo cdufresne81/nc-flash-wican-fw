@@ -665,22 +665,43 @@ function wireRowDrag(entry) {
     });
 }
 
-// --- Per-PID Mode derivation (issue #31): the single source in this file ----------
+// --- Per-PID Mode / PID-text handling (issue #31): the single source in this file --
 // "Mode" replaced the free-text per-PID "Init" (ELM ATSH strings the Datalogger
-// protocol never executed). The PID text's leading service byte is authoritative --
-// poll_log frames cmd verbatim -- so Mode is always DERIVED from it, never trusted
-// from stored JSON or the dropdown: a contradicting hand-edited "Mode" loses here
-// exactly as the firmware parser (pid_prefix_mode in autopid_config.c, this
-// function's C mirror) warns-and-overrides it, and old configs lose "Init" / gain
-// "Mode" on their first Store (one-time migration; docs/internals/web_ui.md "Known
-// exceptions"). EXPRESSIBLE_MODES is the dropdown's option set: extend it and the
-// template <option>s together (the mode-23 follow-up), and the hydrate collapse,
-// save cross-check, and warn split all follow automatically.
+// protocol never executed), and the PID box shows only the IDENTIFIER (0C, 1746) --
+// the service byte lives in the Mode dropdown and the ELM frames-hint nibble is
+// hidden entirely (preserved per row, re-attached on save; it dies for real with
+// issue #28). The STORED format is unchanged -- full "010C1"/"2217461" wire strings,
+// what poll_log frames verbatim and pid_prefix_mode() in autopid_config.c derives
+// the mode from (this block's C mirror) -- so a canonical row round-trips
+// byte-identically: parsePidText() and composePidText() are exact inverses on it.
+// A stored PID that does NOT parse canonically (exotic service, odd shape) keeps the
+// pre-#31 UX: full string in the box, Mode display-only and derived from the prefix
+// via pidServiceMode(), saved verbatim -- never blocked (it was storable before and
+// firmware parses it fine). Old configs lose "Init" / gain "Mode" on their first
+// Store (one-time migration; docs/internals/web_ui.md "Known exceptions").
+// EXPRESSIBLE_MODES is the dropdown's option set: extend it, the template
+// <option>s, and MODE_IDENT_LEN together (the mode-23 follow-up).
 const EXPRESSIBLE_MODES = ['01', '22'];
+const MODE_IDENT_LEN = { '01': 2, '22': 4 };   // hex chars: 1-byte PID / 2-byte DID
+const PID_HINT_DEFAULT = '1';                  // every shipped row uses "1 response frame"
 const pidServiceMode = txt => {
     const p = String(txt || '').slice(0, 2);
     return /^[0-9A-Fa-f]{2}$/.test(p) ? p.toUpperCase() : '01';
 };
+// Stored wire string -> {service, ident, hint} when canonical, else null. ident/hint
+// are kept VERBATIM (no case-fold) so compose reproduces the stored bytes exactly.
+const parsePidText = txt => {
+    const s = String(txt || '');
+    if (!/^[0-9A-Fa-f]+$/.test(s)) return null;
+    const service = s.slice(0, 2);
+    if (!EXPRESSIBLE_MODES.includes(service)) return null;
+    const len = MODE_IDENT_LEN[service];
+    const rest = s.slice(2);
+    if (rest.length === len) return { service, ident: rest, hint: '' };
+    if (rest.length === len + 1) return { service, ident: rest.slice(0, len), hint: rest.slice(len) };
+    return null;
+};
+const composePidText = (service, ident, hint) => service + ident + hint;
 
 function addCollapsibleRow(rowData = {}) {
     const container = document.querySelector('.pid-entries');
@@ -843,20 +864,29 @@ const updateTitle = () => {
 nameInput.addEventListener('input', updateTitle);
 pidInput.addEventListener('input', updateTitle);
 
-// --- Mode (OBD service selector, issue #31) ---------------------------------------
-// Hydrated and synced strictly FROM the PID text via pidServiceMode() (full story at
-// its definition). One-way: PID edits move the select; the reverse is deliberately
-// absent -- rewriting the PID prefix from a select change could garble the identifier
-// -- so a manual select flip is caught by the save cross-check. Services outside
-// EXPRESSIBLE_MODES display as 01 (inexpressible here) but SAVE from the prefix, so
-// the stored JSON never lies.
+// --- Mode + PID box (issue #31; full story at parsePidText) -----------------------
+// Canonical rows: box = identifier only (0C, 1746), select = the service and the
+// SOURCE of the stored prefix on save, frames-hint stashed invisibly on the row.
+// Legacy/exotic rows (stored string doesn't parse canonically): box keeps the
+// verbatim string, select is display-only (derived, one-way synced from typing) and
+// save stores the box verbatim. A NEW row is canonical from birth: Mode 01, empty
+// box, default hint.
 const modeSel = entry.querySelector('.mode-select');
-const syncModeSel = () => {
-    const m = pidServiceMode(pidInput.value);
-    modeSel.value = EXPRESSIBLE_MODES.includes(m) ? m : '01';
-};
-syncModeSel();   // pidInput was just templated from rowData.PID
-pidInput.addEventListener('input', syncModeSel);
+const pidParsed = rowData.PID ? parsePidText(rowData.PID)
+                              : { service: '01', ident: '', hint: PID_HINT_DEFAULT };
+entry.dataset.pidCanonical = pidParsed ? '1' : '0';
+entry.dataset.pidHint = pidParsed ? pidParsed.hint : '';
+if (pidParsed) {
+    pidInput.value = pidParsed.ident;   // programmatic set: fires no event, dirties nothing
+    pidInput.placeholder = 'e.g. 0C or 1746';
+    modeSel.value = pidParsed.service;
+} else {
+    modeSel.value = pidServiceMode(pidInput.value) === '22' ? '22' : '01';
+    pidInput.addEventListener('input', () => {
+        const m = pidServiceMode(pidInput.value);
+        modeSel.value = EXPRESSIBLE_MODES.includes(m) ? m : '01';
+    });
+}
 
 // --- Sample Rate (per-PID sweep divisor, issue #29) -------------------------------
 const SAMPLE_PRESETS = ['0', '2', '4', '8', '16'];
@@ -1219,7 +1249,8 @@ function loadAutoTable(jsonData) {
                 // one-time migration. Every shipped value was "" or "ATSH7E0;", both already
                 // covered by the firmware's hardcoded 7E0; surface anything else rather than
                 // silently discarding it. A stored "Mode" key is deliberately NOT hydrated:
-                // it is re-derived from the PID text at save, so it cannot go stale here.
+                // the row builder parses the PID wire string itself (parsePidText) and the
+                // save path recomposes it, so the key cannot go stale here.
                 if (pidData.Init && pidData.Init !== 'ATSH7E0;') {
                     console.warn(`PID "${pidData.Name}": dropping legacy Init "${pidData.Init}" (replaced by Mode, issue #31)`);
                 }
@@ -1509,15 +1540,35 @@ function buildAutoTableJson() {
     if(entries?.length) {
         entries.forEach((entry, index) => {
             const sampleEvery = readSampleEvery(entry);
-            const pidText = entry.querySelector('.pid-input')?.value || '';
-            // Mode replaces Init in this slot (issue #31): emitted unconditionally, derived
-            // via pidServiceMode() (single source; full story at its definition). The
-            // dropdown is only a cross-check, below.
-            const modeDerived = pidServiceMode(pidText);
+            // PID box + Mode select -> stored wire string (issue #31; full story at
+            // parsePidText). Canonical rows compose service+ident+hint -- the select IS
+            // the service source; legacy rows store the box verbatim with Mode derived
+            // from its prefix (pre-#31 behavior, never blocked).
+            const rowName = entry.querySelector('.name-input')?.value || '';
+            const boxText = entry.querySelector('.pid-input')?.value || '';
+            const modeSelVal = entry.querySelector('.mode-select')?.value || '01';
+            let pidStored, modeStored;
+            if (entry.dataset.pidCanonical === '1') {
+                const wantLen = MODE_IDENT_LEN[modeSelVal];
+                if (!new RegExp('^[0-9A-Fa-f]{' + wantLen + '}$').test(boxText)) {
+                    throw new Error(`PID for "${rowName}" must be ${wantLen / 2} byte${wantLen > 2 ? 's' : ''} (${wantLen} hex chars) for Mode ${modeSelVal} — e.g. ${modeSelVal === '22' ? '1746' : '0C'}`);
+                }
+                pidStored = composePidText(modeSelVal, boxText,
+                    entry.dataset.pidHint !== undefined ? entry.dataset.pidHint : PID_HINT_DEFAULT);
+                modeStored = modeSelVal;
+            } else {
+                pidStored = boxText;
+                modeStored = pidServiceMode(boxText);
+                if (!EXPRESSIBLE_MODES.includes(modeStored)) {
+                    console.warn(`PID "${rowName}": service "${modeStored}" is outside the Mode dropdown (${EXPRESSIBLE_MODES.join('/')}); saved as-is from the PID text`);
+                } else if (modeSelVal !== modeStored) {
+                    console.warn(`PID "${rowName}": Mode dropdown is display-only for this non-standard PID shape; storing "${modeStored}" from the text`);
+                }
+            }
             const pidData = {
-                Name: entry.querySelector('.name-input')?.value || '',
-                Mode: modeDerived,
-                PID: pidText,
+                Name: rowName,
+                Mode: modeStored,
+                PID: pidStored,
                 Expression: entry.querySelector('.expression-input')?.value || '',
                 Unit: entry.querySelector('.unit-input')?.value || '',
                 Class: entry.querySelector('.class-input')?.value || '',
@@ -1540,21 +1591,6 @@ function buildAutoTableJson() {
             }
             if (pidData.PID.length === 0 || pidData.PID.length >= 10) {
                 throw new Error("PID must not be empty and must be less than 10 characters");
-            }
-            // Mode cross-check (issue #31). Only a dropdown-expressible service can
-            // genuinely contradict the select (PID edits sync it one-way, so only a manual
-            // flip gets here) -- block those with a clear message. Any OTHER prefix (09,
-            // 23, non-hex...) was storable in the pre-#31 UI and parses fine in firmware
-            // (mode falls out of the prefix), so it must NOT dead-bolt the whole-table
-            // save: warn and store the truth instead.
-            {
-                const modeSelVal = entry.querySelector('.mode-select')?.value || '01';
-                if (EXPRESSIBLE_MODES.includes(modeDerived) && modeSelVal !== modeDerived) {
-                    throw new Error(`Mode ${modeSelVal} for "${pidData.Name}" does not match the PID's leading service byte "${modeDerived}" — fix the PID text or flip Mode back`);
-                }
-                if (!EXPRESSIBLE_MODES.includes(modeDerived)) {
-                    console.warn(`PID "${pidData.Name}": service "${modeDerived}" is outside the Mode dropdown (${EXPRESSIBLE_MODES.join('/')}); saved as-is from the PID text`);
-                }
             }
             if (pidData.Expression.length === 0 || pidData.Expression.length >= 64) {
                 throw new Error("Expression must not be empty and must be less than 64 characters");
