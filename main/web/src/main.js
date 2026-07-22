@@ -665,6 +665,23 @@ function wireRowDrag(entry) {
     });
 }
 
+// --- Per-PID Mode derivation (issue #31): the single source in this file ----------
+// "Mode" replaced the free-text per-PID "Init" (ELM ATSH strings the Datalogger
+// protocol never executed). The PID text's leading service byte is authoritative --
+// poll_log frames cmd verbatim -- so Mode is always DERIVED from it, never trusted
+// from stored JSON or the dropdown: a contradicting hand-edited "Mode" loses here
+// exactly as the firmware parser (pid_prefix_mode in autopid_config.c, this
+// function's C mirror) warns-and-overrides it, and old configs lose "Init" / gain
+// "Mode" on their first Store (one-time migration; docs/internals/web_ui.md "Known
+// exceptions"). EXPRESSIBLE_MODES is the dropdown's option set: extend it and the
+// template <option>s together (the mode-23 follow-up), and the hydrate collapse,
+// save cross-check, and warn split all follow automatically.
+const EXPRESSIBLE_MODES = ['01', '22'];
+const pidServiceMode = txt => {
+    const p = String(txt || '').slice(0, 2);
+    return /^[0-9A-Fa-f]{2}$/.test(p) ? p.toUpperCase() : '01';
+};
+
 function addCollapsibleRow(rowData = {}) {
     const container = document.querySelector('.pid-entries');
     const entry = document.createElement('div');
@@ -694,10 +711,20 @@ function addCollapsibleRow(rowData = {}) {
                     <td><input type="text" class="name-input" value="${safe(rowData.Name || '')}"
                         placeholder="Parameter Name"></td>
                 </tr>
+                <!-- Mode (issue #31): declarative OBD service selector replacing the free-text
+                     per-PID "Init"; hydrated/synced from the PID text -- full story at
+                     pidServiceMode() above addCollapsibleRow. The <option> values MUST stay
+                     in lockstep with EXPRESSIBLE_MODES. No id= / inline on*= -- same
+                     lint_web.py rationale as Sample Rate below. 0x23 (memory read) is
+                     deliberately absent until it exists as a poll channel (follow-up issue). -->
                 <tr>
-                    <td>Init:</td>
-                    <td><input type="text" class="init-input" value="${safe(rowData.Init || '')}"
-                        placeholder="PID Init"></td>
+                    <td>Mode:</td>
+                    <td>
+                        <select class="mode-select">
+                            <option value="01">01 &mdash; standard OBD</option>
+                            <option value="22">22 &mdash; extended (DID)</option>
+                        </select>
+                    </td>
                 </tr>
                 <tr>
                     <td>PID:</td>
@@ -815,6 +842,21 @@ const updateTitle = () => {
 
 nameInput.addEventListener('input', updateTitle);
 pidInput.addEventListener('input', updateTitle);
+
+// --- Mode (OBD service selector, issue #31) ---------------------------------------
+// Hydrated and synced strictly FROM the PID text via pidServiceMode() (full story at
+// its definition). One-way: PID edits move the select; the reverse is deliberately
+// absent -- rewriting the PID prefix from a select change could garble the identifier
+// -- so a manual select flip is caught by the save cross-check. Services outside
+// EXPRESSIBLE_MODES display as 01 (inexpressible here) but SAVE from the prefix, so
+// the stored JSON never lies.
+const modeSel = entry.querySelector('.mode-select');
+const syncModeSel = () => {
+    const m = pidServiceMode(pidInput.value);
+    modeSel.value = EXPRESSIBLE_MODES.includes(m) ? m : '01';
+};
+syncModeSel();   // pidInput was just templated from rowData.PID
+pidInput.addEventListener('input', syncModeSel);
 
 // --- Sample Rate (per-PID sweep divisor, issue #29) -------------------------------
 const SAMPLE_PRESETS = ['0', '2', '4', '8', '16'];
@@ -1173,9 +1215,16 @@ function loadAutoTable(jsonData) {
         if (data.pids && Array.isArray(data.pids)) {
             data.pids.forEach((pidData, index) => {
                 console.log(`Loading PID ${index}:`, pidData);
+                // Legacy per-PID Init (pre-#31) is dropped on the next Store -- an intended
+                // one-time migration. Every shipped value was "" or "ATSH7E0;", both already
+                // covered by the firmware's hardcoded 7E0; surface anything else rather than
+                // silently discarding it. A stored "Mode" key is deliberately NOT hydrated:
+                // it is re-derived from the PID text at save, so it cannot go stale here.
+                if (pidData.Init && pidData.Init !== 'ATSH7E0;') {
+                    console.warn(`PID "${pidData.Name}": dropping legacy Init "${pidData.Init}" (replaced by Mode, issue #31)`);
+                }
                 addCollapsibleRow({
                     Name: pidData.Name || '',
-                    Init: pidData.Init || '',
                     PID: pidData.PID || '',
                     Expression: pidData.Expression || '',
                     Unit: pidData.Unit || pidData.unit || '',
@@ -1460,10 +1509,15 @@ function buildAutoTableJson() {
     if(entries?.length) {
         entries.forEach((entry, index) => {
             const sampleEvery = readSampleEvery(entry);
+            const pidText = entry.querySelector('.pid-input')?.value || '';
+            // Mode replaces Init in this slot (issue #31): emitted unconditionally, derived
+            // via pidServiceMode() (single source; full story at its definition). The
+            // dropdown is only a cross-check, below.
+            const modeDerived = pidServiceMode(pidText);
             const pidData = {
                 Name: entry.querySelector('.name-input')?.value || '',
-                Init: entry.querySelector('.init-input')?.value || '',
-                PID: entry.querySelector('.pid-input')?.value || '',
+                Mode: modeDerived,
+                PID: pidText,
                 Expression: entry.querySelector('.expression-input')?.value || '',
                 Unit: entry.querySelector('.unit-input')?.value || '',
                 Class: entry.querySelector('.class-input')?.value || '',
@@ -1486,6 +1540,21 @@ function buildAutoTableJson() {
             }
             if (pidData.PID.length === 0 || pidData.PID.length >= 10) {
                 throw new Error("PID must not be empty and must be less than 10 characters");
+            }
+            // Mode cross-check (issue #31). Only a dropdown-expressible service can
+            // genuinely contradict the select (PID edits sync it one-way, so only a manual
+            // flip gets here) -- block those with a clear message. Any OTHER prefix (09,
+            // 23, non-hex...) was storable in the pre-#31 UI and parses fine in firmware
+            // (mode falls out of the prefix), so it must NOT dead-bolt the whole-table
+            // save: warn and store the truth instead.
+            {
+                const modeSelVal = entry.querySelector('.mode-select')?.value || '01';
+                if (EXPRESSIBLE_MODES.includes(modeDerived) && modeSelVal !== modeDerived) {
+                    throw new Error(`Mode ${modeSelVal} for "${pidData.Name}" does not match the PID's leading service byte "${modeDerived}" — fix the PID text or flip Mode back`);
+                }
+                if (!EXPRESSIBLE_MODES.includes(modeDerived)) {
+                    console.warn(`PID "${pidData.Name}": service "${modeDerived}" is outside the Mode dropdown (${EXPRESSIBLE_MODES.join('/')}); saved as-is from the PID text`);
+                }
             }
             if (pidData.Expression.length === 0 || pidData.Expression.length >= 64) {
                 throw new Error("Expression must not be empty and must be less than 64 characters");

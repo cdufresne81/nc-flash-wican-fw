@@ -214,6 +214,43 @@ static uint8_t json_item_to_sample_every(const cJSON *item, const char *dbg)
     return (uint8_t)d;                         /* truncates 4.9 -> 4; documented */
 }
 
+/* OBD service/mode byte (issue #31). The wire framing comes from the leading two hex
+ * chars of the PID/cmd string (poll_log packs cmd verbatim), so the string is the
+ * authoritative source: mode is always DERIVED from that prefix, and a stored "Mode"
+ * key is only cross-checked -- on a mismatch the prefix wins and we warn, so mode can
+ * never claim a service the request doesn't actually send. Absent "Mode" (every
+ * pre-#31 config) is therefore automatically the migration path: old auto_pid.json
+ * files load unchanged. Short/non-hex PID -> 0x01 (standard OBD).
+ * Mirrors to keep in sync: main/web/src/main.js pidServiceMode() (UI emit) and
+ * tools/nc_datalogger/gen_logcfg_pid.py build_pids() (guard-free request[:2]; safe
+ * because the generator controls its inputs). The Test button sniffs the same prefix
+ * independently for its +0x40 echo check (autopid_http_test_pid.c req_service) --
+ * left separate because that whole path dies with issue #28. */
+static uint8_t pid_prefix_mode(const char *pid_str)
+{
+    if (pid_str && isxdigit((unsigned char)pid_str[0]) && isxdigit((unsigned char)pid_str[1]))
+    {
+        char buf[3] = { pid_str[0], pid_str[1], '\0' };
+        return (uint8_t)strtol(buf, NULL, 16);
+    }
+    return 0x01;
+}
+
+static uint8_t json_item_to_mode(const cJSON *mode_item, const char *pid_str, const char *dbg)
+{
+    uint8_t derived = pid_prefix_mode(pid_str);
+    /* A stored "Mode" is only ever a cross-check. Every producer emits a string
+     * ("01"/"22"); non-string values occur in no producer and the return value would
+     * be `derived` regardless, so they simply don't warn. */
+    if (cJSON_IsString(mode_item) && mode_item->valuestring && mode_item->valuestring[0] != '\0' &&
+        (uint8_t)strtol(mode_item->valuestring, NULL, 16) != derived)
+    {
+        ESP_LOGW(TAG, "Mode \"%s\" contradicts PID prefix 0x%02X; using the prefix (%s)",
+                 mode_item->valuestring, derived, dbg ? dbg : "pid");
+    }
+    return derived;
+}
+
 static char *json_strdup_key_or_default(const cJSON *obj, const char *key, const char *default_value)
 {
     if (!obj || !key)
@@ -504,7 +541,6 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
         {
             pid_data_t *curr_pid = &autopid_config->pids[idx];
 
-            cJSON *init_item2 = cJSON_GetObjectItem(pid, "Init");
             cJSON *pid_item = cJSON_GetObjectItem(pid, "PID");
             cJSON *period_item = cJSON_GetObjectItem(pid, "Period");
             cJSON *rxheader_item = cJSON_GetObjectItem(pid, "header");
@@ -525,12 +561,6 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                 strcat(curr_pid->cmd, "\r");
             }
 
-            curr_pid->init = NULL;
-            if (init_item2 && init_item2->valuestring)
-            {
-                curr_pid->init = normalize_init_string(init_item2->valuestring);
-            }
-
             if (period_item && period_item->valuestring && strlen(period_item->valuestring) > 0)
                 curr_pid->period = atoi(period_item->valuestring);
             else if (period_item && period_item->valueint)
@@ -542,6 +572,9 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
             curr_pid->pid_type = PID_CUSTOM;
             curr_pid->enabled = (enabled_item && cJSON_IsBool(enabled_item)) ? cJSON_IsTrue(enabled_item) : true;
             curr_pid->sample_every = json_item_to_sample_every(cJSON_GetObjectItem(pid, "SampleEvery"), "auto_pid pids");
+            curr_pid->mode = json_item_to_mode(cJSON_GetObjectItem(pid, "Mode"),
+                                               pid_is_str ? pid_item->valuestring : NULL,
+                                               "auto_pid pids");
 
             curr_pid->parameters_count = 1;
             curr_pid->parameters = (parameter_t *)heap_caps_calloc(1, sizeof(parameter_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
@@ -578,6 +611,7 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                 cJSON *enabled_item = cJSON_GetObjectItem(pid, "enabled");
                 curr_pid->enabled = (enabled_item && cJSON_IsBool(enabled_item)) ? cJSON_IsTrue(enabled_item) : true;
                 curr_pid->sample_every = json_item_to_sample_every(cJSON_GetObjectItem(pid, "SampleEvery"), "auto_pid std_pids");
+                curr_pid->mode = 0x01;   /* std pids build cmd as "01%s" below -- always standard OBD */
             }
 
             char std_init_buf[64];
@@ -921,16 +955,14 @@ static void parse_car_data_json(autopid_config_t *autopid_config, int *pid_index
                 {
                     pid_data_t *curr_pid = &autopid_config->pids[idx];
                     cJSON *pid_item = cJSON_GetObjectItem(pid, "pid");
-                    cJSON *pid_init_item = cJSON_GetObjectItem(pid, "pid_init");
                     cJSON *enabled_item = cJSON_GetObjectItem(pid, "enabled");
 
                     curr_pid->enabled = (enabled_item && cJSON_IsBool(enabled_item)) ? cJSON_IsTrue(enabled_item) : true;
 
-                    curr_pid->init = NULL;
-                    if (pid_init_item && pid_init_item->valuestring)
-                    {
-                        curr_pid->init = normalize_init_string(pid_init_item->valuestring);
-                    }
+                    /* Legacy "pid_init" (car_data.json) dropped with the per-PID Init
+                     * field (issue #31); this path is unwired in the NC-only build and
+                     * slated for removal under issue #28. */
+                    curr_pid->mode = pid_prefix_mode(pid_item ? pid_item->valuestring : NULL);
 
                     curr_pid->cmd = NULL;
                     if (pid_item && pid_item->valuestring)
@@ -1057,7 +1089,7 @@ static void autopid_free_param_array(parameter_t *params, uint32_t count)
 }
 
 // Deep-free a table produced by load_autopid_config(). Mirrors the parser's exact
-// allocation set: pids[].cmd/init/rxheader + each pid's parameter strings+array,
+// allocation set: pids[].cmd/rxheader + each pid's parameter strings+array,
 // can_filters[] parameter strings+array, calculated[] strings+array, the six
 // top-level char*, then the struct. Guards every array base (partial-alloc safe).
 void autopid_config_deep_free(autopid_config_t *c)
@@ -1070,7 +1102,6 @@ void autopid_config_deep_free(autopid_config_t *c)
         for (uint32_t i = 0; i < c->pid_count; i++)
         {
             free(c->pids[i].cmd);
-            free(c->pids[i].init);
             free(c->pids[i].rxheader);
             autopid_free_param_array(c->pids[i].parameters, c->pids[i].parameters_count);
         }

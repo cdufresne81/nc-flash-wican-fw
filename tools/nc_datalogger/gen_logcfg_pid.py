@@ -157,6 +157,11 @@ def build_pids():
     for name, request, expr, unit, cls in POLLED:
         entry = {
             "PID": request,
+            # Declarative OBD service byte (issue #31), mirrors the PID prefix. Replaces
+            # the retired per-PID "Init" ATSH string: the datalogger protocol addresses
+            # the PCM physically (hardcoded 0x7E0) for BOTH mode 01 and mode 22, so no
+            # per-PID header command exists anymore.
+            "Mode": request[:2],
             "Period": str(POLLED_PERIOD_MS),
             "enabled": True,
             "Name": name,
@@ -164,11 +169,6 @@ def build_pids():
             "unit": unit,
             "class": cls,
         }
-        # Mazda enhanced PIDs (mode 0x22) must be addressed PHYSICALLY to the PCM
-        # (ATSH7E0); functional 0x7DF does not elicit a mode-22 response on the NC.
-        # Mode 01 PIDs use the default functional header, so they need no init.
-        if request.startswith("22"):
-            entry["Init"] = "ATSH7E0;"
         pids.append(entry)
     return pids
 
