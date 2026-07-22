@@ -119,8 +119,10 @@ static volatile int8_t csv_mark_pending = 0;
 // ---- Wide (Tactrix-style) CSV format state (Task #11) ----
 // Approach B: write WIDE incrementally (one column per channel) with in-RAM last-observation-
 // carried-forward (LOCF). Fast channels (RPM) change each row, slow ones (ECT/IAT) repeat
-// their last value until refreshed. The on-SD file is a valid, complete-up-to-now CSV at
-// every flush, so the operator can download the in-progress log while driving.
+// their last value until refreshed. A downloaded IN-PROGRESS file is a valid CSV whose final line
+// may be truncated mid-row -- the sector-aligned SD accumulator (see CSV_SD_ACC_BYTES) withholds
+// the < 512 B tail until it completes a sector; the CLOSED file is always complete to the last row.
+// Consumers that drop an incomplete trailing line read the live log fine while driving.
 //
 // Brick-safety: ALL wide buffers live in INTERNAL RAM. The writer dereferences them inside
 // fprintf/fflush/fsync (flash-cache-disable windows where any PSRAM access faults -- brick
@@ -155,6 +157,24 @@ static bool            csv_grid_auto  = false;   // csv_grid_hz=="auto": track t
 static csv_wide_col_t *csv_cols       = NULL;   // [csv_col_count], INTERNAL RAM, session-scoped
 static int             csv_col_count  = 0;
 static char           *csv_line_buf   = NULL;   // CSV_WIDE_LINE_BUF, INTERNAL RAM, alloc'd once
+
+// ---- Sector-aligned SD write accumulator (interrupt_wdt fix) ----
+// Coalesce all file bytes (header + every row) into whole 512-byte SD sectors so each physical
+// write is one multi-block (CMD25) transfer instead of a stream of single-block ones. That
+// single-block storm (~27 tx/s at 81 Hz) is what starved the FreeRTOS tick past the 300 ms
+// interrupt watchdog. The FILE* is set unbuffered so stdio never re-fragments the 512-aligned
+// writes we hand it; the file starts at offset 0 and only ever advances by 512 multiples, so the
+// offset stays sector-aligned for the whole session and every drain takes the multi-block DMA path.
+// INTERNAL + DMA-capable + alloc-aligned so the sdmmc host does NOT fall back to the per-block
+// bounce loop (a PSRAM or misaligned source would). Same brick-safety discipline as csv_line_buf.
+#define CSV_SD_ACC_BYTES  8192            // 16 sectors, a 512 multiple; batches up to 16 sectors/write
+static char   *csv_sd_acc  = NULL;         // CSV_SD_ACC_BYTES, INTERNAL|DMA RAM, alloc'd once
+static size_t  csv_acc_len = 0;            // bytes currently held (the < 512 B tail after a drain)
+// Multi-block telemetry (interrupt_wdt fix gate): lets /csv_status prove writes are now multi-sector
+// (transfer > 1 block) instead of the old single-block storm. Cumulative since boot; writer-only.
+static uint32_t csv_acc_writes  = 0;       // sector-drain fwrite calls (each = one multi-block xfer)
+static uint32_t csv_acc_sectors = 0;       // total 512 B sectors drained
+static uint32_t csv_acc_multi   = 0;       // drains that wrote > 1 sector (true multi-block)
 
 // Column provider (registered by autopid). Written once at boot before the writer runs.
 static csv_column_provider_t csv_col_provider = NULL;
@@ -197,6 +217,90 @@ static void csv_sanitize_field(char *s)
             *s = '_';
         }
     }
+}
+
+// ---- Sector-aligned accumulator helpers (see CSV_SD_ACC_BYTES above) ----
+
+static void csv_acc_reset(void)
+{
+    csv_acc_len = 0;
+}
+
+// Write the largest whole-512-byte prefix of the accumulator to the file, keeping the < 512 B
+// remainder at the front (still 4-aligned). The offset advances by a 512 multiple, so it stays
+// sector-aligned -> this write takes the multi-block DMA path. Does NOT fsync (data reaches the
+// card; durability is committed by csv_acc_checkpoint). Returns false only on a short fwrite (SD gone).
+static bool csv_acc_write_sectors(void)
+{
+    if (csv_sd_acc == NULL || csv_file == NULL) return false;
+    size_t whole = csv_acc_len & ~((size_t)511);
+    if (whole == 0) return true;
+    size_t w = fwrite(csv_sd_acc, 1, whole, csv_file);
+    // Advance the buffer past ONLY the sectors actually persisted (done is a 512 multiple, so the
+    // file offset stays sector-aligned). On a transient short write -- a recoverable SD hiccup mid
+    // multi-sector drain -- this prevents re-sending already-written bytes on the next drain, which
+    // would duplicate a row into the file. Card-gone still surfaces as the false return -> next emit
+    // closes the session.
+    size_t done = w & ~((size_t)511);
+    if (done)
+    {
+        size_t rem = csv_acc_len - done;
+        if (rem) memmove(csv_sd_acc, csv_sd_acc + done, rem);
+        csv_acc_len = rem;
+        csv_acc_writes++;
+        csv_acc_sectors += (uint32_t)(done >> 9);
+        if ((done >> 9) > 1) csv_acc_multi++;
+    }
+    return (w == whole);
+}
+
+// Append bytes to the accumulator, draining full sectors whenever it fills. Any length is handled
+// (long rows are chunked). Returns false on a write failure (caller closes the session).
+static bool csv_acc_append(const char *data, size_t len)
+{
+    if (csv_sd_acc == NULL || csv_file == NULL) return false;
+    while (len > 0)
+    {
+        size_t room = CSV_SD_ACC_BYTES - csv_acc_len;
+        size_t take = (len < room) ? len : room;
+        memcpy(csv_sd_acc + csv_acc_len, data, take);
+        csv_acc_len += take;
+        data += take;
+        len  -= take;
+        if (csv_acc_len == CSV_SD_ACC_BYTES)       // buffer full (a 512 multiple) -> drain all sectors
+        {
+            if (!csv_acc_write_sectors()) return false;
+        }
+    }
+    return true;
+}
+
+// Durability checkpoint: drain the whole-sector prefix and fsync it, KEEPING the < 512 B tail in
+// RAM. Never fwrite a partial sector mid-session -- that misaligns the offset and reintroduces the
+// single-block writes. Worst-case power loss = the tail + rows since the last checkpoint (~1 s, the
+// same bound as before this change). Best-effort: a write failure is caught by the next row emit.
+static void csv_acc_checkpoint(void)
+{
+    if (csv_sd_acc == NULL || csv_file == NULL) return;
+    if (!csv_acc_write_sectors()) return;
+    fflush(csv_file);
+    fsync(fileno(csv_file));
+}
+
+// Final flush for close/rotation: write EVERYTHING including the partial tail (a partial-sector
+// write is fine here -- the file is closing, or reopening at offset 0) + fsync. Lossless graceful stop.
+static bool csv_acc_finalize(void)
+{
+    if (csv_sd_acc == NULL || csv_file == NULL) return false;
+    if (csv_acc_len > 0)
+    {
+        size_t n = csv_acc_len;
+        csv_acc_len = 0;
+        if (fwrite(csv_sd_acc, 1, n, csv_file) != n) return false;
+    }
+    fflush(csv_file);
+    fsync(fileno(csv_file));
+    return true;
 }
 
 static esp_err_t csv_open_new_file(void)
@@ -246,6 +350,11 @@ static esp_err_t csv_open_new_file(void)
         ESP_LOGE(TAG, "Failed to open %s", csv_file_path);
         return ESP_FAIL;
     }
+    // Unbuffered: every file byte funnels through the sector-aligned accumulator (csv_acc_append),
+    // so stdio must not re-buffer/re-fragment the 512-aligned writes we hand it. The new file is at
+    // offset 0, so reset the accumulator here to keep the offset sector-aligned from the first byte.
+    setvbuf(csv_file, NULL, _IONBF, 0);
+    csv_acc_reset();
 
     // Wide header: timestamp_ms + two system columns (datetime, BATT_V) + one column per channel
     // + a trailing "mark" column (one-shot web event marker; empty on every row unless clicked).
@@ -255,9 +364,13 @@ static esp_err_t csv_open_new_file(void)
     // identical header, so every rotated file is self-describing. Stream column-by-column (no
     // buffer bound here). The two system columns are emitted in the same fixed order by
     // csv_emit_wide_row(), so header and rows stay aligned.
+    // Header bytes go through the accumulator too (a partial-write fprintf here would desync the
+    // sector alignment). Each piece is formatted into a bounded temp, then appended; the accumulator
+    // chunks arbitrary total length, so a wide header spanning several sectors is fine.
     csv_file_bytes = 0;
-    int n = fprintf(csv_file, "timestamp_ms,datetime,BATT_V");
-    if (n > 0) csv_file_bytes += (size_t)n;
+    char hpiece[CSV_LOGGER_NAME_MAX + CSV_LOGGER_SOURCE_MAX + 8];
+    int n = snprintf(hpiece, sizeof(hpiece), "timestamp_ms,datetime,BATT_V");
+    if (n > 0 && csv_acc_append(hpiece, (size_t)n)) csv_file_bytes += (size_t)n;
     for (int c = 0; c < csv_col_count; c++)
     {
         char hdr[CSV_LOGGER_NAME_MAX + CSV_LOGGER_SOURCE_MAX + 4];
@@ -266,13 +379,12 @@ static esp_err_t csv_open_new_file(void)
         else
             strlcpy(hdr, csv_cols[c].name, sizeof(hdr));
         csv_sanitize_field(hdr);   // sanitize a COPY; the column table keeps the raw name
-        n = fprintf(csv_file, ",%s", hdr);
-        if (n > 0) csv_file_bytes += (size_t)n;
+        n = snprintf(hpiece, sizeof(hpiece), ",%s", hdr);
+        if (n > 0 && csv_acc_append(hpiece, (size_t)n)) csv_file_bytes += (size_t)n;
     }
-    n = fprintf(csv_file, ",mark");          /* FINAL column: one-shot event marker (see csv_mark_pending) */
-    if (n > 0) csv_file_bytes += (size_t)n;
-    n = fprintf(csv_file, "\n");
-    if (n > 0) csv_file_bytes += (size_t)n;
+    n = snprintf(hpiece, sizeof(hpiece), ",mark");   /* FINAL column: one-shot event marker (see csv_mark_pending) */
+    if (n > 0 && csv_acc_append(hpiece, (size_t)n)) csv_file_bytes += (size_t)n;
+    if (csv_acc_append("\n", 1)) csv_file_bytes += 1;
     csv_files_count++;
     ESP_LOGI(TAG, "CSV log started: %s (wide, %d cols)", csv_file_path, csv_col_count);
     return ESP_OK;
@@ -282,8 +394,7 @@ static void csv_close_file(void)
 {
     if (csv_file != NULL)
     {
-        fflush(csv_file);
-        fsync(fileno(csv_file));
+        csv_acc_finalize();   // flush the accumulator tail (partial sector OK at EOF) + fsync -> lossless
         fclose(csv_file);
         ESP_LOGI(TAG, "CSV log closed: %s (%u rows, %u bytes)",
                  csv_file_path, (unsigned)csv_rows_written, (unsigned)csv_file_bytes);
@@ -433,9 +544,8 @@ static bool csv_emit_wide_row(int64_t ts_ms)
     buf[len++] = '\n';
     buf[len] = '\0';
 
-    int w = fprintf(csv_file, "%s", buf);
-    if (w < 0) return false;
-    csv_file_bytes += (size_t)w;
+    if (!csv_acc_append(buf, len)) return false;   // coalesce into 512-aligned multi-block writes
+    csv_file_bytes += len;
     csv_rows_written++;
     return true;
 }
@@ -666,11 +776,10 @@ static void csv_logger_task(void *pvParameters)
 
         if (!got_record)
         {
-            // Idle: opportunistic flush so a power cut loses at most ~1s of data.
+            // Idle: opportunistic checkpoint so a power cut loses at most ~1s of data.
             if (csv_session_active && csv_file != NULL && flush_pending)
             {
-                fflush(csv_file);
-                fsync(fileno(csv_file));
+                csv_acc_checkpoint();   // drain whole sectors + fsync; keep the < 512 B tail
                 flush_pending = false;
             }
             continue;
@@ -691,9 +800,10 @@ static void csv_logger_task(void *pvParameters)
                 continue;
             }
 
-            // Wide is the only format (Task #16 removed LONG). It needs the line buffer that
-            // csv_logger_init allocates; if that alloc failed there is nothing to fall back to.
-            if (csv_line_buf == NULL)
+            // Wide is the only format (Task #16 removed LONG). It needs the line buffer AND the SD
+            // write accumulator that csv_logger_init allocates; if either alloc failed there is
+            // nothing to fall back to (logging stays off rather than reintroduce the crash).
+            if (csv_line_buf == NULL || csv_sd_acc == NULL)
             {
                 csv_pending_drops++;
                 csv_sd_retry_after_ms = now_ms + CSV_LOGGER_SD_RETRY_MS;
@@ -746,8 +856,7 @@ static void csv_logger_task(void *pvParameters)
         if (wc_timer_is_expired(&flush_timer))
         {
             wc_timer_set(&flush_timer, CSV_LOGGER_FLUSH_PERIOD_MS);
-            fflush(csv_file);
-            fsync(fileno(csv_file));
+            csv_acc_checkpoint();   // drain whole sectors + fsync; keep the < 512 B tail
             flush_pending = false;
         }
 
@@ -869,6 +978,12 @@ char *csv_logger_get_status_json(void)
     cJSON_AddNumberToObject(root, "columns", csv_session_active ? csv_col_count : 0);
     cJSON_AddNumberToObject(root, "cols_unmatched", csv_cols_unmatched);
     cJSON_AddNumberToObject(root, "pending_drops", csv_pending_drops);
+    // SD write-coalescing telemetry (interrupt_wdt fix gate): acc_writes = multi-block SD drains,
+    // acc_sectors = 512 B sectors moved, acc_multi = drains that carried > 1 sector. A healthy fix
+    // shows acc_sectors/acc_writes well above 1 (writes are multi-sector), i.e. NOT the single-block storm.
+    cJSON_AddNumberToObject(root, "acc_writes", csv_acc_writes);
+    cJSON_AddNumberToObject(root, "acc_sectors", csv_acc_sectors);
+    cJSON_AddNumberToObject(root, "acc_multi", csv_acc_multi);
     char *out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return out;
@@ -1377,6 +1492,19 @@ esp_err_t csv_logger_init(void)
         if (csv_line_buf == NULL)
         {
             ESP_LOGW(TAG, "Wide row buffer alloc failed - wide CSV will fall back to long");
+        }
+    }
+
+    // Sector-aligned SD write accumulator (interrupt_wdt fix): one INTERNAL + DMA-capable buffer
+    // reused for every session (no per-session churn). MALLOC_CAP_DMA gives memory the sdmmc host
+    // can DMA straight from (no PSRAM bounce) and word-aligned. NULL disables logging this boot (the
+    // session open gates on it) -- better to not log than to reintroduce the single-block-write crash.
+    if (csv_sd_acc == NULL)
+    {
+        csv_sd_acc = heap_caps_malloc(CSV_SD_ACC_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (csv_sd_acc == NULL)
+        {
+            ESP_LOGE(TAG, "SD write accumulator alloc failed - CSV logging disabled this boot");
         }
     }
 
