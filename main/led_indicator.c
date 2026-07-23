@@ -97,13 +97,25 @@ void led_indicator_suspend(void)
 {
     if (s_paint_mutex == NULL)
     {
-        // Pre-init (boot-time MIC update): no task is painting yet.
+        // Pre-init (boot-time MIC update): no task is painting yet, and the LED
+        // i2c may not be up -- do not touch it here.
         s_suspend_count++;
         return;
     }
     // Blocks until any in-progress repaint finished; after this returns the
     // indicator task will not touch the LED until led_indicator_resume().
     xSemaphoreTake(s_paint_mutex, portMAX_DELAY);
+    if (s_suspend_count == 0)
+    {
+        // Outermost suspend: hand a clean LED to the foreign owner. If we were in
+        // DATALOG_BLUE the AW2023 is still blinking blue autonomously (MD bit),
+        // and the task will NOT clear it because it stops painting in DEFERRED.
+        // Tear down both channels' patterns now -- one-time ~4 tx at handoff, off
+        // the sustained SD path. Restores the invariant that held for free when
+        // DATALOG_BLUE was a solid/software state.
+        led_disable_pattern(LED_RED);
+        led_disable_pattern(LED_BLUE);
+    }
     s_suspend_count++;
     xSemaphoreGive(s_paint_mutex);
 }
@@ -192,18 +204,32 @@ static void led_indicator_task(void *pvParameters)
             {
                 // The MD (pattern-mode) bit survives led_set_level: clear both
                 // channels' patterns when (re)taking the LED so a leftover
-                // hardware pattern can't fight the software blink.
+                // hardware pattern can't fight a software blink or a solid state.
+                // This also guarantees MD makes a real 0->1 edge below.
                 led_disable_pattern(LED_RED);
                 led_disable_pattern(LED_BLUE);
-                phase_on = true;   // enter blink states visibly on
-                ind_paint(desired, phase_on);
+                phase_on = true;   // enter software-blink states visibly on
+                if (desired == IND_DATALOG_BLUE)
+                {
+                    // interrupt_wdt fix: hand the "logging active" blink to the
+                    // AW2023 pattern engine. Programmed ONCE here; the chip then
+                    // blinks blue (~3.85 Hz) on its own with ZERO i2c for the
+                    // whole sustained state, so nothing co-tenants the core-0
+                    // SD-write path. (The old ~26 ms software toggle drove 3 i2c
+                    // writes ~38x/s == ~115 tx/s and starved the tick past
+                    // INT_WDT; 0 tx/s is the only bench-proven-safe level.)
+                    led_datalog_blink_hw(LED_IND_BLUE_BRIGHTNESS);
+                }
+                else
+                {
+                    ind_paint(desired, phase_on);
+                }
             }
-            // interrupt_wdt amplifier test: DATALOG_BLUE no longer software-blinks.
-            // The old ~26 ms toggle drove led_set_level() (3 i2c writes) ~38x/s ==
-            // ~115 i2c tx/s on the core-0 bus WHILE the SD writer is running --
-            // the co-tenant behind i2c_isr_handler_default in every crash. Holding
-            // solid blue takes LED i2c to ~0/s during logging. FLASH_RED keeps its
-            // software blink (it does not overlap the sustained SD-write path).
+            // FLASH_RED keeps its software blink -- short-lived, user-rate-
+            // configurable below the 130 ms hardware floor, and never overlaps
+            // the sustained SD-write path the WDT amplifier needs. DATALOG_BLUE
+            // (== s_state here) deliberately falls through with NO i2c -- its
+            // hardware pattern is still running.
             else if (desired == IND_FLASH_RED)
             {
                 phase_on = !phase_on;
