@@ -414,22 +414,14 @@ const pidEntryStyles = `
         white-space: nowrap;
     }
 
-    /* Shared muted-hint styling: the broadcast legend (.expr-hint) and the polled
-       "stored as <Bn>" preview (.expr-stored, issue #61). */
-    .expr-hint,
-    .expr-stored {
+    /* Muted legend under the broadcast Expression box (.expr-hint): the raw-CAN byte-naming note. */
+    .expr-hint {
         display: block;
         margin-top: 4px;
         color: #6b7280;
         font-size: 12px;
         line-height: 1.4;
     }
-    /* The preview shows raw byte indices -> monospace; empty text collapses it (:empty) so
-       it only occupies space when a translation actually happened. */
-    .expr-stored {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    }
-    .expr-stored:empty { display: none; }
 `;
 
 // Test results are shown two ways: a compact colored chip on the row (a persistent
@@ -864,11 +856,11 @@ function exprDataOffset(mode) {
     return identLen === undefined ? null : 2 + identLen / 2;   // always even -> integer offset. 01->3, 22->4; unknown->null
 }
 function abcToBn(expr, off) {                                   // friendly A/B/C -> stored Bn
-    if (off === null || off === undefined) return expr;
+    if (off == null) return expr;                              // exprDataOffset yields null | number
     return expr.replace(/\b([A-H])\b/g, (_, L) => 'B' + (off + L.charCodeAt(0) - 65));
 }
 function bnToAbc(expr, off) {                                   // stored Bn -> friendly A/B/C
-    if (off === null || off === undefined) return expr;
+    if (off == null) return expr;                              // exprDataOffset yields null | number
     return expr.replace(/B(\d+)/g, (tok, d) => {
         const k = parseInt(d, 10);
         // Only bytes that physically exist in the 8-byte response frame (B0..B7) get a
@@ -878,14 +870,16 @@ function bnToAbc(expr, off) {                                   // stored Bn -> 
         return (k >= off && k <= 7) ? String.fromCharCode(65 + k - off) : tok;
     });
 }
-// A stored expression is A/B/C-representable iff every byte ref sits in the data window
-// (bnToAbc leaves no raw B/S token behind) AND the forward map reproduces it exactly. The
-// round-trip check is what guarantees a friendly row saves byte-identically to its origin.
-function exprIsAbcCanonical(bnExpr, off) {
-    if (off === null || off === undefined) return false;
+// The friendly A/B/C form of a stored Bn expression, or null when it isn't A/B/C-representable
+// -- i.e. every byte ref sits in the data window (bnToAbc leaves no raw B/S token behind) AND
+// the forward map reproduces it exactly. That round-trip check is what guarantees a friendly
+// row saves byte-identically to its origin. Returning the string (not a bool) lets the caller
+// reuse it as the display value instead of translating a second time.
+function exprAsAbc(bnExpr, off) {
+    if (off == null) return null;
     const abc = bnToAbc(bnExpr, off);
-    if (/B\d/.test(abc) || /S\d/.test(abc)) return false;      // out-of-window byte or signed -> raw
-    return abcToBn(abc, off) === bnExpr;
+    if (/B\d/.test(abc) || /S\d/.test(abc)) return null;       // out-of-window byte or signed -> raw
+    return abcToBn(abc, off) === bnExpr ? abc : null;
 }
 // One-time normalization to the market arithmetic form (issue #61): rewrite the firmware's
 // compact unsigned big-endian range [Bx:By] into ((Bx*256^k)+...+By) -- the notation Torque /
@@ -917,18 +911,6 @@ function rowStoredExpr(entry) {
     const raw = entry.querySelector('.expression-input')?.value || '';
     if (entry.dataset.exprAbc !== '1') return raw;
     return rangeToArith(abcToBn(raw, exprDataOffset(entry.querySelector('.mode-select')?.value || '01')));
-}
-// Live "stored as <Bn>" preview under a friendly polled Expression: the exact bytes a Store
-// will write, repainted on input and on a Mode change. Blank (the :empty rule collapses it)
-// for raw rows, an empty box, or a value already in Bn, so it only appears when a
-// translation actually happened. textContent-only on a plain <div> in no store whitelist ->
-// never serialized, never dirties the form (same safety as .sample-every-hint).
-function renderExprPreview(entry) {
-    const prev = entry.querySelector('.expr-stored');
-    if (!prev) return;                             // custom-filter/calculated rows have none -> no-op
-    const field = (entry.querySelector('.expression-input')?.value || '').trim();
-    const bn = rowStoredExpr(entry).trim();
-    prev.textContent = (entry.dataset.exprAbc === '1' && field && bn !== field) ? ('stored as ' + bn) : '';
 }
 // Custom-filter rows read RAW broadcast frames: there is no ISO-TP framing to strip and no
 // SAE A/B/C convention for arbitrary CAN payloads, so bytes are referenced directly as Bn
@@ -991,7 +973,7 @@ function addCollapsibleRow(rowData = {}) {
                 <tr>
                     <td>Expression:</td>
                     <td><input type="text" class="expression-input" value="${safe(rowData.Expression || '')}"
-                        placeholder="Standard formula, e.g. ((A*256)+B)/4  (A B C D = data bytes)"><div class="expr-stored"></div></td>
+                        placeholder="Standard formula, e.g. ((A*256)+B)/4  (A B C D = data bytes)"></td>
                 </tr>
                 <tr>
                     <td>Unit:</td>
@@ -1129,31 +1111,32 @@ if (pidParsed) {
     pidInput.addEventListener('input', () => {
         const m = pidServiceMode(pidInput.value);
         modeSel.value = EXPRESSIBLE_MODES.includes(m) ? m : '01';
-        renderExprPreview(entry);   // legacy: modeSel.value set programmatically fires no 'change'
     });
 }
 // Standard-formula authoring (issue #61): show the stored Bn expression in the OBD A/B/C
 // vocabulary and translate it back on save. Only canonical PID rows qualify -- their Mode
 // (hence the data offset) is known and trustworthy; legacy/exotic PID shapes keep raw Bn.
 // A stored expression that dips into a framing byte or uses signed Sn also stays raw
-// (exprIsAbcCanonical false). Programmatic .value set fires no event -> dirties nothing.
+// (exprAsAbc null). Programmatic .value set fires no event -> dirties nothing.
 const exprInput = entry.querySelector('.expression-input');
 const exprOff0 = exprDataOffset(modeSel.value);
+const exprCanonical = entry.dataset.pidCanonical === '1' && exprInput;
 // Normalize the compact [Bx:By] range to the market arithmetic form BEFORE classifying, so a
 // bracket-form config migrates to ((Bx*256)+By) and displays like Torque/OBD-Fusion. Only a
 // canonical PID row is a migration candidate; a non-canonical row keeps its box verbatim.
-const exprStored0 = (entry.dataset.pidCanonical === '1' && exprInput) ? rangeToArith(exprInput.value) : '';
-if (entry.dataset.pidCanonical === '1' && exprInput && exprIsAbcCanonical(exprStored0, exprOff0)) {
-    if (exprStored0) exprInput.value = bnToAbc(exprStored0, exprOff0);
+const exprStored0 = exprCanonical ? rangeToArith(exprInput.value) : '';
+// exprAsAbc returns the friendly string ('' for an empty box -- a NEW row is canonical from
+// birth, so it MUST stay exprAbc='1' or a later-typed A/B/C formula would be stored verbatim
+// and rejected by the firmware parser) or null when the stored expr can't be shown friendly.
+const exprFriendly0 = exprCanonical ? exprAsAbc(exprStored0, exprOff0) : null;
+if (exprFriendly0 !== null) {
+    exprInput.value = exprFriendly0;   // display the market A/B/C form; save re-derives Bn
     entry.dataset.exprAbc = '1';
 } else {
     entry.dataset.exprAbc = '0';
 }
-if (exprInput) exprInput.addEventListener('input', () => renderExprPreview(entry));
-// Repaint the "stored as" preview on a manual Mode change (off shifts B3<->B4) and once now
-// to reflect the loaded/derived Mode. Per-row, so safe here before the append below.
-modeSel.addEventListener('change', () => renderExprPreview(entry));
-renderExprPreview(entry);
+// No live preview: the friendly A/B/C stays in the box; rowStoredExpr() translates it back to
+// raw Bn (re-framing B3<->B4 against the row's CURRENT Mode) only at save/test time.
 
 // --- Sample Rate (per-PID sweep divisor, issue #29) -------------------------------
 const SAMPLE_PRESETS = ['0', '2', '4', '8', '16'];
