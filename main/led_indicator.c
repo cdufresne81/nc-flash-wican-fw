@@ -198,7 +198,13 @@ static void led_indicator_task(void *pvParameters)
                 phase_on = true;   // enter blink states visibly on
                 ind_paint(desired, phase_on);
             }
-            else if (desired == IND_FLASH_RED || desired == IND_DATALOG_BLUE)
+            // interrupt_wdt amplifier test: DATALOG_BLUE no longer software-blinks.
+            // The old ~26 ms toggle drove led_set_level() (3 i2c writes) ~38x/s ==
+            // ~115 i2c tx/s on the core-0 bus WHILE the SD writer is running --
+            // the co-tenant behind i2c_isr_handler_default in every crash. Holding
+            // solid blue takes LED i2c to ~0/s during logging. FLASH_RED keeps its
+            // software blink (it does not overlap the sustained SD-write path).
+            else if (desired == IND_FLASH_RED)
             {
                 phase_on = !phase_on;
                 ind_paint(desired, phase_on);
@@ -215,7 +221,9 @@ static void led_indicator_task(void *pvParameters)
         }
         // While blinking, the tick IS the half-period; rate changes from the
         // config getter take effect on the next toggle without a reprogram.
-        const bool fast_tick = (desired == IND_FLASH_RED || desired == IND_DATALOG_BLUE);
+        // DATALOG_BLUE is now steady (painted once on entry), so it uses the slow
+        // idle tick -- no per-tick i2c during logging.
+        const bool fast_tick = (desired == IND_FLASH_RED);
         vTaskDelay(pdMS_TO_TICKS(fast_tick ? rate_ms : LED_IND_TICK_MS));
     }
 }
