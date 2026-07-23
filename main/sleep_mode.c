@@ -1046,8 +1046,10 @@ void light_sleep_task(void *pvParameters)
         restart_tracker_state_t restart_tracker_state;
         if(restart_tracker_get_state(&restart_tracker_state) == ESP_OK)
         {
-            if(restart_tracker_state.unexpected_reset_count >=3 && battery_voltage < ERROR_VOLTAGE)
+            if(restart_tracker_state.unexpected_reset_count >=3 && battery_voltage < ERROR_VOLTAGE && current_state != STATE_SLEEPING)
             {
+                // Guard on !STATE_SLEEPING so this teardown runs once on entry, not every
+                // 2 s loop while voltage stays in the low band (#47).
                 current_state = STATE_SLEEPING;
                 gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
                 dev_status_clear_bits(DEV_AWAKE_BIT);
@@ -1077,10 +1079,13 @@ void light_sleep_task(void *pvParameters)
                 };
                 led_set_level(100, 0, 0);  // Set red color
                 led_set_pattern_ms(LED_RED, &breathing_pattern);
-                esp_light_sleep_start();
+                // Do NOT esp_light_sleep_start() here: no wakeup source is armed yet on
+                // this boot (esp_sleep_enable_timer_wakeup runs in the STATE_SLEEPING block
+                // below), so sleeping here would hang the device until a physical power
+                // cycle. Fall through to that block, which arms the 2 s timer first (#47).
             }
         }
-        if(current_state == STATE_SLEEPING) 
+        if(current_state == STATE_SLEEPING)
         {
             static wc_timer_t waketime = 0;
             ESP_LOGW(TAG, "Sleep...");
