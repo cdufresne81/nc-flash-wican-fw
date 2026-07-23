@@ -170,7 +170,7 @@ typedef struct _device_config
 	char csv_grid_hz[16];     // wide fixed-rate grid frequency, 1..100 Hz or "auto" (issue #23)
 	char csv_require_engine[16]; // gate CSV logging on engine running (ECU answering): "enable" | "disable"
 	char imu_threshold[16];
-	char led_blink_ms[16];    // LED activity-indicator blink half-period (ms), normalized at load to led_indicator_snap_rate_ms()'s table
+	char led_blink[16];       // activity-LED blink toggle: "enable" (default) blinks while active, "disable" holds a solid color
 	bool debug_enabled;
 }device_config_t;
 
@@ -231,9 +231,8 @@ int8_t config_server_get_sleep_time(uint32_t *sleep_time);
 int8_t config_server_get_wakeup_time(uint32_t *wakeup_time);
 wifi_security_t config_server_get_sta_security(void);
 int8_t config_server_get_csv_log(void);
-// LED indicator blink half-period in ms, always an entry of
-// led_indicator_snap_rate_ms()'s table (26-208 ms)
-int32_t config_server_get_led_blink_ms(void);
+// Activity-LED blink toggle: 1 = blink while active (default), 0 = solid color.
+int8_t config_server_get_led_blink_enabled(void);
 int8_t config_server_get_log_period(uint32_t *log_period);
 // Wide CSV (Task #11; always fixed-rate since issue #53): grid_hz writes *hz (1..100,
 // or 0 for the "auto" sentinel -- issue #23: grid tracks the measured poll sweep rate) and

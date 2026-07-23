@@ -204,7 +204,7 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"st
 										\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\
 										\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\
 								\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\
-										\"csv_log\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"csv_grid_hz\":\"10\",\"csv_require_engine\":\"enable\",\"led_blink_ms\":\"52\"}";
+										\"csv_log\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"csv_grid_hz\":\"10\",\"csv_require_engine\":\"enable\",\"led_blink\":\"enable\"}";
 
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"periodic_wakeup\":\"disable\",\"wakeup_interval\":\"5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
@@ -705,7 +705,7 @@ static esp_err_t index_handler(httpd_req_t *req)
 // (cached once into adc_task statics). Keep this list in lockstep with
 // docs/goal-live-reconfigure.md (exactly 20 keys).
 #define LIVE_APPLY_WHITELIST(X) \
-	X(led_blink_ms) \
+	X(led_blink) \
 	X(home_ssid) X(home_password) X(home_security) X(home_protocol) \
 	X(drive_ssid) X(drive_password) X(drive_security) X(drive_protocol) \
 	X(drive_connection_type) X(drive_mode_timeout) \
@@ -1449,7 +1449,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "csv_require_engine", device_config.csv_require_engine);
 	cJSON_AddStringToObject(root, "log_storage", device_config.log_storage);
 	cJSON_AddStringToObject(root, "imu_threshold", device_config.imu_threshold);
-	cJSON_AddStringToObject(root, "led_blink_ms", device_config.led_blink_ms);
+	cJSON_AddStringToObject(root, "led_blink", device_config.led_blink);
 	if(gpio_get_level(OBD_READY_PIN) == 1)
 	{
 		cJSON_AddStringToObject(root, "obd_chip_status", "Sleep");
@@ -2809,17 +2809,23 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	ESP_LOGI(TAG, "dst->log_period: %s", dst->log_period);
 	//*****
 
-	//***** led_blink_ms: single normalization point. Snapping garbage or legacy
-	//      values (e.g. the old 130-1040 hardware table) to the allowed table
-	//      here is what lets config_server_get_led_blink_ms() return the stored
-	//      value as-is.
-	key = cJSON_GetObjectItem(root,"led_blink_ms");
+	//***** Activity-LED blink toggle: anything not "enable"/"disable" coerces to
+	//      "enable" (default ON). An absent key (old NVS / first upgrade boot,
+	//      including the retired numeric led_blink_ms) also defaults ON.
+	key = cJSON_GetObjectItem(root,"led_blink");
+	if(key == 0 || key->valuestring == NULL)
 	{
-		int32_t ms = (key != 0 && key->valuestring != NULL) ? atoi(key->valuestring) : 52;
-		snprintf(dst->led_blink_ms, sizeof(dst->led_blink_ms),
-				 "%ld", (long)led_indicator_snap_rate_ms(ms));
+		strlcpy(dst->led_blink, "enable", sizeof(dst->led_blink));
 	}
-	ESP_LOGI(TAG, "dst->led_blink_ms: %s", dst->led_blink_ms);
+	else
+	{
+		strlcpy(dst->led_blink, key->valuestring, sizeof(dst->led_blink));
+	}
+	if(strcmp(dst->led_blink, "enable") != 0 && strcmp(dst->led_blink, "disable") != 0)
+	{
+		strlcpy(dst->led_blink, "enable", sizeof(dst->led_blink));
+	}
+	ESP_LOGI(TAG, "dst->led_blink: %s", dst->led_blink);
 	//*****
 
 	//***** Wide CSV (Task #11): csv_grid_hz. Garbage coerces to a safe default so a bad NVS
@@ -3541,10 +3547,11 @@ int8_t config_server_get_csv_log(void)
 	return -1;
 }
 
-int32_t config_server_get_led_blink_ms(void)
+int8_t config_server_get_led_blink_enabled(void)
 {
-	// Already normalized to led_indicator_snap_rate_ms()'s table at load time.
-	return atoi(device_config.led_blink_ms);
+	// Default ON: "disable" holds a solid activity color; "enable" or any other
+	// value blinks. Normalized to enable/disable at load time.
+	return (strcmp(device_config.led_blink, "disable") == 0) ? 0 : 1;
 }
 
 int8_t config_server_get_ap_auto_disable(void)
