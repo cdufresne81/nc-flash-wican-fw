@@ -1860,9 +1860,15 @@ function buildAutoTableJson() {
             if (pidData.Expression.length === 0 || pidData.Expression.length >= 64) {
                 throw new Error("Expression must not be empty and must be less than 64 characters");
             }
-            if (!/^\d+$/.test(pidData.Period) || (parseInt(pidData.Period) < 100 && parseInt(pidData.Period) != 0)) {
-                throw new Error("Period must be a number greater than 100");
-            }
+            // Period is deliberately NOT validated. It is a retired, hidden field (see the
+            // display:none row in the template and the Class+Period note above). The shipping
+            // product runs the POLL_LOG protocol, which reads Period NOWHERE -- poll_log sweeps
+            // every PID each pass. The only code that reads Period is the legacy AUTO_PID
+            // scheduler (a mutually-exclusive protocol slated for removal in #28), and it
+            // tolerates a blank value. A brand-new PID row is born with an empty Period the user
+            // can neither see nor fix, so the old "Period must be a number greater than 100"
+            // check made adding ANY polled PID impossible. The hidden input still round-trips an
+            // existing PID's stored value.
             // Sample Rate (issue #29). readSampleEvery returns NaN for a Custom field holding
             // anything that is not a bare non-negative decimal integer, so 4.5 / -2 / 1e3 / ""
             // all land here. Lower bound is 0 in code (0 and 1 are reachable only from the
