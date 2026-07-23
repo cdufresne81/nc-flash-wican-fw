@@ -413,6 +413,23 @@ const pidEntryStyles = `
         font-size: 12px;
         white-space: nowrap;
     }
+
+    /* Shared muted-hint styling: the broadcast legend (.expr-hint) and the polled
+       "stored as <Bn>" preview (.expr-stored, issue #61). */
+    .expr-hint,
+    .expr-stored {
+        display: block;
+        margin-top: 4px;
+        color: #6b7280;
+        font-size: 12px;
+        line-height: 1.4;
+    }
+    /* The preview shows raw byte indices -> monospace; empty text collapses it (:empty) so
+       it only occupies space when a translation actually happened. */
+    .expr-stored {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .expr-stored:empty { display: none; }
 `;
 
 // Test results are shown two ways: a compact colored chip on the row (a persistent
@@ -451,7 +468,7 @@ async function runPidTest(entry) {
     // handler intentionally ignores init/pid_init (fixed 0x7E0 addressing, no ELM AT setup),
     // and the Custom Initialisation row is hidden -- poll_log is the only protocol this fork runs.
     payload.pid = rowPidWire(entry);
-    payload.expr = entry.querySelector('.expression-input')?.value || '';
+    payload.expr = rowStoredExpr(entry);   // friendly A/B/C -> raw Bn the firmware evaluates (issue #61)
 
     buttonEl.disabled = true;
     resultEl.style.display = 'inline-flex';
@@ -825,6 +842,101 @@ function rowPidWire(entry) {
     return box;
 }
 
+// --- Standard-formula authoring for polled expressions (issue #61) -----------------
+// Polled expressions are AUTHORED in the standard OBD vocabulary -- data bytes A, B, C,
+// D... counted from the first DATA byte, exactly how SAE J1979 / Torque / OBD-Fusion PID
+// tables print a formula like ((A*256)+B)/4 -- and STORED as the firmware's raw Bn
+// indices, which include the ISO-TP framing (PCI + service/ident echo) that sits in front
+// of the data. The two are related by the Mode's data offset off = 2 + ident_bytes
+// (B3 for Mode 01, B4 for Mode 22, DERIVED from MODE_IDENT_LEN so a new mode needs no
+// second table): A<->B{off}, B<->B{off+1}, ... The swap is a per-token EXACT inverse on
+// the standard subset, so a load->save of an unedited row reproduces the stored bytes
+// verbatim (the byte-identical round-trip the rest of the editor guards). Only A-H are
+// data-byte letters and 'B' is one ONLY when not followed by a digit, so raw Bn / Sn / V /
+// numbers pass through untouched (\b keeps `B3` a byte token, never a bare data-byte B).
+// An expression that reaches a framing byte, an OUT-OF-FRAME byte (B8+; poll_log evaluates a
+// single 8-byte frame), or uses signed Sn has no clean letter form and stays in RAW Bn --
+// the same canonical-vs-legacy split #31 uses for exotic PIDs, and gated on pidCanonical so
+// the offset (hence the whole translation) is trusted only where the Mode is known. Nothing
+// here changes the stored schema or what the firmware evaluates.
+function exprDataOffset(mode) {
+    const identLen = MODE_IDENT_LEN[mode];                     // hex chars of a whole-byte ident,
+    return identLen === undefined ? null : 2 + identLen / 2;   // always even -> integer offset. 01->3, 22->4; unknown->null
+}
+function abcToBn(expr, off) {                                   // friendly A/B/C -> stored Bn
+    if (off === null || off === undefined) return expr;
+    return expr.replace(/\b([A-H])\b/g, (_, L) => 'B' + (off + L.charCodeAt(0) - 65));
+}
+function bnToAbc(expr, off) {                                   // stored Bn -> friendly A/B/C
+    if (off === null || off === undefined) return expr;
+    return expr.replace(/B(\d+)/g, (tok, d) => {
+        const k = parseInt(d, 10);
+        // Only bytes that physically exist in the 8-byte response frame (B0..B7) get a
+        // letter. poll_log evaluates a single frame (poll_log.c: "always an 8-byte OBD
+        // frame", no multi-frame reassembly), so B8+ is out of frame -- leave it raw rather
+        // than prettify it into a name that would mask the out-of-bounds read.
+        return (k >= off && k <= 7) ? String.fromCharCode(65 + k - off) : tok;
+    });
+}
+// A stored expression is A/B/C-representable iff every byte ref sits in the data window
+// (bnToAbc leaves no raw B/S token behind) AND the forward map reproduces it exactly. The
+// round-trip check is what guarantees a friendly row saves byte-identically to its origin.
+function exprIsAbcCanonical(bnExpr, off) {
+    if (off === null || off === undefined) return false;
+    const abc = bnToAbc(bnExpr, off);
+    if (/B\d/.test(abc) || /S\d/.test(abc)) return false;      // out-of-window byte or signed -> raw
+    return abcToBn(abc, off) === bnExpr;
+}
+// One-time normalization to the market arithmetic form (issue #61): rewrite the firmware's
+// compact unsigned big-endian range [Bx:By] into ((Bx*256^k)+...+By) -- the notation Torque /
+// OBD-Fusion / SAE PID tables use -- so the friendly view reads ((A*256)+B)/4 rather than
+// [A:B]/4. Applied only where a row is shown friendly, so it touches exactly the A/B/C rows.
+// Signed [Sx:Sy] (different sign-extending assembly) and ranges wider than 4 bytes (uint32 is
+// the exact-in-double range) are left compact. The VALUE is unchanged: evaluate_expression
+// computes [Bx:By] and the polynomial identically for byte data. Idempotent (no [..] left to
+// convert on a second pass), so a migrated config then round-trips byte-identically.
+function rangeToArith(expr) {
+    return String(expr).replace(/\[B(\d+):B(\d+)\]/g, (m, aStr, bStr) => {
+        const a = parseInt(aStr, 10), b = parseInt(bStr, 10);
+        const n = b - a + 1;
+        if (b < a || n > 4) return m;                  // invalid or too wide -> keep compact
+        if (n === 1) return 'B' + a;                   // a 1-byte range is just the byte
+        const terms = [];
+        for (let j = a; j <= b; j++) {                 // big-endian: highest byte gets the largest weight
+            const shift = b - j;
+            terms.push(shift === 0 ? ('B' + j) : ('(B' + j + '*' + Math.pow(256, shift) + ')'));
+        }
+        return '(' + terms.join('+') + ')';
+    });
+}
+// The stored/firmware Bn expression for a polled row: friendly rows (exprAbc='1') translate
+// A/B/C back to Bn against the row's CURRENT Mode offset (so flipping Mode 01<->22 re-frames
+// B3<->B4 on its own) and normalize any typed range to arithmetic; raw rows -- and every
+// non-canonical PID -- store the box verbatim.
+function rowStoredExpr(entry) {
+    const raw = entry.querySelector('.expression-input')?.value || '';
+    if (entry.dataset.exprAbc !== '1') return raw;
+    return rangeToArith(abcToBn(raw, exprDataOffset(entry.querySelector('.mode-select')?.value || '01')));
+}
+// Live "stored as <Bn>" preview under a friendly polled Expression: the exact bytes a Store
+// will write, repainted on input and on a Mode change. Blank (the :empty rule collapses it)
+// for raw rows, an empty box, or a value already in Bn, so it only appears when a
+// translation actually happened. textContent-only on a plain <div> in no store whitelist ->
+// never serialized, never dirties the form (same safety as .sample-every-hint).
+function renderExprPreview(entry) {
+    const prev = entry.querySelector('.expr-stored');
+    if (!prev) return;                             // custom-filter/calculated rows have none -> no-op
+    const field = (entry.querySelector('.expression-input')?.value || '').trim();
+    const bn = rowStoredExpr(entry).trim();
+    prev.textContent = (entry.dataset.exprAbc === '1' && field && bn !== field) ? ('stored as ' + bn) : '';
+}
+// Custom-filter rows read RAW broadcast frames: there is no ISO-TP framing to strip and no
+// SAE A/B/C convention for arbitrary CAN payloads, so bytes are referenced directly as Bn
+// (that IS the mainstream notation for raw CAN). A fixed clarifying label, no translation.
+const EXPR_HINT_BROADCAST = 'Raw broadcast frame - no OBD framing to strip, so the CAN '
+    + 'payload starts at B0. Reference bytes directly (B0 B1 B2 ...); e.g. a 16-bit '
+    + 'big-endian value is [B0:B1]. The A/B/C data-byte names apply to polled PIDs only.';
+
 function addCollapsibleRow(rowData = {}) {
     const container = document.querySelector('.pid-entries');
     const entry = document.createElement('div');
@@ -879,7 +991,7 @@ function addCollapsibleRow(rowData = {}) {
                 <tr>
                     <td>Expression:</td>
                     <td><input type="text" class="expression-input" value="${safe(rowData.Expression || '')}"
-                        placeholder="Enter expression"></td>
+                        placeholder="Standard formula, e.g. ((A*256)+B)/4  (A B C D = data bytes)"><div class="expr-stored"></div></td>
                 </tr>
                 <tr>
                     <td>Unit:</td>
@@ -1017,8 +1129,31 @@ if (pidParsed) {
     pidInput.addEventListener('input', () => {
         const m = pidServiceMode(pidInput.value);
         modeSel.value = EXPRESSIBLE_MODES.includes(m) ? m : '01';
+        renderExprPreview(entry);   // legacy: modeSel.value set programmatically fires no 'change'
     });
 }
+// Standard-formula authoring (issue #61): show the stored Bn expression in the OBD A/B/C
+// vocabulary and translate it back on save. Only canonical PID rows qualify -- their Mode
+// (hence the data offset) is known and trustworthy; legacy/exotic PID shapes keep raw Bn.
+// A stored expression that dips into a framing byte or uses signed Sn also stays raw
+// (exprIsAbcCanonical false). Programmatic .value set fires no event -> dirties nothing.
+const exprInput = entry.querySelector('.expression-input');
+const exprOff0 = exprDataOffset(modeSel.value);
+// Normalize the compact [Bx:By] range to the market arithmetic form BEFORE classifying, so a
+// bracket-form config migrates to ((Bx*256)+By) and displays like Torque/OBD-Fusion. Only a
+// canonical PID row is a migration candidate; a non-canonical row keeps its box verbatim.
+const exprStored0 = (entry.dataset.pidCanonical === '1' && exprInput) ? rangeToArith(exprInput.value) : '';
+if (entry.dataset.pidCanonical === '1' && exprInput && exprIsAbcCanonical(exprStored0, exprOff0)) {
+    if (exprStored0) exprInput.value = bnToAbc(exprStored0, exprOff0);
+    entry.dataset.exprAbc = '1';
+} else {
+    entry.dataset.exprAbc = '0';
+}
+if (exprInput) exprInput.addEventListener('input', () => renderExprPreview(entry));
+// Repaint the "stored as" preview on a manual Mode change (off shifts B3<->B4) and once now
+// to reflect the loaded/derived Mode. Per-row, so safe here before the append below.
+modeSel.addEventListener('change', () => renderExprPreview(entry));
+renderExprPreview(entry);
 
 // --- Sample Rate (per-PID sweep divisor, issue #29) -------------------------------
 const SAMPLE_PRESETS = ['0', '2', '4', '8', '16'];
@@ -1132,7 +1267,7 @@ function addCustomCanFilterEntry(rowData = {}) {
                 </tr>
                 <tr>
                     <td>Expression:</td>
-                    <td><input type="text" class="expression-input" value="${safe(p.expression)}" placeholder="Expression"></td>
+                    <td><input type="text" class="expression-input" value="${safe(p.expression)}" placeholder="Expression"><div class="expr-hint"></div></td>
                 </tr>
                 <tr>
                     <td>Unit:</td>
@@ -1180,6 +1315,11 @@ function addCustomCanFilterEntry(rowData = {}) {
     const content = entry.querySelector('.pid-content');
     const titleEl = entry.querySelector('.pid-title');
     const enabledChk = entry.querySelector('.enabled-chk');
+
+    // Byte-offset legend (issue #61): custom filters evaluate RAW broadcast frames (no
+    // ISO-TP framing), so data always starts at B0 -- static, no Mode to react to.
+    const exprHint = entry.querySelector('.expr-hint');
+    if (exprHint) exprHint.textContent = EXPR_HINT_BROADCAST;
 
     if (enabledChk) {
         enabledChk.addEventListener('click', (e) => e.stopPropagation());
@@ -1711,7 +1851,7 @@ function buildAutoTableJson() {
                 Name: rowName,
                 Mode: modeStored,
                 PID: pidStored,
-                Expression: entry.querySelector('.expression-input')?.value || '',
+                Expression: rowStoredExpr(entry),   // friendly A/B/C -> stored Bn (issue #61)
                 Unit: entry.querySelector('.unit-input')?.value || '',
                 Class: entry.querySelector('.class-input')?.value || '',
                 MinValue: entry.querySelector('.min-value-input')?.value || '',
