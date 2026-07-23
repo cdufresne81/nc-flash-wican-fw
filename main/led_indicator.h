@@ -55,12 +55,6 @@ void led_indicator_init(void);
 void led_indicator_suspend(void);
 void led_indicator_resume(void);
 
-// Snap a blink half-period (ms) to the nearest entry of the allowed table
-// (26–208 ms, ~19 Hz to ~2.4 Hz — see led_indicator.c for the values and why).
-// config_server_load_cfg() normalizes the stored led_blink_ms with this once;
-// the table is mirrored by LED_BLINK_STEPS in main/web/src/main.js.
-int32_t led_indicator_snap_rate_ms(int32_t ms);
-
 // Current indicator state for /check_status:
 // "flash_red" | "datalog_blue" | "idle" | "deferred"
 const char *led_indicator_get_state_str(void);

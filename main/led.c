@@ -251,6 +251,48 @@ esp_err_t led_fast_blink(led_color_t color, uint8_t brightness, bool enable)
     }
 }
 
+/*
+ * Program the BLUE channel to blink autonomously on the AW2023 pattern engine.
+ *
+ * Written ONCE, then the chip blinks with ZERO further i2c until the pattern is
+ * disabled. This is the interrupt_wdt fix for the datalog "logging active"
+ * indicator: the old software blink drove led_set_level() (3 i2c writes) every
+ * ~26 ms == ~115 tx/s on the shared core-0 bus while the SD writer ran, stacking
+ * an i2c bus-hold onto the sdmmc ISR critical section past the 300 ms INT_WDT.
+ * 0 sustained tx/s is the only bench-proven-safe level, and the pattern engine
+ * hits it exactly.
+ *
+ * Timing: 130 ms is the smallest non-zero AW2023 time slot (AW2023_TIME_MAP[1]).
+ * BOTH the on phase (T2/hold) AND the off phase (T4/off) MUST be non-zero: with
+ * off=0 the engine re-triggers the on phase immediately and the LED reads SOLID
+ * -- exactly the led_fast_blink() trap (off_time_ms=0 above). 130 on / 130 off
+ * = 260 ms period = 3.85 Hz, 50% duty: a clear on/off blink.
+ *
+ * PWM is the peak the engine modulates to (0 <-> PWM2), so blue MUST be armed
+ * via led_set_level BEFORE MD is set -- otherwise the first lit phase runs at a
+ * stale/zero PWM2. led_set_pattern_ms sets MD last, so this ordering guarantees
+ * the first cycle is already blue at `brightness`. Red/green forced to 0.
+ *
+ * Caller must have cleared any live BLUE pattern first (led_disable_pattern) so
+ * MD makes a real 0->1 edge and the cycle starts at the beginning of a phase.
+ */
+esp_err_t led_datalog_blink_hw(uint8_t brightness)
+{
+    const led_pattern_ms_t blink = {
+        .rise_time_ms  = 0,     // T1 = 0   : instant on (square edge)
+        .hold_time_ms  = 130,   // T2 = 130 : LIT phase
+        .fall_time_ms  = 0,     // T3 = 0   : instant off (square edge)
+        .off_time_ms   = 130,   // T4 = 130 : DARK phase -> makes it a real blink
+        .delay_time_ms = 0,     // T0 = 0   : start immediately
+        .repeat_times  = 0,     // 0        : repeat forever
+    };
+
+    esp_err_t ret = led_set_level(0, 0, brightness);   // arm PWM2 peak BEFORE MD
+    if (ret != ESP_OK) return ret;
+
+    return led_set_pattern_ms(LED_BLUE, &blink);       // sets MD last -> engine runs
+}
+
 esp_err_t led_enable_fade(led_color_t color, bool fade_in, bool fade_out)
 {
     if ((uint8_t)color > LED_BLUE) return ESP_ERR_INVALID_ARG;

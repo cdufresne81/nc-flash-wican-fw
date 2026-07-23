@@ -58,6 +58,9 @@ esp_err_t led_set_max_current(led_current_t current);
 esp_err_t led_set_pattern_ms(led_color_t color, const led_pattern_ms_t *pattern_ms);
 esp_err_t led_disable_pattern(led_color_t color);
 esp_err_t led_fast_blink(led_color_t color, uint8_t brightness, bool enable);
+// Autonomous blue blink on the AW2023 pattern engine: program once, then the
+// chip blinks with ZERO further i2c (the interrupt_wdt datalog-LED fix).
+esp_err_t led_datalog_blink_hw(uint8_t brightness);
 
 // Effect control functions
 esp_err_t led_enable_fade(led_color_t color, bool fade_in, bool fade_out);

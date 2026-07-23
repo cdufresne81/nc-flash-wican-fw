@@ -73,6 +73,7 @@ set(requires
     wican_common
     restart_tracker
     event_log
+    crash_report
 )
 
 # Register the component

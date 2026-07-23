@@ -26,7 +26,7 @@ Two independent mechanisms, one honest HTTP/UI contract.
 
 ### A. `config.json` Category-B live-apply — *seed-from-live shadow → whitelist probe → reboot dominates → cache refresh*
 
-Reuse the **real boot parser** so a live apply is byte-for-byte reboot-equivalent (inherits every coercion: led snap `config_server.c:2675`, batt_alert force-disable `:2278`, home_/drive_ defaults `:2489-2597`, sta_fallbacks reset `:2027`).
+Reuse the **real boot parser** so a live apply is byte-for-byte reboot-equivalent (inherits every coercion: led_blink enable/disable coerce `config_server.c:2816`, batt_alert force-disable `:2278`, home_/drive_ defaults `:2489-2597`, sta_fallbacks reset `:2027`).
 
 - **STEP 0 (prereq, mechanical, highest-risk):** extract `static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)` from `config_server_load_cfg()` (`config_server.c:2016`). Every `device_config.X` → `dst->X`; the two error labels (`:2850-2882`) **return false** instead of unlink/restore-default/reboot. Boot caller (`:3035`) wraps it: `if(!config_server_parse_cfg_into(&device_config, buf)){ <old restore-default+reboot body> }`. No parse-logic change. ⟢ *Verified as the doc's highest risk — a single missed `device_config.X → dst->X` substitution corrupts the diff; criterion 2 makes the omission grep-detectable.*
 - **STEP 1:** in `store_config_handler` keep recv/validate/ap_ssid-check/file-write (`:727–836`). **Do not reboot yet.**
@@ -35,13 +35,13 @@ Reuse the **real boot parser** so a live apply is byte-for-byte reboot-equivalen
 - **STEP 4 (reboot path):** if `reboot_needed` → `free(shadow); free(probe);` reboot exactly as today (`config_server.c:844`), touch **no** RAM, respond `{reboot:true, applied:"reboot", msg:"Configuration saved. Rebooting to apply."}`.
 - **STEP 5 (no-reboot apply):** for each whitelisted field, `memcpy(&device_config.W, &shadow->W, sizeof device_config.W)` (field-width only — **never** whole-struct memcpy: that rewrites reboot fields and transiently zeroes `sta_fallbacks` at `:2027`). Then do STEP 6. `free(shadow); free(probe); free(buf);` respond `{reboot:false, applied:"live", msg:"Configuration applied (no reboot)."}` without arming the reboot timer.
 - **STEP 6 (⟢ MUST-FIX 3 — refresh the raw-string cache):** the no-reboot path MUST also replace the global `device_config_file` (`config_server.c:119`), the cached raw JSON that `/load_config` serves verbatim (`:899-905`) and that the status JSON re-parses (`:3570`). Without this, the UI's post-save page reload (`main.js:2164`) repopulates the form from the **stale** cache and `loadedPassthrough` (`main.js:2094`) re-sends the OLD values, so the **next Submit reverts the live-applied change**. Replace the cache with the freshly written config bytes (the buffer already validated/written in STEP 1). httpd handlers serialize on one server task, so a `char *old = device_config_file; device_config_file = new; free(old);` swap is safe here.
-- **STEP 7 (kick):** none — every whitelisted consumer already re-reads: LED task each loop (`led_indicator.c:158`), smartconnect per transition (`smartconnect.c:175/184/627-643`), batt-alert creds/protocol when an alert fires (`sleep_mode.c:471/479`).
+- **STEP 7 (kick):** none — every whitelisted consumer already re-reads: LED task each loop (`led_indicator.c:155`), smartconnect per transition (`smartconnect.c:175/184/627-643`), batt-alert creds/protocol when an alert fires (`sleep_mode.c:471/479`).
 
-**LIVE whitelist (20 keys):** `led_blink_ms`; `home_ssid/home_password/home_security/home_protocol`; `drive_ssid/drive_password/drive_security/drive_protocol/drive_connection_type/drive_mode_timeout`; `batt_alert/batt_alert_protocol/batt_alert_ssid/batt_alert_pass/batt_alert_url/batt_alert_port/batt_alert_topic/batt_mqtt_user/batt_mqtt_pass`. ⟢ *`batt_alert_protocol` added for consistency (read live at alert-fire like the other creds). `batt_alert` (master) is inert — the parser force-disables it (`config_server.c:2278`) so it can never diff; harmless to keep listed, never applied.*
+**LIVE whitelist (20 keys):** `led_blink`; `home_ssid/home_password/home_security/home_protocol`; `drive_ssid/drive_password/drive_security/drive_protocol/drive_connection_type/drive_mode_timeout`; `batt_alert/batt_alert_protocol/batt_alert_ssid/batt_alert_pass/batt_alert_url/batt_alert_port/batt_alert_topic/batt_mqtt_user/batt_mqtt_pass`. ⟢ *`batt_alert_protocol` added for consistency (read live at alert-fire like the other creds). `batt_alert` (master) is inert — the parser force-disables it (`config_server.c:2278`) so it can never diff; harmless to keep listed, never applied.*
 
 **Deliberately EXCLUDED (stay reboot-required):** `batt_alert_volt`, `batt_alert_time` — cached once into `adc_task` statics (`sleep_mode.c:321-332`), so a RAM update would be a silent no-op; a change to either forces a reboot (safe). Pre-existing inertness, not fixed here.
 
-**Concurrency:** `device_config` is a lock-free file-scope static; ⟢ *confirmed all 20 whitelisted fields are fixed `char[]` (`config_server.h:110-158`) and `device_config_t` contains no pointers* → a torn read is bounded and self-healing (one wrong LED half-period / one retried connect), never dangling. Accept eventual consistency (matches existing posture).
+**Concurrency:** `device_config` is a lock-free file-scope static; ⟢ *confirmed all 20 whitelisted fields are fixed `char[]` (`config_server.h:110-158`) and `device_config_t` contains no pointers* → a torn read is bounded and self-healing (one wrong LED blink toggle / one retried connect), never dangling. Accept eventual consistency (matches existing posture).
 
 ### B. `auto_pid.json` PID-table hot-swap — *safe-point ownership + fully-hoisted mutex + file mutex (in-task RCU)*
 
@@ -138,7 +138,7 @@ Each check is a `grep`/`git diff`/`idf.py build` the implementing session runs a
 ## 5. Manual verification checklist (OUTSIDE the /goal condition — needs hardware/eyes)
 
 Run on the bench OBD-PRO after OTA (see MEMORY `wican-test-device` for the address/flow):
-- [ ] `POST /store_config` changing **only** `led_blink_ms` → device does **not** reboot (connection stays up); LED blink rate visibly changes within one half-period.
+- [ ] `POST /store_config` changing **only** `led_blink` → device does **not** reboot (connection stays up); the activity LED switches between blinking and solid within one indicator tick.
 - [ ] After that live apply, **reload the page and click Submit without changing anything** → the led value is **retained** (proves the `device_config_file` cache refresh; regression guard for MUST-FIX 3).
 - [ ] `POST /store_config` changing a reboot key (e.g. `can_datarate`) → device **does** reboot; change applied after reconnect.
 - [ ] Engine OFF / no trip: `POST /store_auto_data` with an edited table → reply `"live"`, no reboot; the **next** trip's CSV wide header reflects the new channels.

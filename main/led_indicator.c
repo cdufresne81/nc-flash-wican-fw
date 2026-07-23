@@ -38,6 +38,10 @@
 #define LED_IND_RED_HOLD_US     (1500LL * 1000LL)
 #define LED_IND_RED_BRIGHTNESS  255
 #define LED_IND_BLUE_BRIGHTNESS 200
+// Red flash-activity software-blink half-period (ms) when blinking is enabled.
+// Blue datalog uses the AW2023 hardware pattern instead (zero i2c); only this
+// short-lived red blink is still software-timed on the RTOS tick.
+#define LED_IND_FLASH_BLINK_MS  52
 
 typedef enum {
     IND_UNKNOWN = 0,   // pre-first-paint; forces an initial repaint
@@ -53,28 +57,6 @@ static volatile ind_state_t s_state = IND_UNKNOWN;
 // Guarded by s_paint_mutex once it exists; boot-time calls before init are
 // single-task.
 static volatile int8_t s_suspend_count = 0;
-
-// The allowed software-blink half-periods, ~19 Hz to ~2.4 Hz. The AW2023
-// pattern engine bottoms out at 130 ms per phase, so the blink is timed in
-// led_indicator_task (1 kHz RTOS tick) and the chip is driven as plain PWM —
-// that is what allows rates the hardware time table cannot express. This
-// table is mirrored by LED_BLINK_STEPS in main/web/src/main.js.
-int32_t led_indicator_snap_rate_ms(int32_t ms)
-{
-    static const int32_t allowed[] = {26, 52, 76, 102, 154, 208};
-    int32_t best = allowed[0];
-    int32_t best_diff = (ms > best) ? (ms - best) : (best - ms);
-    for (size_t i = 1; i < sizeof(allowed)/sizeof(allowed[0]); i++)
-    {
-        int32_t diff = (ms > allowed[i]) ? (ms - allowed[i]) : (allowed[i] - ms);
-        if (diff < best_diff)
-        {
-            best_diff = diff;
-            best = allowed[i];
-        }
-    }
-    return best;
-}
 
 static const char *ind_state_str(ind_state_t st)
 {
@@ -97,13 +79,25 @@ void led_indicator_suspend(void)
 {
     if (s_paint_mutex == NULL)
     {
-        // Pre-init (boot-time MIC update): no task is painting yet.
+        // Pre-init (boot-time MIC update): no task is painting yet, and the LED
+        // i2c may not be up -- do not touch it here.
         s_suspend_count++;
         return;
     }
     // Blocks until any in-progress repaint finished; after this returns the
     // indicator task will not touch the LED until led_indicator_resume().
     xSemaphoreTake(s_paint_mutex, portMAX_DELAY);
+    if (s_suspend_count == 0)
+    {
+        // Outermost suspend: hand a clean LED to the foreign owner. If we were in
+        // DATALOG_BLUE the AW2023 is still blinking blue autonomously (MD bit),
+        // and the task will NOT clear it because it stops painting in DEFERRED.
+        // Tear down both channels' patterns now -- one-time ~4 tx at handoff, off
+        // the sustained SD path. Restores the invariant that held for free when
+        // DATALOG_BLUE was a solid/software state.
+        led_disable_pattern(LED_RED);
+        led_disable_pattern(LED_BLUE);
+    }
     s_suspend_count++;
     xSemaphoreGive(s_paint_mutex);
 }
@@ -147,6 +141,9 @@ static void led_indicator_task(void *pvParameters)
 {
     int64_t red_hold_until_us = 0;
     bool phase_on = false;
+    // Tracks whether the last paint used the blink form, so a live led_blink
+    // toggle is honored even when the indicator state itself doesn't change.
+    bool blink_applied = false;
 
     for (;;)
     {
@@ -154,8 +151,8 @@ static void led_indicator_task(void *pvParameters)
         // the sleep paths additionally suspend() before writing the LED off.
         dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
 
-        // Already normalized to the allowed table by config_server_load_cfg.
-        const uint32_t rate_ms = (uint32_t)config_server_get_led_blink_ms();
+        // Live-apply toggle: enable = blink while active, disable = solid color.
+        const bool blink_on = (config_server_get_led_blink_enabled() != 0);
 
         // Decide and paint under the mutex: once led_indicator_suspend()
         // returns, this task must not touch the LED. The predicates are all
@@ -188,17 +185,40 @@ static void led_indicator_task(void *pvParameters)
         // suspend() hook — never paint over a LED the sleep code turned off.
         if (desired != IND_DEFERRED && dev_status_is_awake())
         {
-            if (desired != s_state)
+            // Repaint on a state change OR a live blink-toggle change.
+            if (desired != s_state || blink_on != blink_applied)
             {
                 // The MD (pattern-mode) bit survives led_set_level: clear both
                 // channels' patterns when (re)taking the LED so a leftover
-                // hardware pattern can't fight the software blink.
+                // hardware pattern can't fight a software blink or a solid state.
+                // This also guarantees MD makes a real 0->1 edge below.
                 led_disable_pattern(LED_RED);
                 led_disable_pattern(LED_BLUE);
-                phase_on = true;   // enter blink states visibly on
-                ind_paint(desired, phase_on);
+                phase_on = true;   // enter software-blink states visibly on
+                if (desired == IND_DATALOG_BLUE && blink_on)
+                {
+                    // interrupt_wdt fix: hand the "logging active" blink to the
+                    // AW2023 pattern engine. Programmed ONCE here; the chip then
+                    // blinks blue (~3.85 Hz) on its own with ZERO i2c for the
+                    // whole sustained state, so nothing co-tenants the core-0
+                    // SD-write path. (A software toggle here drove ~115 i2c tx/s
+                    // and starved the tick past INT_WDT; 0 tx/s is the only
+                    // bench-proven-safe level.)
+                    led_datalog_blink_hw(LED_IND_BLUE_BRIGHTNESS);
+                }
+                else
+                {
+                    // Solid: idle, blink-disabled datalog blue, or the "on" phase
+                    // of the red flash blink. One-shot write, then no further i2c.
+                    ind_paint(desired, phase_on);
+                }
+                blink_applied = blink_on;
             }
-            else if (desired == IND_FLASH_RED || desired == IND_DATALOG_BLUE)
+            // FLASH_RED keeps its software blink while enabled -- short-lived and
+            // never overlaps the sustained SD-write path the WDT amplifier needs.
+            // DATALOG_BLUE (== s_state, blink unchanged) deliberately falls
+            // through with NO i2c -- its hardware pattern / solid paint still holds.
+            else if (desired == IND_FLASH_RED && blink_on)
             {
                 phase_on = !phase_on;
                 ind_paint(desired, phase_on);
@@ -210,13 +230,15 @@ static void led_indicator_task(void *pvParameters)
 
         if (desired != prev)
         {
-            ESP_LOGI(TAG, "state %s -> %s (rate %lums)",
-                     ind_state_str(prev), ind_state_str(desired), (unsigned long)rate_ms);
+            ESP_LOGI(TAG, "state %s -> %s (blink %s)",
+                     ind_state_str(prev), ind_state_str(desired),
+                     blink_on ? "on" : "off");
         }
-        // While blinking, the tick IS the half-period; rate changes from the
-        // config getter take effect on the next toggle without a reprogram.
-        const bool fast_tick = (desired == IND_FLASH_RED || desired == IND_DATALOG_BLUE);
-        vTaskDelay(pdMS_TO_TICKS(fast_tick ? rate_ms : LED_IND_TICK_MS));
+        // Only the red software blink needs the fast tick; every other state is
+        // painted once and idles on the slow tick -- no per-tick i2c during
+        // sustained logging.
+        const bool fast_tick = (desired == IND_FLASH_RED && blink_on);
+        vTaskDelay(pdMS_TO_TICKS(fast_tick ? LED_IND_FLASH_BLINK_MS : LED_IND_TICK_MS));
     }
 }
 
