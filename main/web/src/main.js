@@ -185,18 +185,8 @@ async function checkFirmwareUpdate() {
             }
 
             const data = await response.json();
-            const json = JSON.stringify(data, null, 2);
-            const blob = new Blob([json], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement('a');
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-
-            link.href = url;
-            link.download = `restart-history-${timestamp}.json`;
-            document.body.appendChild(link);
-            link.click();
-            link.remove();
-            URL.revokeObjectURL(url);
+            downloadTextFile(`restart-history-${timestamp}.json`, JSON.stringify(data, null, 2));
 
             showNotification('Restart history downloaded.', 'blue', 3000);
         } catch (error) {
@@ -875,10 +865,13 @@ function bnToAbc(expr, off) {                                   // stored Bn -> 
 // the forward map reproduces it exactly. That round-trip check is what guarantees a friendly
 // row saves byte-identically to its origin. Returning the string (not a bool) lets the caller
 // reuse it as the display value instead of translating a second time.
+// "Still names a numbered byte" -- an out-of-window Bn or a signed Sn. One definition, used
+// both here and by the sensor-file importer to tell a wire expression from a friendly one.
+const exprHasWireByte = e => /B\d/.test(e) || /S\d/.test(e);
 function exprAsAbc(bnExpr, off) {
     if (off == null) return null;
     const abc = bnToAbc(bnExpr, off);
-    if (/B\d/.test(abc) || /S\d/.test(abc)) return null;       // out-of-window byte or signed -> raw
+    if (exprHasWireByte(abc)) return null;                     // out-of-window byte or signed -> raw
     return abcToBn(abc, off) === bnExpr ? abc : null;
 }
 // One-time normalization to the market arithmetic form (issue #61): rewrite the firmware's
@@ -1471,6 +1464,14 @@ function loadAutoTable(jsonData) {
         console.log("Raw jsonData:", jsonData);
         const data = jsonData;
 
+        // Reset polled PIDs UI to avoid duplicates: this loader REPLACES the tables, it
+        // never appends. Inert at page load (the container starts empty), but loading into
+        // a populated table is a real path for any caller that reloads the set (the sensor
+        // import, issue #63) -- without this, polled rows would append while the two
+        // containers below were replaced.
+        const pidContainer = document.querySelector('.pid-entries');
+        if (pidContainer) pidContainer.innerHTML = '';
+
         // Reset custom filters UI to avoid duplicates on reload
         const customFilterContainer = document.querySelector('.custom-canfilter-entries');
         if (customFilterContainer) customFilterContainer.innerHTML = '';
@@ -2006,6 +2007,424 @@ async function storeAutoTableData(skipIfUnchanged = false) {
         showNotification(error.message, "red");
         return false;
     }
+}
+
+// ---- Sensor-set file: Logger-scoped export / import (issue #63) -------------------
+// One file holding every sensor on this page -- polled PIDs, broadcast PIDs and
+// calculated channels -- so a tuned set can be backed up, shared, or moved to another
+// adapter. Deliberately NOT the System-tab whole-device backup: that one carries
+// config.json (Wi-Fi credentials included) and reboots on restore. File format and
+// round-trip rules: docs/internals/web_ui.md.
+const SENSORS_FILE_KIND = 'sensors';
+const SENSORS_FILE_VERSION = 1;
+// Period is inert under the Datalogger (only the legacy AutoPID scheduler gates on it), so
+// the file omits it and import restores this value -- what every shipped row carries, which
+// is what keeps an exported-then-imported config byte-identical to the stored one.
+const SENSORS_DEFAULT_PERIOD = '200';
+const SENSORS_DEFAULT_CLASS = 'none';   // both restored by the importer; see emitSensorsYaml
+// Set once /load_auto_pid has populated the page. Import refuses until then, because the
+// settings it passes through are read from the live DOM.
+var sensorsPageLoaded = false;
+
+// Blob -> browser download. Shared by the sensor export, the System-tab whole-device
+// downloadCfg(), and the Tactrix logcfg.txt exporter to come (issue #37).
+function downloadTextFile(filename, text, mime = 'application/json') {
+    const url = window.URL.createObjectURL(new Blob([text], { type: mime }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+}
+
+// Every string is quoted, every number and boolean bare. Consistency beats brevity in a
+// file people hand-edit: an unquoted "01" would silently become the integer 1, and an
+// unquoted % is a YAML directive marker.
+const yq = v => '"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+
+// A row is written in the friendly decomposed form ONLY when its wire string is canonical
+// AND carries the default one-response-frame hint. Anything else (exotic service, odd
+// shape, a non-default hint) keeps the full wire string, exactly as the UI does -- the
+// decomposed form has nowhere to put the difference, and guessing would corrupt the row.
+const sensorPidParts = wire => {
+    const p = parsePidText(wire);
+    return (p && p.hint === PID_HINT_DEFAULT) ? p : null;
+};
+
+// Renders what the Logger page SHOWS: Mode + bare identifier, and expressions in the
+// standard SAE J1979 / Torque A/B/C vocabulary (issue #61). Derived from
+// buildAutoTableJson() rather than re-read from the DOM, so the export runs the same
+// validation as Store -- an invalid row throws here instead of producing a file that
+// cannot be restored -- and so the friendly/raw decision uses the identical predicates
+// (parsePidText, exprAsAbc) the row builder used to decide what to display.
+//
+// Keys the Datalogger never reads are NOT written: Class (MQTT/HA metadata this firmware
+// never publishes), Period (only the legacy AutoPID scheduler gates on it; poll_log sweeps
+// every PID), initialisation / ecu_protocol (legacy ELM setup; poll_log hardcodes 0x7E0),
+// standard_pids / std_pids. Import restores them at their shipped defaults, so
+// auto_pid.json keeps its schema and existing configs still round-trip.
+//
+// class and period are dropped unconditionally, including the per-row values some configs
+// carry (class "temperature", period 1000 on a broadcast row). Writing them only when
+// non-default was considered and rejected: they change nothing the logger does, so carrying
+// them would add noise to every such row to preserve text nothing reads. They come back as
+// SENSORS_DEFAULT_CLASS / SENSORS_DEFAULT_PERIOD, and go for good with issue #28.
+function emitSensorsYaml() {
+    const stored = buildAutoTableJson();
+    const L = [
+        '# WiCAN sensor set',
+        '#',
+        '# Every sensor from the Logger page, written the way the page shows them: Mode plus',
+        '# PID identifier, and expressions in the standard OBD form where A is the FIRST DATA',
+        '# BYTE of the response (then B, C, ...). Sensors only -- no Wi-Fi credentials and no',
+        '# device settings.',
+        '#',
+        '# Load it back with Import Sensors on the Logger page, review the rows, press Store.',
+        '',
+        `wican: ${yq(SENSORS_FILE_KIND)}`,
+        `version: ${SENSORS_FILE_VERSION}`,
+        '',
+        '# ---- Polled PIDs ---------------------------------------------------------------',
+        '# Requested from the ECU every sweep. mode 01 = standard OBD-II, 22 = extended (DID).',
+        '# sample_every omitted means every sweep.',
+        'polled:'
+    ];
+    // One entry: a blank separator, then "- k: v" and aligned continuation lines. The row
+    // CONTENTS differ per section; the emit does not, so it lives in one place.
+    const emitEntry = (first, row) => {
+        if (!first) L.push('');
+        row.forEach(([k, v], j) => L.push((j ? '    ' : '  - ') + k + ': ' + v));
+    };
+
+    stored.pids.forEach((p, i) => {
+        const parts = sensorPidParts(p.PID);
+        const abc = parts ? exprAsAbc(p.Expression, exprDataOffset(parts.service)) : null;
+        const row = [['name', yq(p.Name)], ['mode', yq(parts ? parts.service : pidServiceMode(p.PID))],
+                     ['pid', yq(parts ? parts.ident : p.PID)],
+                     ['expression', yq(abc !== null ? abc : p.Expression)],
+                     ['unit', yq(p.Unit)]];
+        if (p.SampleEvery) row.push(['sample_every', p.SampleEvery]);
+        row.push(['enabled', p.enabled !== false]);
+        if (p.description) row.push(['description', yq(p.description)]);
+        if (p.comment) row.push(['comment', yq(p.comment)]);
+        if (p.MinValue) row.push(['min', yq(p.MinValue)]);
+        if (p.MaxValue) row.push(['max', yq(p.MaxValue)]);
+        emitEntry(i === 0, row);
+    });
+
+    L.push('', '# ---- Broadcast PIDs ------------------------------------------------------------',
+           '# Decoded from frames the bus already sends -- nothing is requested, so there is no',
+           '# request echo to skip and bytes are referenced directly as B0..B7.',
+           'broadcast:');
+    let n = 0;
+    (stored.can_filters || []).forEach(f => (f.parameters || []).forEach(prm => {
+        // formatFrameIdForUi is what the Frame ID box itself renders -- reuse it rather than
+        // hand-rolling a second hex formatter, which zero-padded to 3 digits and so wrote
+        // 0x0F0 where the page shows 0xF0.
+        const fid = (typeof f.frame_id === 'number') ? formatFrameIdForUi(f.frame_id)
+                                                     : yq(f.frame_id);
+        const row = [['frame_id', fid], ['name', yq(prm.name)],
+                     ['expression', yq(prm.expression)], ['unit', yq(prm.unit)],
+                     ['enabled', prm.enabled !== false]];
+        if (prm.description) row.push(['description', yq(prm.description)]);
+        if (prm.comment) row.push(['comment', yq(prm.comment)]);
+        if (prm.min) row.push(['min', yq(prm.min)]);
+        if (prm.max) row.push(['max', yq(prm.max)]);
+        emitEntry(n++ === 0, row);
+    }));
+
+    L.push('', '# ---- Calculated PIDs -----------------------------------------------------------',
+           '# Derived from other channels by name, evaluated after each sweep.',
+           'calculated:');
+    (stored.calculated || []).forEach((c, i) => {
+        emitEntry(i === 0, [['name', yq(c.name)], ['expression', yq(c.expression)],
+                            ['unit', yq(c.unit)], ['enabled', c.enabled !== false]]);
+    });
+    return L.join('\n') + '\n';
+}
+
+function exportSensors() {
+    try {
+        downloadTextFile(`wican_sensors_${new Date().toISOString().split('T')[0]}.yaml`,
+                         emitSensorsYaml(), 'text/yaml');
+        showNotification("Sensor set exported.", "green");
+    } catch (error) {
+        // Validation messages quote row names, which may have come from an imported file.
+        showNotification("Export failed: " + safe(error.message), "red");
+    }
+}
+
+function importSensors() {
+    const fileInput = document.getElementById('sensors_file');
+    const file = fileInput?.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        try {
+            applySensorsFile(e.target.result);
+        } catch (error) {
+            // safe(): showNotification assigns innerHTML, and parse errors quote the
+            // offending LINE back to the user. A shared sensor file is untrusted input --
+            // an unescaped <img onerror=...> in it would otherwise run script in the
+            // device's own origin, where /store_config and OTA live.
+            showNotification("Import failed: " + safe(error.message), "red");
+        }
+        fileInput.value = '';   // clear, or re-picking the same file fires no change event
+    };
+    reader.onerror = function() {
+        showNotification("Import failed: could not read that file.", "red");
+        fileInput.value = '';
+    };
+    reader.readAsText(file);
+}
+
+// Reads exactly the shape emitSensorsYaml() writes: top-level scalars plus three block
+// sequences of flat key/value maps. Deliberately NOT a general YAML implementation -- a
+// full parser is tens of KB in a main.js that ships uncompressed inside the firmware
+// image, and the constructs it would add (anchors, flow collections, multi-line scalars)
+// are ones this format never emits. Anything outside the shape is REJECTED with a line
+// number, because silently guessing at a hand edit would reshape someone's sensor set.
+const SENSORS_YAML_SECTIONS = ['polled', 'broadcast', 'calculated'];
+
+function parseSensorsScalar(text, lineNo) {
+    const fail = m => { throw new Error(`line ${lineNo}: ${m}`); };
+    if (text.startsWith('"')) {
+        let out = '', j = 1, closed = false;
+        while (j < text.length) {
+            if (text[j] === '\\' && j + 1 < text.length) { out += text[j + 1]; j += 2; continue; }
+            if (text[j] === '"') { closed = true; j++; break; }
+            out += text[j++];
+        }
+        if (!closed) fail('unterminated quoted value (missing closing ")');
+        const tail = text.slice(j).trim();
+        if (tail && !tail.startsWith('#')) fail(`unexpected text after the quoted value: ${tail}`);
+        return out;
+    }
+    const hash = text.indexOf(' #');
+    const v = (hash >= 0 ? text.slice(0, hash) : text).trim();
+    if (!v) fail('missing value');
+    if (v === 'true' || v === 'false') return v === 'true';
+    // 0x... is deliberately NOT coerced to a number here. Only the caller knows whether a
+    // hex token is a VALUE (frame_id 0x240 -> 576) or DIGITS (pid 0x16CD -> the identifier
+    // "16CD"); coercing centrally turned a hand-written `pid: 0x16CD` into 5837, whose
+    // decimal text "5837" then passed the 4-hex-digit test and polled the wrong DID.
+    if (/^-?\d+$/.test(v)) return parseInt(v, 10);
+    // No float branch: nothing this format emits is a bare decimal, and the only field a
+    // hand-written one reaches (min/max) is String()'d straight back -- parsing it would
+    // only rewrite "1.50" as "1.5". Bare strings pass through verbatim instead.
+    return v;   // bare string: tolerated on a hand edit even though we always quote
+}
+
+function parseSensorsYaml(text) {
+    const doc = {};
+    let list = null, item = null;
+    String(text).split(/\r\n|\r|\n/).forEach((raw, idx) => {
+        const lineNo = idx + 1;
+        const fail = m => { throw new Error(`line ${lineNo}: ${m}`); };
+        const line = raw.replace(/\s+$/, '');
+        if (!line.trim() || line.trim().startsWith('#')) return;
+        if (/^ *\t/.test(line)) fail('tab used for indentation -- YAML requires spaces');
+
+        const indent = line.length - line.trimStart().length;
+        let body = line.trim();
+        const isItem = body.startsWith('- ');
+        if (isItem) body = body.slice(2).trim();
+
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*:(.*)$/.exec(body);
+        if (!m) fail(`expected "key: value", got: ${body}`);
+        const key = m[1], rest = m[2].trim();
+
+        if (!isItem && indent === 0) {
+            // Last-wins would silently DISCARD everything under the first occurrence --
+            // exactly the "quietly reshape a sensor set" outcome this parser exists to
+            // prevent, and the likeliest way a hand edit loses rows (splitting the polled
+            // list into two blocks).
+            if (key in doc) fail(`"${key}" appears more than once at the top level`);
+            if (rest === '') {
+                if (!SENSORS_YAML_SECTIONS.includes(key)) {
+                    fail(`unknown section "${key}" (expected ${SENSORS_YAML_SECTIONS.join(', ')})`);
+                }
+                list = doc[key] = [];
+                item = null;
+            } else {
+                doc[key] = parseSensorsScalar(rest, lineNo);
+                list = null;
+                item = null;
+            }
+            return;
+        }
+        if (isItem) {
+            if (!list) fail('list entry outside any section');
+            item = {};
+            list.push(item);
+        } else if (!item) {
+            fail(`"${key}" is indented but not inside a list entry`);
+        } else if (key in item) {
+            fail(`"${key}" is set twice in the same entry`);
+        }
+        item[key] = parseSensorsScalar(rest, lineNo);
+    });
+    return doc;
+}
+
+// Every field the file may omit lands as the empty string; `undefined` must not reach the
+// row builders as the literal "undefined".
+const sTxt = v => v === undefined ? '' : String(v);
+
+// Rebuilds the auto_pid shape loadAutoTable() hydrates from, restoring at their shipped
+// defaults every key the file deliberately omits. The file is a VIEW of the sensor set,
+// not a copy of auto_pid.json, so the stored schema is reconstructed here rather than
+// carried around in the file where nobody can read it.
+function sensorsFileToAutoPid(doc) {
+    const pids = (doc.polled || []).map((r, i) => {
+        const where = r.name ? `polled PID "${r.name}"` : `polled PID #${i + 1}`;
+        if (!r.name) throw new Error(`${where} has no name.`);
+        // We always WRITE mode and pid quoted, but a hand editor may not. Two ways an
+        // unquoted edit arrives wrong, both fixed here rather than in the row builder:
+        //   `mode: 01` / `pid: 03`   -> YAML number 1 / 3, needing the leading zero back
+        //   `pid: 0x16CD`            -> hex DIGITS, not a value (the 0x form is natural
+        //                               here because frame_id in the same file uses it)
+        // Left unhandled, either silently fails the canonical test below and stores an
+        // untranslated wire string -- a wrong PID with no error anywhere.
+        const hexDigits = v => String(v).replace(/^0[xX]/, '');
+        const mode = hexDigits(r.mode === undefined ? '01' : r.mode).padStart(2, '0');
+        const identLen = MODE_IDENT_LEN[mode];
+        let pid = hexDigits(sTxt(r.pid));
+        if (identLen !== undefined && /^\d+$/.test(pid) && pid.length < identLen) {
+            pid = pid.padStart(identLen, '0');
+        }
+        // Decomposed only when the identifier is exactly the width this Mode declares;
+        // anything else is taken as a complete wire string, matching the export.
+        const canonical = identLen !== undefined && new RegExp(`^[0-9A-Fa-f]{${identLen}}$`).test(pid);
+        // An expression is already in wire form when a token names a numbered byte (B3, S2)
+        // -- friendly A/B/C names are single letters and can never look like that. Same
+        // predicate exprAsAbc uses to decide which rows may be shown friendly (issue #61).
+        const expr = sTxt(r.expression);
+        return {
+            Name: String(r.name),
+            PID: canonical ? composePidText(mode, pid, PID_HINT_DEFAULT) : pid,
+            Expression: (canonical && !exprHasWireByte(expr))
+                ? abcToBn(expr, exprDataOffset(mode)) : expr,
+            Unit: sTxt(r.unit),
+            Class: SENSORS_DEFAULT_CLASS,
+            MinValue: sTxt(r.min),
+            MaxValue: sTxt(r.max),
+            Period: SENSORS_DEFAULT_PERIOD,
+            SampleEvery: r.sample_every,
+            description: sTxt(r.description),
+            comment: sTxt(r.comment),
+            enabled: r.enabled !== false
+        };
+    });
+    // One group per row: loadAutoTable() builds one DOM row per parameter either way, and
+    // buildAutoTableJson() re-groups consecutive same-frame rows on Store, so the stored
+    // grouping is reproduced from row ORDER without this having to replicate that logic.
+    const can_filters = (doc.broadcast || []).map((r, i) => {
+        if (r.frame_id === undefined) throw new Error(`broadcast PID #${i + 1} has no frame_id.`);
+        // Same normalization the Frame ID box performs, so 0x240 / "0x240" / 240 / "7E8" all
+        // mean here exactly what they mean when typed into the UI. null (unparseable) falls
+        // through verbatim for the row builder to display and the user to correct.
+        const fid = normalizeFrameIdInputToNumber(r.frame_id);
+        return {
+            frame_id: fid === null ? r.frame_id : fid,
+            parameters: [{
+                name: sTxt(r.name),
+                expression: sTxt(r.expression),
+                unit: sTxt(r.unit),
+                class: SENSORS_DEFAULT_CLASS,
+                period: SENSORS_DEFAULT_PERIOD,
+                min: sTxt(r.min),
+                max: sTxt(r.max),
+                description: sTxt(r.description),
+                comment: sTxt(r.comment),
+                enabled: r.enabled !== false
+            }]
+        };
+    });
+    const calculated = (doc.calculated || []).map((r, i) => {
+        // buildAutoTableJson() silently skips an unnamed calculated row, so an unnamed one
+        // here would vanish at Store with nothing said. Refuse it up front instead.
+        if (!r.name) throw new Error(`calculated PID #${i + 1} has no name.`);
+        return {
+            name: String(r.name),
+            expression: sTxt(r.expression),
+            unit: sTxt(r.unit),
+            enabled: r.enabled !== false
+        };
+    });
+    // auto_pid.json keys the file deliberately does not carry keep whatever the DEVICE
+    // already has. This is a sensor set, not a device config: importing one must never move
+    // a voltage threshold. Read BEFORE loadAutoTable() runs, because it would otherwise
+    // apply its own absent-key defaults -- silently flipping disable_on_sleep_voltage to
+    // "disable" and blanking initialisation.
+    return {
+        initialisation: document.getElementById('initialisation')?.value || '',
+        disable_on_sleep_voltage: document.getElementById('disable_on_sleep_voltage')?.value
+                                  || 'automate_threshold',
+        pid_polling_min_voltage: document.getElementById('pid_polling_min_voltage')?.value,
+        standard_pids: loadedStandardPids,
+        ecu_protocol: loadedEcuProtocol,
+        std_pids: loadedStdPids,
+        pids, can_filters, calculated
+    };
+}
+
+// Loads the file into the tables for REVIEW. Nothing reaches the device here -- the user
+// looks the rows over and presses Store, which runs the same validation and the same
+// /store_auto_data path as any hand edit. Throws (caught by the caller) on a file this
+// page cannot read, so a wrong pick is never a silent no-op.
+function applySensorsFile(text) {
+    // The import carries over the logger settings the file omits by reading them off the
+    // page (see sensorsFileToAutoPid). Before /load_auto_pid has come back those elements
+    // still hold the static HTML defaults, so importing into a half-loaded page would
+    // capture a default voltage threshold and push it on the next Store -- the one thing
+    // omitting those keys is supposed to prevent.
+    if (!sensorsPageLoaded) {
+        throw new Error("the page is still loading the current sensor set. Try again in a moment.");
+    }
+    if (/^\s*[{[]/.test(text)) {
+        // The pre-release JSON format and the whole-device backup both start this way.
+        throw new Error("that looks like a JSON file. Sensor sets are YAML (.yaml) — export a fresh one, and use System → Upload Configuration for a full device backup.");
+    }
+    const doc = parseSensorsYaml(text);   // throws with a line number
+    if (doc.wican !== SENSORS_FILE_KIND) {
+        throw new Error("that file is not a WiCAN sensor file (no `wican: \"sensors\"` line).");
+    }
+    // Only a readable-but-too-new file earns "update the firmware"; a missing or junk
+    // version means the marker was a coincidence, not a file from a newer build.
+    const version = Number(doc.version);
+    if (!Number.isFinite(version)) {
+        throw new Error("that file is not a WiCAN sensor file (no readable `version`).");
+    }
+    if (version > SENSORS_FILE_VERSION) {
+        throw new Error(`that sensor file is version ${version}; this firmware reads up to ${SENSORS_FILE_VERSION}. Update the firmware.`);
+    }
+    if (!SENSORS_YAML_SECTIONS.some(s => Array.isArray(doc[s]))) {
+        throw new Error("that sensor file carries no sensor data.");
+    }
+    const autoPid = sensorsFileToAutoPid(doc);
+
+    // autoTableSavedJson means one thing: the table the DEVICE is running. loadAutoTable()
+    // re-snapshots it from whatever it just loaded, which would break both consumers --
+    // the combined Submit's skipIfUnchanged path would read the import as "nothing
+    // changed" and never POST it, and sampleLoadCommitted() would anchor the "predicted
+    // after apply" sweep to the imported set itself, claiming the device already runs it.
+    // Restoring the pre-import value keeps that single meaning; pollSweepRefresh() is
+    // re-run because loadAutoTable() already fired it against the clobbered baseline.
+    const deviceBaseline = autoTableSavedJson;
+    loadAutoTable(autoPid);   // replaces all three tables -- see the resets there
+    autoTableSavedJson = deviceBaseline;
+    pollSweepRefresh();
+    enableAutoStoreButton();
+    submit_enable();
+
+    const n = sel => document.querySelectorAll(sel).length;
+    showNotification(`Imported ${n('.pid-entry')} polled, ${n('.custom-canfilter-entry')} broadcast, ` +
+                     `${n('.calculated-entry')} calculated. Review the rows, then press <b>Store</b> to apply them.`,
+                     "blue", 8000);
 }
 
 var filesCwd = '';   // current directory, relative to /sdcard
@@ -2643,6 +3062,7 @@ function loadautoPID() {
         if(this.responseText !== "NONE") {
             const data = JSON.parse(this.responseText);
             loadAutoTable(data);
+            sensorsPageLoaded = true;   // the import passthrough may now trust the page
             document.getElementById("custom_pid_store").disabled = true;
         } else {
             console.log("No PID data found on server");
@@ -3079,20 +3499,9 @@ async function downloadCfg() {
             throw new Error('No data was successfully fetched from any endpoint');
         }
         
-        const dataStr = JSON.stringify(combinedData, null, 0);
-        const blob = new Blob([dataStr], { type: 'application/json' });
-        const url = window.URL.createObjectURL(blob);
-        
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `config_${new Date().toISOString().split('T')[0]}.json`;
-        
-        document.body.appendChild(link);
-        link.click();
-        
-        document.body.removeChild(link);
-        window.URL.revokeObjectURL(url);
-        
+        downloadTextFile(`config_${new Date().toISOString().split('T')[0]}.json`,
+                         JSON.stringify(combinedData, null, 0));
+
         return true;
         
     } catch (error) {
@@ -3118,6 +3527,15 @@ async function uploadCfg() {
         
         reader.onload = async function(e) {
             try {
+                // Reciprocal of the guard in applySensorsFile(). Checked on the RAW text and
+                // before JSON.parse, because a sensor file is YAML: parsing it first would
+                // fail with "Failed to parse configuration file" and never mention the tool
+                // that does read it.
+                if (/^\s*wican\s*:\s*"?sensors"?\s*$/m.test(e.target.result)) {
+                    alert('That is a sensor file, not a full device backup. Load it from the Logger page with "Import Sensors".');
+                    fileInput.value = '';
+                    return;
+                }
                 const jsonData = JSON.parse(e.target.result);
                 let hasErrors = false;
 
