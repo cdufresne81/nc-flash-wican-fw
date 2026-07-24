@@ -1683,6 +1683,17 @@
                 </div>
             </div>
             <div>
+                <!-- Sensor set export/import (issue #63): a Logger-scoped backup covering all
+                     three tables below, written as hand-editable YAML in the page's own
+                     vocabulary (Mode + PID identifier + A/B/C formula), NOT a copy of
+                     auto_pid.json. Distinct from System -> Download/Upload Configuration,
+                     which bundles config.json (Wi-Fi credentials included) and reboots on
+                     restore; this pair is sensors-only and applies live via /store_auto_data. -->
+                <div class="section-title-row">
+                    <div class="section-title section-title--no-underline">Sensor Set</div>
+                    <div class="section-title-actions"><button class="primary-button" onclick="exportSensors()" type="button">Export Sensors</button> <button class="primary-button" onclick="document.getElementById('sensors_file').click()" type="button">Import Sensors</button> <input accept=".yaml,.yml" id="sensors_file" onchange="importSensors()" style="display:none" type="file"></div>
+                </div>
+                <div style="color:#6b7280;font-size:12px;margin-bottom:1rem">Saves every sensor below &mdash; polled, broadcast and calculated &mdash; to one readable <b>.yaml</b> file you can keep as a backup, edit by hand, share, or load onto another adapter. It records exactly what you see here: Mode, PID and the standard A/B/C formula. Sensors only: no Wi-Fi credentials and no device settings. Importing replaces the tables below for review; nothing reaches the device until you press <b>Store</b>.</div>
                 <div class="section-title-row">
                     <div class="section-title section-title--no-underline">Polled PIDs</div>
                     <div class="section-title-actions"><button class="primary-button success-button" onclick="addRowAutoTable()">New Polled PID</button></div>
