@@ -24,7 +24,9 @@ A grid timer ticks at a configured rate and each tick writes one full-width row 
 
 ### Why slave the grid to the sweep
 
-If the grid ticked faster than the data refreshed, channel values would repeat across rows (staircase rendering in log viewers). If slower, resolution is wasted. Matching the measured sweep gives the fastest rate at which every row still carries fresh polled values — the original "Tactrix logcfg" ask of issue #23, answered by measuring instead of estimating.
+If the grid ticked faster than the data refreshed, channel values would repeat across rows (staircase rendering in log viewers). If slower, resolution is wasted. Matching the measured rate gives the fastest grid at which the *fastest* channel is fresh on every row — the original "Tactrix logcfg" ask of issue #23, answered by measuring instead of estimating.
+
+**With divisors, slower channels do staircase — by construction.** Before issue #29 every channel refreshed every sweep, so "fastest channel fresh on every row" meant *every* channel fresh on every row. That is no longer the same statement: the grid ticks at `sweep_ms × sched_min_n`, so a channel at `SampleEvery: N` produces a new value every `N / sched_min_n` rows and its cell is carried forward in between. A row is a rectangular snapshot, so the only alternatives are a blank cell or a ragged file, both of which log viewers handle worse than a held value. Asking for a channel to be sampled less **is** asking for it to repeat in the CSV; the grid is still the fastest one that wastes no resolution on the channels you did not gate. Mode-23 memory channels (issue #51) are the common case here, since they cost ~7× a Mode 01 channel and are usually worth a large `N` — see [poll_log.md](poll_log.md).
 
 ## Registration patterns (one-way dependencies)
 

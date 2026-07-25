@@ -75,6 +75,28 @@ int precedence(char operator) {
     return 0;
 }
 
+/* Scan the decimal byte index that follows a Bn / Sn / Fn token, advancing *i past it.
+ * One definition instead of the three identical loops the token branches used to carry.
+ *
+ * Deliberately does NOT bounds-check the RESULT: Bn/Sn have always indexed data[] unchecked and
+ * adding a limit here would change their shipped behaviour. (Note the callers pass an 8-byte
+ * buffer but only the BROADCAST path zero-pads it -- polllog_poll_one hands over the raw frame,
+ * so bytes past data_length_code are stale, not zero.) Fn checks its own range because it
+ * consumes four bytes rather than one.
+ *
+ * It DOES saturate the accumulator: signed overflow is UB, and an overflowed index defeats the
+ * very range check Fn performs. Saturating keeps a nonsense index nonsense and in-range of int. */
+#define EXPR_INDEX_MAX 99999
+static int scan_byte_index(const uint8_t *expression, int *i) {
+    int index = 0;
+    while (isdigit(expression[*i])) {
+        if (index <= EXPR_INDEX_MAX)
+            index = index * 10 + (expression[*i] - '0');
+        (*i)++;                      /* keep consuming digits so the token is fully scanned */
+    }
+    return index;
+}
+
 bool evaluate_expression(uint8_t *expression, uint8_t *data, double V, double *result) {
     Stack operandStack, operatorStack;
     initStack(&operandStack);
@@ -167,11 +189,7 @@ bool evaluate_expression(uint8_t *expression, uint8_t *data, double V, double *r
             }
         } else if (expression[i] == 'B') {
             i++;
-            int index = 0;
-            while (isdigit(expression[i])) {
-                index = index * 10 + (expression[i] - '0');
-                i++;
-            }
+            int index = scan_byte_index(expression, &i);
             uint8_t value = data[index];
             if (expression[i] == ':') {
                 i++;
@@ -182,13 +200,35 @@ bool evaluate_expression(uint8_t *expression, uint8_t *data, double V, double *r
             push(&operandStack, value);
         } else if (expression[i] == 'S') {
             i++;
-            int index = 0;
-            while (isdigit(expression[i])) {
-                index = index * 10 + (expression[i] - '0');
-                i++;
-            }
+            int index = scan_byte_index(expression, &i);
             int8_t value = (int8_t)data[index];
             push(&operandStack, value);
+        } else if (expression[i] == 'F') {
+            /* Fn: IEEE-754 big-endian float32 at data[n..n+3] (issue #51). The speeps
+             * patched ROM exposes RAM variables that are genuine floats -- VOLEFF at
+             * 0xFFFFAC18, VOLFLOW at 0xFFFFAC1C, both "isfloat = 1" in the Tactrix
+             * logcfg -- and without this a Mode 23 read of one yields its raw bit
+             * pattern (e.g. 1.0f reading as 1065353216), silently wrong rather than
+             * failing. Unlike Bn/Sn this consumes FOUR bytes, so unlike the rest of
+             * this parser it DOES bounds-check: the contract everywhere here is a
+             * zero-padded 8-byte frame (see poll_log.c), so n+3 must stay inside it. */
+            i++;
+            int index = scan_byte_index(expression, &i);
+            /* Compare against the LIMIT, never index+3: scan_byte_index accumulates an int, so
+             * "F2147483647" would overflow that addition (UB, and on wrap it goes negative and
+             * sails past the guard into data[INT_MAX]). B0..B7 is the frame, a float spans four
+             * bytes, so the last legal start is 4. */
+            if (index < 0 || index > 4) {
+                ESP_LOGE(TAG, "F%d reads past the 8-byte frame", index);
+                freeStack(&operandStack);
+                freeStack(&operatorStack);
+                return false;
+            }
+            uint32_t bits = ((uint32_t)data[index] << 24) | ((uint32_t)data[index + 1] << 16) |
+                            ((uint32_t)data[index + 2] << 8) | (uint32_t)data[index + 3];
+            float f;
+            memcpy(&f, &bits, sizeof(f));   /* type-pun via memcpy: no strict-aliasing UB */
+            push(&operandStack, (double)f);
         } else if (expression[i] == '(') {
             push(&operatorStack, expression[i]);
             i++;

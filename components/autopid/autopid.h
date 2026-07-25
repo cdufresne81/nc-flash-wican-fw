@@ -89,7 +89,8 @@ typedef struct
     pid_type_t pid_type;
     char* rxheader;
     bool enabled;
-    /* OBD service/mode byte (issue #31): 0x01 standard OBD, 0x22 ReadDataByIdentifier.
+    /* OBD service/mode byte (issue #31): 0x01 standard OBD, 0x22 ReadDataByIdentifier,
+     * 0x23 ReadMemoryByAddress (issue #51).
      * Parsed from "Mode" on auto_pid.json pids; when the key is absent (every pre-#31
      * config) it auto-migrates from the leading two hex chars of the PID string, so old
      * configs load unchanged. The wire framing still comes from cmd's leading service
@@ -98,8 +99,8 @@ typedef struct
      * the request doesn't send. Replaces the deleted free-text per-PID "Init" (inert
      * under poll_log; its ATSH use is covered by the hardcoded 0x7E0). Consumed
      * BEHAVIORALLY only by the legacy scheduler's mode-22 ATSH7E0 prologue (autopid.c,
-     * dies with issue #28); informational under poll_log. Reserved value 0x23
-     * (ReadMemoryByAddress) is NOT a poll channel yet -- see the follow-up issue. */
+     * dies with issue #28); informational under poll_log, which shapes and matches a 0x23
+     * request from cmd alone (see polllog_req_bytes / polllog_match). */
     uint8_t mode;
     /* Sweep-divisor scheduling (issue #29): poll this PID on every Nth poll_log sweep.
      * 0 or 1 == every sweep -- the default and today's shipped behaviour. Parsed from
