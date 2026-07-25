@@ -788,10 +788,37 @@ function wireRowDrag(entry) {
 // via pidServiceMode(), saved verbatim -- never blocked (it was storable before and
 // firmware parses it fine). Old configs lose "Init" / gain "Mode" on their first
 // Store (one-time migration; docs/internals/web_ui.md "Known exceptions").
-// EXPRESSIBLE_MODES is the dropdown's option set: extend it, the template
-// <option>s, and MODE_IDENT_LEN together (the mode-23 follow-up).
-const EXPRESSIBLE_MODES = ['01', '22'];
-const MODE_IDENT_LEN = { '01': 2, '22': 4 };   // hex chars: 1-byte PID / 2-byte DID
+// Mode 23 (ReadMemoryByAddress, issue #51) stores a 6-byte operand -- 4-byte big-endian
+// address + 2-byte big-endian size -- so its "identifier" is 12 hex chars. The UI splits
+// that into an Address box and a Size box; only the STORED string concatenates them, which
+// is what keeps parsePidText/composePidText exact inverses here too.
+const RMBA_MODE = '23';                        // the one mode whose operand is address+size
+const RMBA_ADDR_LEN = 8;                       // hex chars of the address half of the identifier
+const RMBA_SIZE_LEN = 4;                       // hex chars of the size half
+const RMBA_MAX_SIZE = 6;                       // == POLLLOG_RMBA_MAX_SIZE: one ISO-TP single frame
+const RMBA_ADDR_RE = new RegExp(`^[0-9A-Fa-f]{${RMBA_ADDR_LEN}}$`);
+// ONE row per OBD service, so adding a mode is a single edit here plus the template <option>.
+//   ident -- hex chars of the identifier the PID box holds
+//   echo  -- operand bytes the ECU repeats back in its positive response, which is what
+//            shifts the data window (see exprDataOffset). NOT the same as ident: mode 23
+//            sends 6 operand bytes and echoes none.
+// The three lookups below are DERIVED from it rather than maintained beside it -- the
+// previous shape needed a comment instructing you to extend three tables together, which
+// nothing enforced.
+const PID_MODES = {
+    '01': { ident: 2, echo: 1 },
+    '22': { ident: 4, echo: 2 },
+    '23': { ident: RMBA_ADDR_LEN + RMBA_SIZE_LEN, echo: 0 },
+};
+const EXPRESSIBLE_MODES = Object.keys(PID_MODES);                        // the dropdown's option set
+const MODE_IDENT_LEN = Object.fromEntries(Object.entries(PID_MODES).map(([m, v]) => [m, v.ident]));
+const MODE_ECHO_BYTES = Object.fromEntries(Object.entries(PID_MODES).map(([m, v]) => [m, v.echo]));
+// Longest legal stored PID string: service(2) + the widest identifier + the frames hint(1),
+// i.e. "23FFFFAC1800041" = 15. DERIVED, because the old hard-coded "< 10" silently rejected
+// every mode 23 row the rest of this file can produce. It is also the real firmware ceiling:
+// polllog_req_bytes reads at most POLLLOG_MAX_REQ_BYTES*2 nibbles plus the hint and TRUNCATES
+// beyond that, so a longer string would be quietly polled as different bytes.
+const PID_TEXT_MAX = 2 + Math.max(...Object.values(MODE_IDENT_LEN)) + 1;
 const PID_HINT_DEFAULT = '1';                  // every shipped row uses "1 response frame"
 const pidServiceMode = txt => {
     const p = String(txt || '').slice(0, 2);
@@ -806,22 +833,89 @@ const parsePidText = txt => {
     if (!EXPRESSIBLE_MODES.includes(service)) return null;
     const len = MODE_IDENT_LEN[service];
     const rest = s.slice(2);
-    if (rest.length === len) return { service, ident: rest, hint: '' };
-    if (rest.length === len + 1) return { service, ident: rest.slice(0, len), hint: rest.slice(len) };
-    return null;
+    let parsed = null;
+    if (rest.length === len) parsed = { service, ident: rest, hint: '' };
+    else if (rest.length === len + 1) parsed = { service, ident: rest.slice(0, len), hint: rest.slice(len) };
+    if (!parsed) return null;
+    // Mode 23 is the one service whose identifier carries a value the UI must be able to EDIT
+    // (the read size) rather than merely display. A stored size outside 1..RMBA_MAX_SIZE has no
+    // valid Size-box state, so treating it as canonical would load a row that then makes every
+    // subsequent Store of the WHOLE page throw -- the user could not save an unrelated edit
+    // without first deleting it. Falling through to null routes it down the existing legacy
+    // path instead: full wire string in the box, Mode display-only, saved verbatim, never
+    // blocked -- the same contract exotic PID shapes have had since #31. The firmware rejects
+    // it independently (polllog_req_bytes) and now reports it as pids_unpollable.
+    if (service === RMBA_MODE) {
+        const size = rmbaSplitIdent(parsed.ident).size;
+        if (!Number.isFinite(size) || size < 1 || size > RMBA_MAX_SIZE) return null;
+    }
+    return parsed;
 };
 const composePidText = (service, ident, hint) => service + ident + hint;
+// Mode 23's identifier is two ideas glued together -- a 4-byte address then a 2-byte size --
+// so the UI edits them in two boxes and only the STORED string concatenates them. Split/join
+// are exact inverses: every legal size (1..6) is a single hex digit, so the zero-padded join
+// reproduces the stored characters verbatim and the row still round-trips byte-identically.
+const rmbaSplitIdent = ident => ({
+    addr: String(ident).slice(0, RMBA_ADDR_LEN),
+    size: parseInt(String(ident).slice(RMBA_ADDR_LEN), 16),
+});
+const rmbaJoinIdent = (addr, size) => String(addr) + Number(size).toString(16).padStart(RMBA_SIZE_LEN, '0');
+// The one definition of "is this a usable mode 23 operand". Returns null when it is, else the
+// reason. Shared by the save path and the sensor-file importer so the RULE lives once even
+// though each caller words its own message (the importer names the file row, Store names the
+// box). Mirrors the firmware floor in polllog_req_bytes.
+function rmbaIdentProblem(addr, size) {
+    if (!RMBA_ADDR_RE.test(addr)) {
+        return `address must be 4 bytes (${RMBA_ADDR_LEN} hex chars) — e.g. FFFFAC18`;
+    }
+    if (!Number.isFinite(size) || size < 1 || size > RMBA_MAX_SIZE) {
+        return `read size must be 1 to ${RMBA_MAX_SIZE} bytes — the ECU answers a Mode 23 read in a single frame`;
+    }
+    return null;
+}
+// Every byte a Mode 23 expression reads must lie inside the window that row actually REQUESTS:
+// data occupies B{off}..B{off+size-1}. Modes 01/22 cannot be checked this way -- the response
+// length is the ECU's business and unknowable from config -- but a Mode 23 row declares its own
+// size, so a formula reaching past it is a config error we can name. Unchecked it is silent bad
+// data: "FA" on a 2-byte read assembles a float from two real bytes and two ISO-TP padding
+// bytes, logging a plausible wrong number forever with no error anywhere. Takes the STORED (Bn)
+// form, so it sees exactly the indices the firmware will evaluate.
+function rmbaExprProblem(storedExpr, size) {
+    const off = exprDataOffset(RMBA_MODE);
+    if (off == null || !Number.isFinite(size)) return null;
+    const last = off + size - 1;
+    let bad = null;
+    String(storedExpr).replace(/([BSF])(\d+)/g, (tok, kind, digits) => {
+        const n = parseInt(digits, 10);
+        const end = kind === 'F' ? n + 3 : n;     // a float spans four bytes from n
+        if (!bad && (n < off || end > last)) {
+            const window = size === 1 ? 'data byte A' : `data bytes A–${String.fromCharCode(64 + size)}`;
+            bad = `expression reads ${tok}, outside the ${size}-byte window this row requests (${window})`;
+        }
+        return tok;
+    });
+    return bad;
+}
+// The stored IDENTIFIER a canonical row would save: the PID box as typed, except Mode 23 where
+// it is the address box joined with the size box. One definition, used by BOTH the live Test
+// and the save path, so they can never disagree about the bytes that go on the wire.
+function rowIdentText(entry, mode) {
+    const box = entry.querySelector('.pid-input')?.value || '';
+    if (mode !== RMBA_MODE) return box;
+    const n = parseInt(entry.querySelector('.rmba-size-input')?.value, 10);
+    return Number.isFinite(n) ? rmbaJoinIdent(box, n) : box;
+}
 // The wire-format PID string a row would STORE, so the live Test (issue #41) polls the exact
 // bytes poll_log will: canonical rows compose service+ident+hint (mirrors storeAutoTableData's
 // compose), legacy rows hold the full string in the box verbatim.
 function rowPidWire(entry) {
-    const box = entry.querySelector('.pid-input')?.value || '';
     if (entry.dataset.pidCanonical === '1') {
         const mode = entry.querySelector('.mode-select')?.value || '01';
         const hint = entry.dataset.pidHint !== undefined ? entry.dataset.pidHint : PID_HINT_DEFAULT;
-        return composePidText(mode, box, hint);
+        return composePidText(mode, rowIdentText(entry, mode), hint);
     }
-    return box;
+    return entry.querySelector('.pid-input')?.value || '';
 }
 
 // --- Standard-formula authoring for polled expressions (issue #61) -----------------
@@ -829,9 +923,13 @@ function rowPidWire(entry) {
 // D... counted from the first DATA byte, exactly how SAE J1979 / Torque / OBD-Fusion PID
 // tables print a formula like ((A*256)+B)/4 -- and STORED as the firmware's raw Bn
 // indices, which include the ISO-TP framing (PCI + service/ident echo) that sits in front
-// of the data. The two are related by the Mode's data offset off = 2 + ident_bytes
-// (B3 for Mode 01, B4 for Mode 22, DERIVED from MODE_IDENT_LEN so a new mode needs no
-// second table): A<->B{off}, B<->B{off+1}, ... The swap is a per-token EXACT inverse on
+// of the data. The two are related by the Mode's data offset off = 2 + ECHOED bytes --
+// what the ECU repeats back, NOT what we send. For Modes 01/22 those coincide (1 and 2
+// operand bytes echoed -> B3/B4), which is why this was once derived from MODE_IDENT_LEN;
+// Mode 23 breaks that, because it sends a 6-byte operand and echoes NONE of it (the
+// response is just 63 <data...>, bench-verified), putting its first data byte at B2. Hence
+// an explicit echo table rather than a derivation: A<->B{off}, B<->B{off+1}, ...
+// The swap is a per-token EXACT inverse on
 // the standard subset, so a load->save of an unedited row reproduces the stored bytes
 // verbatim (the byte-identical round-trip the rest of the editor guards). Only A-H are
 // data-byte letters and 'B' is one ONLY when not followed by a digit, so raw Bn / Sn / V /
@@ -842,16 +940,26 @@ function rowPidWire(entry) {
 // the offset (hence the whole translation) is trusted only where the Mode is known. Nothing
 // here changes the stored schema or what the firmware evaluates.
 function exprDataOffset(mode) {
-    const identLen = MODE_IDENT_LEN[mode];                     // hex chars of a whole-byte ident,
-    return identLen === undefined ? null : 2 + identLen / 2;   // always even -> integer offset. 01->3, 22->4; unknown->null
+    const echo = MODE_ECHO_BYTES[mode];                        // PCI + service byte + echoed operand
+    return echo === undefined ? null : 2 + echo;               // 01->3, 22->4, 23->2; unknown->null
 }
 function abcToBn(expr, off) {                                   // friendly A/B/C -> stored Bn
     if (off == null) return expr;                              // exprDataOffset yields null | number
-    return expr.replace(/\b([A-H])\b/g, (_, L) => 'B' + (off + L.charCodeAt(0) - 65));
+    // Float token first (issue #51): "FA" means the float32 STARTING at data byte A, so the
+    // letter belongs to the F, not to a bare data byte. The bare-letter pass below cannot
+    // steal it anyway -- \b needs a non-word char before the letter and F is one short of
+    // that -- but doing F first keeps the two rules independent of that subtlety.
+    return expr.replace(/F([A-H])\b/g, (_, L) => 'F' + (off + L.charCodeAt(0) - 65))
+               .replace(/\b([A-H])\b/g, (_, L) => 'B' + (off + L.charCodeAt(0) - 65));
 }
 function bnToAbc(expr, off) {                                   // stored Bn -> friendly A/B/C
     if (off == null) return expr;                              // exprDataOffset yields null | number
-    return expr.replace(/B(\d+)/g, (tok, d) => {
+    // Fn spans FOUR bytes, so it earns a letter only when all of n..n+3 sit in the frame --
+    // the same in-window rule as Bn, applied to the token's full width (issue #51).
+    return expr.replace(/F(\d+)/g, (tok, d) => {
+        const k = parseInt(d, 10);
+        return (k >= off && k + 3 <= 7) ? 'F' + String.fromCharCode(65 + k - off) : tok;
+    }).replace(/B(\d+)/g, (tok, d) => {
         const k = parseInt(d, 10);
         // Only bytes that physically exist in the 8-byte response frame (B0..B7) get a
         // letter. poll_log evaluates a single frame (poll_log.c: "always an 8-byte OBD
@@ -865,9 +973,10 @@ function bnToAbc(expr, off) {                                   // stored Bn -> 
 // the forward map reproduces it exactly. That round-trip check is what guarantees a friendly
 // row saves byte-identically to its origin. Returning the string (not a bool) lets the caller
 // reuse it as the display value instead of translating a second time.
-// "Still names a numbered byte" -- an out-of-window Bn or a signed Sn. One definition, used
-// both here and by the sensor-file importer to tell a wire expression from a friendly one.
-const exprHasWireByte = e => /B\d/.test(e) || /S\d/.test(e);
+// "Still names a numbered byte" -- an out-of-window Bn, a signed Sn, or an out-of-window
+// float Fn. One definition, used both here and by the sensor-file importer to tell a wire
+// expression from a friendly one.
+const exprHasWireByte = e => /[BSF]\d/.test(e);
 function exprAsAbc(bnExpr, off) {
     if (off == null) return null;
     const abc = bnToAbc(bnExpr, off);
@@ -947,26 +1056,39 @@ function addCollapsibleRow(rowData = {}) {
                      per-PID "Init"; hydrated/synced from the PID text -- full story at
                      pidServiceMode() above addCollapsibleRow. The <option> values MUST stay
                      in lockstep with EXPRESSIBLE_MODES. No id= / inline on*= -- same
-                     lint_web.py rationale as Sample Rate below. 0x23 (memory read) is
-                     deliberately absent until it exists as a poll channel (follow-up issue). -->
+                     lint_web.py rationale as Sample Rate below. -->
                 <tr>
                     <td>Mode:</td>
                     <td>
                         <select class="mode-select">
                             <option value="01">01 &mdash; standard OBD</option>
                             <option value="22">22 &mdash; extended (DID)</option>
+                            <option value="23">23 &mdash; memory (address)</option>
                         </select>
                     </td>
                 </tr>
                 <tr>
-                    <td>PID:</td>
+                    <td class="pid-label">PID:</td>
                     <td><input type="text" class="pid-input" value="${safe(rowData.PID || '')}"
                         placeholder="PID"></td>
+                </tr>
+                <!-- Mode 23 read size (issue #51): bytes to read at the address. The ECU answers
+                     63 <data...>, and this path receives ONE ISO-TP single frame, so 1..6
+                     (RMBA_MAX_SIZE, == POLLLOG_RMBA_MAX_SIZE in poll_log.c). A number input rather
+                     than a <select>: a select must enumerate the legal sizes, and a hand-written
+                     config carrying a size the list happened to lack would silently save back a
+                     DIFFERENT size. Row shown only while Mode is 23; no id= / inline on*= -- same
+                     lint_web.py rationale as Sample Rate below. -->
+                <tr class="rmba-size-row" style="display:none">
+                    <td>Read size:</td>
+                    <td><input type="number" class="rmba-size-input" min="1" max="${RMBA_MAX_SIZE}" step="1"
+                               value="" placeholder="bytes" style="width:5em">
+                        <span class="rmba-size-hint"></span></td>
                 </tr>
                 <tr>
                     <td>Expression:</td>
                     <td><input type="text" class="expression-input" value="${safe(rowData.Expression || '')}"
-                        placeholder="Standard formula, e.g. ((A*256)+B)/4  (A B C D = data bytes)"></td>
+                        placeholder="Standard formula, e.g. ((A*256)+B)/4  (A B C D = data bytes; FA = float32 at A)"></td>
                 </tr>
                 <tr>
                     <td>Unit:</td>
@@ -1096,8 +1218,13 @@ const pidParsed = rowData.PID ? parsePidText(rowData.PID)
 entry.dataset.pidCanonical = pidParsed ? '1' : '0';
 entry.dataset.pidHint = pidParsed ? pidParsed.hint : '';
 if (pidParsed) {
-    pidInput.value = pidParsed.ident;   // programmatic set: fires no event, dirties nothing
-    pidInput.placeholder = 'e.g. 0C or 1746';
+    // Mode 23 (issue #51) stores address+size glued together, so the box gets only the address
+    // half and the Size box below gets the rest. Gated on canonical for the same reason the
+    // A/B/C translation is: only there is the shape trusted. The placeholder is owned by
+    // syncRmbaRow() (called at the end of this block), which knows both cases.
+    pidInput.value = pidParsed.service === RMBA_MODE
+        ? rmbaSplitIdent(pidParsed.ident).addr
+        : pidParsed.ident;              // programmatic set: fires no event, dirties nothing
     modeSel.value = pidParsed.service;
 } else {
     modeSel.value = pidServiceMode(pidInput.value) === '22' ? '22' : '01';
@@ -1106,6 +1233,36 @@ if (pidParsed) {
         modeSel.value = EXPRESSIBLE_MODES.includes(m) ? m : '01';
     });
 }
+// Mode 23 (issue #51): show the Size box and relabel PID -> Address whenever this row is a
+// canonical memory read. A LEGACY row keeps the whole verbatim string in the box and gets no
+// Size row, exactly as modes 01/22 do.
+const rmbaSizeRow   = entry.querySelector('.rmba-size-row');
+const rmbaSizeInput = entry.querySelector('.rmba-size-input');
+const rmbaSizeHint  = entry.querySelector('.rmba-size-hint');
+const rmbaPidLabel  = entry.querySelector('.pid-label');
+const syncRmbaRow = () => {
+    const on = entry.dataset.pidCanonical === '1' && modeSel.value === RMBA_MODE;
+    if (rmbaSizeRow) rmbaSizeRow.style.display = on ? '' : 'none';
+    if (rmbaPidLabel) rmbaPidLabel.textContent = on ? 'Address:' : 'PID:';
+    if (entry.dataset.pidCanonical === '1') {
+        pidInput.placeholder = on ? 'e.g. FFFFAC18' : 'e.g. 0C or 1746';
+    }
+    // Name the data-byte letters this size actually yields, so the Expression box below is
+    // authored against a window the user can see (A is B2 for mode 23, not B3/B4).
+    if (rmbaSizeHint) {
+        const n = parseInt(rmbaSizeInput && rmbaSizeInput.value, 10);
+        rmbaSizeHint.textContent = (on && Number.isFinite(n) && n >= 1 && n <= RMBA_MAX_SIZE)
+            ? (n === 1 ? '  → data byte A' : '  → data bytes A–' + String.fromCharCode(64 + n))
+            : '';
+    }
+};
+if (pidParsed && pidParsed.service === RMBA_MODE && rmbaSizeInput) {
+    const size = rmbaSplitIdent(pidParsed.ident).size;   // address half already went in the box above
+    rmbaSizeInput.value = Number.isFinite(size) ? size : '';
+}
+modeSel.addEventListener('change', syncRmbaRow);
+if (rmbaSizeInput) rmbaSizeInput.addEventListener('input', syncRmbaRow);
+syncRmbaRow();
 // Standard-formula authoring (issue #61): show the stored Bn expression in the OBD A/B/C
 // vocabulary and translate it back on save. Only canonical PID rows qualify -- their Mode
 // (hence the data offset) is known and trustworthy; legacy/exotic PID shapes keep raw Bn.
@@ -1815,11 +1972,24 @@ function buildAutoTableJson() {
             const modeSelVal = entry.querySelector('.mode-select')?.value || '01';
             let pidStored, modeStored;
             if (entry.dataset.pidCanonical === '1') {
-                const wantLen = MODE_IDENT_LEN[modeSelVal];
-                if (!new RegExp('^[0-9A-Fa-f]{' + wantLen + '}$').test(boxText)) {
-                    throw new Error(`PID for "${rowName}" must be ${wantLen / 2} byte${wantLen > 2 ? 's' : ''} (${wantLen} hex chars) for Mode ${modeSelVal} — e.g. ${modeSelVal === '22' ? '1746' : '0C'}`);
+                // Mode 23 (issue #51) is validated on the two boxes the user actually edits, so the
+                // message names the box at fault instead of the 12-hex-char string they never see.
+                // Its own check is exhaustive -- address 8 hex + size 1..6 makes rowIdentText
+                // return exactly MODE_IDENT_LEN['23'] chars -- so the generic width test below is
+                // an `else`, not a follow-up: reached, it would advise "e.g. 0C" for a Mode 23 row.
+                if (modeSelVal === RMBA_MODE) {
+                    const rmbaSize = parseInt(entry.querySelector('.rmba-size-input')?.value, 10);
+                    const why = rmbaIdentProblem(boxText, rmbaSize)
+                             || rmbaExprProblem(rowStoredExpr(entry), rmbaSize);
+                    if (why) throw new Error(`Mode 23 "${rowName}": ${why}`);
+                } else {
+                    const wantLen = MODE_IDENT_LEN[modeSelVal];
+                    if (!new RegExp('^[0-9A-Fa-f]{' + wantLen + '}$').test(boxText)) {
+                        throw new Error(`PID for "${rowName}" must be ${wantLen / 2} byte${wantLen > 2 ? 's' : ''} (${wantLen} hex chars) for Mode ${modeSelVal} — e.g. ${modeSelVal === '22' ? '1746' : '0C'}`);
+                    }
                 }
-                pidStored = composePidText(modeSelVal, boxText,
+                const identText = rowIdentText(entry, modeSelVal);
+                pidStored = composePidText(modeSelVal, identText,
                     entry.dataset.pidHint !== undefined ? entry.dataset.pidHint : PID_HINT_DEFAULT);
                 modeStored = modeSelVal;
             } else {
@@ -1855,8 +2025,8 @@ function buildAutoTableJson() {
             if (pidData.Name.length === 0 || pidData.Name.length >= 32) {
                 throw new Error("Name must not be empty and must be less than 32 characters");
             }
-            if (pidData.PID.length === 0 || pidData.PID.length >= 10) {
-                throw new Error("PID must not be empty and must be less than 10 characters");
+            if (pidData.PID.length === 0 || pidData.PID.length > PID_TEXT_MAX) {
+                throw new Error(`PID for "${pidData.Name}" must not be empty and must be at most ${PID_TEXT_MAX} characters`);
             }
             if (pidData.Expression.length === 0 || pidData.Expression.length >= 64) {
                 throw new Error("Expression must not be empty and must be less than 64 characters");
@@ -2004,7 +2174,12 @@ async function storeAutoTableData(skipIfUnchanged = false) {
         return true;
 
     } catch (error) {
-        showNotification(error.message, "red");
+        // safe(): these validation messages quote the row's NAME back at the user, and
+        // showNotification assigns innerHTML. A name arrives from an imported .yaml, so an
+        // unescaped message is script execution in the device's own origin -- where
+        // /store_config, the Wi-Fi credentials and OTA live. Escaped at the sink so every
+        // throw in this function is covered, not just today's.
+        showNotification(safe(error.message), "red");
         return false;
     }
 }
@@ -2087,7 +2262,8 @@ function emitSensorsYaml() {
         `version: ${SENSORS_FILE_VERSION}`,
         '',
         '# ---- Polled PIDs ---------------------------------------------------------------',
-        '# Requested from the ECU every sweep. mode 01 = standard OBD-II, 22 = extended (DID).',
+        '# Requested from the ECU every sweep. mode 01 = standard OBD-II, 22 = extended (DID),',
+        '# 23 = memory read, which carries "address" and "size" instead of "pid".',
         '# sample_every omitted means every sweep.',
         'polled:'
     ];
@@ -2100,11 +2276,22 @@ function emitSensorsYaml() {
 
     stored.pids.forEach((p, i) => {
         const parts = sensorPidParts(p.PID);
-        const abc = parts ? exprAsAbc(p.Expression, exprDataOffset(parts.service)) : null;
-        const row = [['name', yq(p.Name)], ['mode', yq(parts ? parts.service : pidServiceMode(p.PID))],
-                     ['pid', yq(parts ? parts.ident : p.PID)],
-                     ['expression', yq(abc !== null ? abc : p.Expression)],
-                     ['unit', yq(p.Unit)]];
+        // rangeToArith FIRST, exactly as the row builder does before it classifies (issue #61),
+        // or the file would print the compact [A:D] for a stored [B2:B5] while the page shows
+        // ((A*16777216)+...) for the same row -- the one thing this format promises not to do.
+        // Both forms import to the same bytes; a Store then persists the arithmetic form, which
+        // is the same one-time migration an ordinary load->Store already performs.
+        const abc = parts ? exprAsAbc(rangeToArith(p.Expression), exprDataOffset(parts.service)) : null;
+        const row = [['name', yq(p.Name)], ['mode', yq(parts ? parts.service : pidServiceMode(p.PID))]];
+        // Mode 23 carries address + size, the same two ideas the page edits, rather than the
+        // glued 12-hex-char identifier nobody types (issue #51).
+        if (parts && parts.service === RMBA_MODE) {
+            const sp = rmbaSplitIdent(parts.ident);
+            row.push(['address', yq(sp.addr)], ['size', sp.size]);
+        } else {
+            row.push(['pid', yq(parts ? parts.ident : p.PID)]);
+        }
+        row.push(['expression', yq(abc !== null ? abc : p.Expression)], ['unit', yq(p.Unit)]);
         if (p.SampleEvery) row.push(['sample_every', p.SampleEvery]);
         row.push(['enabled', p.enabled !== false]);
         if (p.description) row.push(['description', yq(p.description)]);
@@ -2292,9 +2479,29 @@ function sensorsFileToAutoPid(doc) {
         const hexDigits = v => String(v).replace(/^0[xX]/, '');
         const mode = hexDigits(r.mode === undefined ? '01' : r.mode).padStart(2, '0');
         const identLen = MODE_IDENT_LEN[mode];
-        let pid = hexDigits(sTxt(r.pid));
-        if (identLen !== undefined && /^\d+$/.test(pid) && pid.length < identLen) {
-            pid = pid.padStart(identLen, '0');
+        let pid;
+        // Branch on the KEY PRESENT, not on the mode alone. A mode-23 row the export could not
+        // decompose -- a wire string with no frames-hint nibble, or a non-default one -- is
+        // written as a verbatim `pid:` exactly like an exotic mode 01/22 row, and must import
+        // back the same way. Keying purely on mode made the page reject its own export, and
+        // fail the WHOLE file while naming an `address` key the file did not contain.
+        // ...but a row carrying NEITHER key is a genuine mistake, so it still gets the specific
+        // "needs an address" message rather than falling through to an empty PID that only
+        // fails later, at Store, with a vaguer complaint.
+        if (mode === RMBA_MODE && (r.address !== undefined || r.pid === undefined)) {
+            // Mode 23 is authored as address + size (issue #51), matching the page and the
+            // export. Deliberately NOT zero-padded the way a short numeric pid is above: a
+            // half-written address is a DIFFERENT address, so it is an error, not a guess.
+            const addr = hexDigits(sTxt(r.address));
+            const size = parseInt(r.size, 10);
+            const why = rmbaIdentProblem(addr, size);
+            if (why) throw new Error(`${where}: ${why}.`);
+            pid = rmbaJoinIdent(addr, size);
+        } else {
+            pid = hexDigits(sTxt(r.pid));
+            if (identLen !== undefined && /^\d+$/.test(pid) && pid.length < identLen) {
+                pid = pid.padStart(identLen, '0');
+            }
         }
         // Decomposed only when the identifier is exactly the width this Mode declares;
         // anything else is taken as a complete wire string, matching the export.

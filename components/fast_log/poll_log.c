@@ -79,10 +79,41 @@
 static const char *TAG = "poll_log";
 
 /* ---- Tunables ----------------------------------------------------------- */
-#define POLLLOG_TX_ID            0x7E0u  /* physical request to the PCM (works for mode-01 & mode-22) */
+#define POLLLOG_TX_ID            0x7E0u  /* physical request to the PCM (works for mode-01, -22 & -23) */
 #define POLLLOG_RX_ID            0x7E8u  /* PCM positive-response ID */
 #define POLLLOG_PAD              0x55u   /* ISO-TP single-frame padding (ECU ignores unused bytes) */
 #define POLLLOG_RESP_TIMEOUT_MS  30      /* per-PID wait budget for the response */
+
+/* Mode 0x23 ReadMemoryByAddress (issue #51). The request is SID + 4-byte big-endian
+ * address + 2-byte big-endian size = 7 payload bytes, which is what sets the request
+ * cap below; modes 01/22 need only 1..3. Bench-verified 2026-07-25 against the patched
+ * NC PCM: this ALFID-less shape is the ONLY one it accepts (every ISO-14229 ALFID
+ * variant and every 3-byte-address form answers NRC 0x12/0x31), matching the wire spec
+ * ncflash_fastread.c:159-165 already proved for bulk ROM reads. A STOCK ROM refuses the
+ * service outright with NRC 0x22 at dispatch, so mode 23 needs the patched calibration.
+ *
+ * The positive response is 63 <data...> with NO address/size echo, so the data begins at
+ * frame byte B2 (mode 01 = B3, mode 22 = B4) -- see polllog_match. Payload is 1 SID byte
+ * + size, so a size of 1..6 stays in one ISO-TP single frame and 7+ would need
+ * FF/FC/CF reassembly this path deliberately does not implement (bench-confirmed
+ * boundary; the real speeps channels are 1, 2 and 4 bytes). Oversized or malformed
+ * mode-23 rows are rejected in polllog_req_bytes, which is the single pollability
+ * funnel, so they never reach the sweep or the schedule. */
+#define POLLLOG_SVC_RMBA         0x23u   /* UDS ReadMemoryByAddress service (== UDS_RMBA, main/ncflash_fastread.c) */
+#define POLLLOG_RMBA_MAX_SIZE    6       /* bytes readable in one single frame (7 - the 0x63 SID) */
+#define POLLLOG_RMBA_REQ_BYTES   7       /* a mode-23 request is EXACTLY this: SID + addr4 + size2 */
+/* Longest request any supported service frames. Equal to the mode-23 length today, but a
+ * DIFFERENT fact: keeping them separate means adding a longer service later widens the buffer
+ * without silently loosening the mode-23 shape gate below. */
+#define POLLLOG_MAX_REQ_BYTES    POLLLOG_RMBA_REQ_BYTES
+
+/* Requested read size of a mode-23 request, from the operand poll_log framed. One definition,
+ * so the byte offsets of the size field are not restated in polllog_match(). Valid only once
+ * polllog_req_bytes() has accepted the request (it enforces the exact length). */
+static inline uint16_t polllog_rmba_size(const uint8_t *req)
+{
+    return (uint16_t)(((uint16_t)req[5] << 8) | req[6]);
+}
 #define POLLLOG_RX_TASK_PRIO     5       /* == can_rx_task; sole TWAI consumer in POLL_LOG */
 #define POLLLOG_RX_STACK_BYTES   (1024 * 8)   /* INTERNAL RAM (brick invariant) */
 #define POLLLOG_STATS_PERIOD_US  (3LL * 1000 * 1000)    /* emit turnaround stats every 3 s */
@@ -219,6 +250,7 @@ static volatile uint32_t s_sweep_pids   = 0;  /* PIDs actually requested in the 
 static volatile uint32_t s_gate_skips   = 0;  /* cumulative polls suppressed by the divisor gate */
 static volatile uint32_t s_pace_sweeps  = 0;  /* sweeps held back by the POLLLOG_MIN_SWEEP_MS cap */
 static volatile uint32_t s_pids_gated   = 0;  /* pollable PIDs with sample_every >= 2 */
+static volatile uint32_t s_pids_unpollable = 0; /* ENABLED rows the request funnel refused (issue #51) */
 static volatile uint32_t s_sched_min_n  = 1;  /* min effective divisor over POLLABLE pids; 1 = nothing gated */
 static volatile bool     s_gating_live  = false; /* the gate is actually in effect right now */
 static volatile float    s_fast_ms = 0, s_fast_hz = 0;  /* fastest channel: sweep * sched_min_n */
@@ -253,17 +285,22 @@ static autopid_live_test_res_t s_test_res;
 
 /*
  * Parse a polled-PID command string into request bytes.
- * The config stores cmd as the raw PID string plus a trailing CR, e.g. "010B1\r" (mode-01 PID 0B)
- * or "2217461\r" (mode-22 PID 1746). The LAST hex nibble is the ELM "expected response frames"
- * hint (1 = single frame here), NOT part of the request, so an odd nibble count means we drop the
- * final nibble. Returns request length in bytes (1..3), or 0 if the string isn't a PID request.
+ * The config stores cmd as the raw PID string plus a trailing CR, e.g. "010B1\r" (mode-01 PID 0B),
+ * "2217461\r" (mode-22 PID 1746) or "23FFFFAC1800041\r" (mode-23 read of 4 bytes at 0xFFFFAC18 --
+ * SID + 4-byte address + 2-byte size, issue #51). The LAST hex nibble is the ELM "expected response
+ * frames" hint (1 = single frame here), NOT part of the request, so an odd nibble count means we
+ * drop the final nibble. Returns request length in bytes (1..POLLLOG_MAX_REQ_BYTES), or 0 when the
+ * row is NOT POLLABLE BY THIS PATH -- either the string isn't a PID request at all, or it is a
+ * mode-23 read this single-frame receiver could never reassemble (see the shape gate at the end).
+ * Longer strings are truncated to the cap rather than rejected, which is the pre-#51 behaviour
+ * with a wider cap.
  */
-static size_t polllog_req_bytes(const char *cmd, uint8_t out[3])
+static size_t polllog_req_bytes(const char *cmd, uint8_t out[POLLLOG_MAX_REQ_BYTES])
 {
     if (!cmd)
         return 0;
 
-    char hex[8];
+    char hex[POLLLOG_MAX_REQ_BYTES * 2 + 1];   /* 14 request nibbles + the trailing frames hint */
     size_t n = 0;
     for (const char *p = cmd; *p && n < sizeof(hex); p++)
     {
@@ -280,13 +317,31 @@ static size_t polllog_req_bytes(const char *cmd, uint8_t out[3])
     size_t bytes = n / 2;
     if (bytes < 1)
         return 0;
-    if (bytes > 3)
-        bytes = 3;
+    if (bytes > POLLLOG_MAX_REQ_BYTES)
+        bytes = POLLLOG_MAX_REQ_BYTES;
 
     for (size_t i = 0; i < bytes; i++)
     {
         char t[3] = { hex[2 * i], hex[2 * i + 1], 0 };
         out[i] = (uint8_t)strtol(t, NULL, 16);
+    }
+
+    /* Mode 23 shape gate (issue #51). This is the ONE funnel every caller uses to decide
+     * whether a row is pollable at all -- the sweep, polllog_prepare_schedule() and the live
+     * PID test -- so rejecting here excludes a malformed mode-23 row uniformly instead of
+     * letting it burn a phase slot and time out every sweep forever. Requires the exact
+     * SID+addr4+size2 shape, and a size this single-frame path can actually receive: the
+     * response is 0x63 + size bytes, so 1..POLLLOG_RMBA_MAX_SIZE. The web UI blocks both
+     * cases at save time; this is the defensive floor for a hand-edited config. */
+    if (out[0] == POLLLOG_SVC_RMBA)
+    {
+        /* Length FIRST: out[5]/out[6] are only written when the request is full length, so
+         * reading the size out of a shorter one would be an indeterminate read of this buffer. */
+        if (bytes != POLLLOG_RMBA_REQ_BYTES)
+            return 0;
+        const uint16_t size = polllog_rmba_size(out);
+        if (size < 1 || size > POLLLOG_RMBA_MAX_SIZE)
+            return 0;
     }
     return bytes;
 }
@@ -302,6 +357,19 @@ static bool polllog_match(const twai_message_t *m, const uint8_t *req, size_t rl
         return false;
     if (m->data[1] != (uint8_t)(req[0] + 0x40u))       /* positive-response service echo */
         return false;
+    /* Mode 23 (issue #51) answers 0x63 with NO address/size echo -- bench-verified -- so the
+     * service byte is the only operand-independent thing to key on. Match the payload LENGTH
+     * as well: the SF PCI low nibble is 1 (the 0x63 SID) + the requested size. That is free,
+     * it validates the response really carries the bytes we asked for, and it discriminates
+     * concurrent mode-23 channels of DIFFERENT sizes.
+     *
+     * KNOWN LIMIT: two mode-23 channels reading the SAME size are indistinguishable. Reaching a
+     * misattribution needs a late reply to an already-TIMED-OUT request, because this poller
+     * keeps one request in flight and drains stale frames immediately before every send; the
+     * bench measures 0 timeouts over 25M requests. Modes 01/22 are immune -- their operand echo
+     * disambiguates. Documented in docs/internals/poll_log.md. */
+    if (req[0] == POLLLOG_SVC_RMBA)
+        return (m->data[0] & 0x0Fu) == (uint8_t)(1u + polllog_rmba_size(req));
     if (rl >= 2 && m->data[2] != req[1])               /* PID echo (mode-01 PID / mode-22 hi) */
         return false;
     if (rl >= 3 && m->data[3] != req[2])               /* PID echo (mode-22 lo) */
@@ -416,11 +484,16 @@ static bool polllog_poll_one(pid_data_t *pid)
     if (!pid || !pid->enabled || !pid->cmd)
         return false;
 
-    uint8_t req[3];
+    uint8_t req[POLLLOG_MAX_REQ_BYTES];
     size_t rl = polllog_req_bytes(pid->cmd, req);
     if (rl == 0)
     {
-        ESP_LOGW(TAG, "skip PID with unparseable cmd '%s'", pid->cmd);
+        /* DEBUG, not WARN: the sweep visits this row every pass (~45 Hz), so a warn here is a
+         * continuous log flood for one bad row -- and at 2 Mbaud each line costs real time on
+         * the sole-TWAI-owner task. The condition is reported ONCE per config load by
+         * polllog_prepare_schedule() and published continuously as pids_unpollable in
+         * /poll_status, which is the diagnostic surface that actually reaches the user. */
+        ESP_LOGD(TAG, "skip PID with unparseable cmd '%s'", pid->cmd);
         return false;
     }
 
@@ -547,13 +620,14 @@ static void polllog_prepare_schedule(autopid_config_t *c)
 {
     uint8_t  cnt[AUTOPID_MAX_SAMPLE_EVERY + 1] = {0};
     uint8_t  k  [AUTOPID_MAX_SAMPLE_EVERY + 1] = {0};
-    uint8_t  tmp[3];
-    uint32_t gated = 0, min_n = 0;
+    uint8_t  tmp[POLLLOG_MAX_REQ_BYTES];
+    uint32_t gated = 0, min_n = 0, unpollable = 0;
 
     if (c == NULL)
     {
         s_pids_gated = 0;
         s_sched_min_n = 1;
+        s_pids_unpollable = 0;
         return;
     }
 
@@ -575,6 +649,18 @@ static void polllog_prepare_schedule(autopid_config_t *c)
          * a phase slot. */
         if (!p->enabled || !p->cmd || polllog_req_bytes(p->cmd, tmp) == 0)
         {
+            /* An ENABLED row the funnel refuses is a config error the user cannot otherwise
+             * see: it is counted in `pids` but never in `sweep_pids`, indistinguishable from a
+             * deliberately disabled row, and the only other signal is this log line on a device
+             * with no serial console. Mode 23 adds two new ways to land here (wrong request
+             * length, size outside 1..POLLLOG_RMBA_MAX_SIZE), so publish a count -- same
+             * "no serial console needed" principle as pids_gated / sweep_empty / gate_skips. */
+            if (p->enabled)
+            {
+                unpollable++;
+                ESP_LOGW(TAG, "unpollable pid '%s': cmd missing or not a request this path can send",
+                         p->cmd ? p->cmd : "(null)");
+            }
             if (p->enabled && p->sample_every > 1)
                 ESP_LOGW(TAG, "SampleEvery ignored: pid '%s' can never be polled", p->cmd ? p->cmd : "(null)");
             continue;
@@ -607,9 +693,13 @@ static void polllog_prepare_schedule(autopid_config_t *c)
                  (unsigned)n, (unsigned)p->sample_ctr);
     }
 
-    s_pids_gated  = gated;
-    s_sched_min_n = (min_n == 0) ? 1u : min_n;
+    s_pids_gated      = gated;
+    s_sched_min_n     = (min_n == 0) ? 1u : min_n;
+    s_pids_unpollable = unpollable;
 
+    if (unpollable > 0)
+        ESP_LOGW(TAG, "%u enabled pid(s) are not pollable and were left out of the schedule",
+                 (unsigned)unpollable);
     if (gated > 0)
         ESP_LOGI(TAG, "sweep divisors active: %u/%u pids gated, fastest channel every %u sweep(s)",
                  (unsigned)gated, (unsigned)c->pid_count, (unsigned)s_sched_min_n);
@@ -644,7 +734,7 @@ static void polllog_execute_test(const autopid_live_test_req_t *req, autopid_liv
             return;
         }
 
-        uint8_t reqb[3];
+        uint8_t reqb[POLLLOG_MAX_REQ_BYTES];
         size_t rl = polllog_req_bytes(req->cmd, reqb);
         if (rl == 0)
         {
@@ -1283,7 +1373,7 @@ char *poll_log_get_status_json(void)
              "{\"active\":%s,\"ok\":%u,\"timeout\":%u,\"txfail\":%u,"
              "\"rtt_avg_ms\":%.2f,\"rtt_min_ms\":%.2f,\"rtt_max_ms\":%.2f,\"req_s\":%.1f,"
              "\"sweep_ms\":%.1f,\"sweep_hz\":%.2f,\"pids\":%u,"
-             "\"pids_gated\":%u,\"sched_min_n\":%u,\"gating_active\":%s,"
+             "\"pids_gated\":%u,\"pids_unpollable\":%u,\"sched_min_n\":%u,\"gating_active\":%s,"
              "\"sweep_pids\":%u,\"sweep_seq\":%u,\"sweep_empty\":%u,\"gate_skips\":%u,"
              "\"pace_sweeps\":%u,\"min_sweep_ms\":%u,"
              "\"sweep_min_ms\":%.1f,\"sweep_max_ms\":%.1f,\"fast_ms\":%.1f,\"fast_hz\":%.2f,"
@@ -1296,7 +1386,7 @@ char *poll_log_get_status_json(void)
              (double)s_win_req_s,
              (double)s_sweep_ms, (double)s_sweep_hz,
              (unsigned)s_pid_count,   /* cross-task-safe mirror, never derefs s_cfg (issue #39) */
-             (unsigned)s_pids_gated, (unsigned)s_sched_min_n,
+             (unsigned)s_pids_gated, (unsigned)s_pids_unpollable, (unsigned)s_sched_min_n,
              s_gating_live ? "true" : "false",
              (unsigned)s_sweep_pids, (unsigned)s_sweep_seq, (unsigned)s_sweep_empty,
              (unsigned)s_gate_skips,

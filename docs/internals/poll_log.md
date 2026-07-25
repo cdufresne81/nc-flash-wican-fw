@@ -73,6 +73,43 @@ Two bypasses skip the gate completely, and while bypassed the counters do **not*
 
 **Empty sweeps.** With divisors, a sweep can request nothing (one PID at N=64 → 63 consecutive empty sweeps — a legal config). Every `vTaskDelay` and every `can_receive` in the sweep lives inside `polllog_poll_one`, so an empty sweep would neither yield nor drain. Both are fatal: a yield-free prio-5 loop starves IDLE (TWDT flood) and the prio-4 CSV writer; and poll_log is the sole TWAI consumer, so the 96-slot driver RX queue fills in ~48 ms on a busy powertrain bus. The empty path therefore drains RX (hybrid-decoding as it goes), evaluates calculated channels every 16th empty sweep, and yields.
 
+## Mode 0x23 — ReadMemoryByAddress channels (issue #51)
+
+A mode-23 row polls a **raw ECU memory address** instead of a PID/DID. That is how the speeps patched ROM exposes its custom variables — flex-fuel state, launch control, and the speed-density floats `VOLEFF` / `VOLFLOW` — none of which have an OBD identifier.
+
+**Requires the patched calibration.** A stock ROM refuses service 0x23 outright with `NRC 0x22 conditionsNotCorrect`, rejected at service dispatch before the payload is parsed (verified by enumerating nine request shapes — every one gave the identical NRC). Diagnosing this is quick: on a stock ROM a bogus mode-22 DID answers `NRC 0x31 out-of-range`, meaning that handler *ran*, while mode 23 answers `0x22`, meaning it never got that far. Sessions are not the answer either — this ECU rejects `0x10 01` and `0x10 03` with `NRC 0x12`, accepting only the `0x85` programming session, which stops Mode 01 from answering at all. Check `read_rom_id()` / Mode 09 CVN before concluding a firmware bug.
+
+| | |
+|---|---|
+| Request | `23 <addr:4 BE> <size:2 BE>` — 7 payload bytes, **no ALFID** |
+| Response | `63 <data…>` — positive SID, **no address/size echo** |
+| Data window | first data byte is **B2** (mode 01 = B3, mode 22 = B4) |
+| Size | **1–6 bytes**, so the reply is one ISO-TP single frame |
+
+The ALFID-less shape is not a choice: it is the only form this ECU accepts, and it is the same one `main/ncflash_fastread.c` uses for bulk ROM reads. Do not "fix" it toward ISO-14229.
+
+Consequences in this file:
+
+- **`polllog_req_bytes` caps at `POLLLOG_MAX_REQ_BYTES` (7)**, up from 3. It also *rejects* a malformed mode-23 row — wrong length, or a size outside 1..`POLLLOG_RMBA_MAX_SIZE`. That function is the single pollability funnel (sweep, `polllog_prepare_schedule`, live test), so one gate excludes the row everywhere instead of letting it burn a phase slot and time out every sweep.
+- **`polllog_match` matches service-only** for 0x23, because there is no operand to echo — plus the SF PCI length (`1 + size`), which is free, validates the shape, and discriminates concurrent mode-23 channels of *different* sizes.
+- **Known limit:** two mode-23 channels reading the **same size** are indistinguishable on the wire. Misattribution needs a late reply to an already-timed-out request (this poller keeps one request in flight and drains stale frames immediately before each send); the bench measures 0 timeouts over 25M requests. Modes 01/22 are immune — their operand echo disambiguates.
+- **Sizes ≥ 7 go multi-frame** (FF → FC → CF), which this path deliberately does not implement. Bench-confirmed boundary; the real speeps channels are 1, 2 and 4 bytes.
+
+### Measured cost (bench, patched PCM, 2026-07-25)
+
+`rtt_*` in `/poll_status` is a **3-second rolling window**, so a table containing only one service's channels reports that service's own round-trip. Four uniform 4-channel tables:
+
+| Table | `rtt_avg` | Sweep | Note |
+|---|---|---|---|
+| mode 01 × 4 | **1.13 ms** | 10.0 ms | sweep is pinned to `POLLLOG_MIN_SWEEP_MS`, not RTT-bound |
+| mode 22 × 4 | **7.94 ms** | 32.0 ms | genuinely RTT-bound, 8.00 ms/channel |
+| mode 23 × 4 (1-byte reads) | **7.95 ms** | 32.0 ms | |
+| mode 23 × 4 (4-byte reads) | **7.95 ms** | 32.0 ms | read size costs nothing |
+
+**A mode-23 channel costs exactly what a mode-22 channel costs, and both are ~7× a mode-01 channel.** So "mode 23 is slow" is true but misattributed — it is not a property of ReadMemoryByAddress, it is that this ECU answers *any* non-standard service in ~8 ms against ~1.1 ms for standard OBD. Adding one mode-23 channel to a mode-01 table lengthens the sweep by ~8 ms, slowing **every** channel (see the `SampleEvery` divisors above — a memory channel is usually a good candidate for a large N). Read size is free, so prefer one 4-byte read over four 1-byte reads at consecutive addresses. 0 timeouts and 0 txfail throughout.
+
+**Floats.** `VOLEFF`/`VOLFLOW` are `isfloat = 1` in the Tactrix logcfg — genuine IEEE-754 float32. `expression_parser.c` gained an `Fn` token (big-endian float32 at `data[n..n+3]`); without it a 4-byte read yields the raw bit pattern (`1.0f` reading as `1065353216`), silently wrong rather than failing. `Fn` is the one token in that parser that bounds-checks, because it consumes four bytes. In the UI it is authored as `FA` = "float32 starting at data byte A".
+
 ## Sweep-rate measurement and the Auto grid (issue #23)
 
 The Auto (fastest) logging rate is a **measurement, not an estimate** — this is what makes it correct in hybrid mode (broadcast channels are always at least as fresh as the polled sweep, so the polled sweep is the true freshness limiter).
@@ -91,7 +128,7 @@ The Auto (fastest) logging rate is a **measurement, not an estimate** — this i
 {"active":true,"ok":19676,"timeout":0,"txfail":0,
  "rtt_avg_ms":2.48,"rtt_min_ms":0.72,"rtt_max_ms":9.97,"req_s":396.0,
  "sweep_ms":49.6,"sweep_hz":20.15,"pids":19,
- "pids_gated":4,"sched_min_n":1,"gating_active":true,
+ "pids_gated":4,"pids_unpollable":0,"sched_min_n":1,"gating_active":true,
  "sweep_pids":15,"sweep_seq":40311,"sweep_empty":0,"gate_skips":12093,
  "pace_sweeps":0,"min_sweep_ms":10,
  "sweep_min_ms":38.2,"sweep_max_ms":52.7,"fast_ms":49.6,"fast_hz":20.15,
@@ -107,6 +144,7 @@ The divisor fields (issue #29) are the whole diagnostic surface for the feature 
 | Field | Meaning |
 |---|---|
 | `pids_gated` | Pollable PIDs with `SampleEvery >= 2`. `0` ⇒ the gate is inert and every path below is today's shipped behaviour. |
+| `pids_unpollable` | **ENABLED** rows `polllog_req_bytes()` refused — no `cmd`, unparseable, or a mode-23 read this single-frame path cannot receive (issue #51). Such a row counts in `pids` but never in `sweep_pids`, so without this field it is indistinguishable from a disabled one. **Must be 0 on a healthy config**; non-zero means a channel you configured is silently not being polled. |
 | `sched_min_n` | Smallest divisor over pollable PIDs. `1` ⇒ at least one channel still runs every sweep. |
 | `gating_active` | The gate is *actually* in effect right now (false while probing or during the stale-OK bypass). |
 | `sweep_pids` | PIDs actually requested in the last sweep. Should equal `pids` when nothing is gated. |
@@ -163,5 +201,5 @@ Note the 100 Hz cap makes the specific rate at which this was seen unreachable, 
 ## Related
 
 - Per-PID rate limiting: issue #29 — shipped as `SampleEvery` (above). The legacy `Period` field was deliberately left untouched.
-- Per-PID `Mode` (issue #31): `Init` is deleted (one-time config migration, see `web_ui.md`); `Mode` is `01`/`22` today. Mode `23` (ReadMemoryByAddress — wire spec proven in `main/ncflash_fastread.c`) is **not** a poll channel yet: it needs an addr+size config schema, ISO-TP multi-frame reassembly, and a no-echo match — follow-up issue.
+- Per-PID `Mode` (issue #31): `Init` is deleted (one-time config migration, see `web_ui.md`); `Mode` is `01`, `22` or `23` (issue #51, below).
 - Hidden/legacy fields (`Period`, `Class`) and what still consumes them: issue #28.
