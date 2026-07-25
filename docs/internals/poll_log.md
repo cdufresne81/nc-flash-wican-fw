@@ -108,7 +108,19 @@ Consequences in this file:
 
 **A mode-23 channel costs exactly what a mode-22 channel costs, and both are ~7× a mode-01 channel.** So "mode 23 is slow" is true but misattributed — it is not a property of ReadMemoryByAddress, it is that this ECU answers *any* non-standard service in ~8 ms against ~1.1 ms for standard OBD. Adding one mode-23 channel to a mode-01 table lengthens the sweep by ~8 ms, slowing **every** channel (see the `SampleEvery` divisors above — a memory channel is usually a good candidate for a large N). Read size is free, so prefer one 4-byte read over four 1-byte reads at consecutive addresses. 0 timeouts and 0 txfail throughout.
 
-**Floats.** `VOLEFF`/`VOLFLOW` are `isfloat = 1` in the Tactrix logcfg — genuine IEEE-754 float32. `expression_parser.c` gained an `Fn` token (big-endian float32 at `data[n..n+3]`); without it a 4-byte read yields the raw bit pattern (`1.0f` reading as `1065353216`), silently wrong rather than failing. `Fn` is the one token in that parser that bounds-checks, because it consumes four bytes. In the UI it is authored as `FA` = "float32 starting at data byte A".
+**Floats.** `VOLEFF`/`VOLFLOW` are `isfloat = 1` in the Tactrix logcfg — genuine IEEE-754 float32. `expression_parser.c` gained an `Fn` token (big-endian float32 at `data[n..n+3]`); without it a 4-byte read yields the raw bit pattern (`1.0f` reading as `1065353216`), silently wrong rather than failing. `Fn` is the one token in that parser that bounds-checks, because it consumes four bytes. In the UI it is authored as `FA` = "float32 starting at data byte A". The decode was cross-checked against Python `struct.unpack('>f', …)` on three ROM addresses holding non-zero bytes (including one denormal) — exact matches; engine-off RAM is all zeros and would have validated nothing.
+
+### Tried and rejected
+
+Negative results, recorded so nobody spends the bench time again:
+
+| Tried | Outcome |
+|---|---|
+| Nine request shapes against the **stock** ROM — 4-byte address, 3-byte address, size omitted, and ALFID `0x14` / `0x24` / `0x13` / `0x41` | All nine returned the identical `NRC 0x22`. The request shape was never the problem, so this sweep tells you nothing on a stock ROM. |
+| Diagnostic sessions `0x10 01` / `0x10 03` to "unlock" 0x23 | Both `NRC 0x12 subFunctionNotSupported`. Only `0x85` (programming) is accepted, and it stops Mode 01 answering — unusable for a logger, which is what makes the patched calibration the only route. |
+| ISO-TP multi-frame reassembly — the largest work item on issue #51 | **Not needed.** Real speeps params are 1, 2 and 4 bytes, and `63` + ≤ 6 data bytes fits one frame. Sizes ≥ 7 are refused at the funnel rather than half-implemented. |
+| `B1` as the first data byte, as issue #51 states | Off by one. #51 measured from the ISO-TP *payload*; this evaluator sees the raw CAN frame, where `B0` is PCI and `B1` the `0x63` SID. Hence `B2` above. |
+| Discarding the first frame after a timeout, to close the same-size ambiguity | Rejected. It trades a rare wrong value for a *systematic* dropped sample, and cascades under alternating timeouts — strictly worse than the 0-timeout behaviour it would protect. |
 
 ## Sweep-rate measurement and the Auto grid (issue #23)
 
