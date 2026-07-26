@@ -225,11 +225,32 @@ typically routes OBD-II connector pins to a transceiver. If PPSW=10 is what conn
 CAN-H/CAN-L to the TWAI transceiver, then removing this "dead" subsystem silently kills
 the datalogger.
 
-This cannot be settled by reading code. **It is a bench experiment**: build with
-`elm327_powerpin_commands()` skipped, flash, and see whether polling still works. That
-single experiment is worth more to this decision than any further analysis — it decides
-~500 KB of flash, ~52 KB of internal RAM, 3,353 lines of source, and it is a
-precondition for both path B and path C.
+This cannot be settled by reading code. **It is a bench experiment** — and it is worth
+more to this decision than any further analysis, because it decides ~500 KB of flash,
+~52 KB of internal RAM and 3,353 lines of source, and it is a precondition for *both*
+path B and path C.
+
+**The protocol** (about an hour, one OTA, fully reversible):
+
+1. Keep the current known-good `.bin` on hand — that is the rollback.
+2. Baseline the device first: `GET /poll_status`, record `ok` / `timeout` / `txfail` /
+   `pids_unpollable` and `sweep_hz`.
+3. Comment out the single line `elm327_powerpin_commands();` at `elm327.c:3287`.
+   Change nothing else — leave `elm327_init()` and the chip firmware update in place,
+   so the experiment isolates `PPSW` and nothing else.
+4. `idf.py build`, then OTA:
+   `curl -F "file=@build/wican-fw_obd_pro_<ver>.bin" http://<device>/upload/ota.bin`
+   (multipart is mandatory — a raw body fails).
+5. After the reboot, `GET /poll_status` again.
+   - **`ok` still climbing, `txfail` 0** → `PPSW` is irrelevant to the TWAI path.
+     ELM327/MIC3624 becomes deletable in one PR, and it should go first.
+   - **`ok` frozen or `txfail` climbing** → `PPSW` gates the CAN pins. Keep the chip
+     path, and **add a comment at `elm327.c:3287` saying so**, because the next person
+     to read that code will draw exactly the conclusion I did.
+6. Either way, restore the previous `.bin` before drawing further conclusions.
+
+Do it with the engine off and, ideally, not on the car — a device that cannot reach the
+bus is a non-event on the bench and an annoyance in a driveway.
 
 It is also the perfect illustration of why path C is riskier than it looks: a greenfield
 would have to *rediscover* PPSW from scratch, on a device with no serial console, with
