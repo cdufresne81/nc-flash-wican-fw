@@ -1448,6 +1448,10 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "csv_grid_hz", device_config.csv_grid_hz);
 	cJSON_AddStringToObject(root, "csv_require_engine", device_config.csv_require_engine);
 	cJSON_AddStringToObject(root, "log_storage", device_config.log_storage);
+	// "mounted" | "unreadable" | "absent". The card is never auto-formatted, so
+	// an unreadable one keeps the user's logs intact -- this is what tells them
+	// it happened, on a device with no console.
+	cJSON_AddStringToObject(root, "sd_status", sdcard_status_str());
 	cJSON_AddStringToObject(root, "imu_threshold", device_config.imu_threshold);
 	cJSON_AddStringToObject(root, "led_blink", device_config.led_blink);
 	if(gpio_get_level(OBD_READY_PIN) == 1)

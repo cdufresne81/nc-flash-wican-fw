@@ -16,6 +16,19 @@ typedef enum {
     CARD_TYPE_SDIO
 } card_type_t;
 
+/**
+ * @brief Why the SD card is or is not usable.
+ *
+ * The distinction that matters is UNREADABLE vs ABSENT. The card is never
+ * auto-formatted, so an unreadable card still holds the user's logs and is
+ * recoverable -- but only if something tells them. ABSENT needs no action.
+ */
+typedef enum {
+    SD_STATUS_ABSENT = 0,   // no card, or it never responded
+    SD_STATUS_MOUNTED,      // mounted and usable
+    SD_STATUS_UNREADABLE    // card present, no mountable filesystem
+} sd_status_t;
+
 typedef struct {
     uint64_t capacity;     // Card capacity in bytes
     uint16_t sector_size;  // Sector size in bytes
@@ -91,6 +104,16 @@ esp_err_t sdcard_get_info(sdmmc_card_info_t *info);
  * @return ESP_FAIL if file operations or data verification fails
  */
 esp_err_t sdcard_test_rw(void);
+
+/**
+ * @brief Mount status as a wire string: "mounted", "unreadable", or "absent".
+ *
+ * Reported by /check_status. This device has no console, so an unreadable card
+ * would otherwise fail completely silently now that it is no longer erased.
+ *
+ * @return const char* static string, never NULL
+ */
+const char *sdcard_status_str(void);
 
 /**
  * Perform OTA update from a firmware file on the SD card
