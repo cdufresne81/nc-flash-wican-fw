@@ -182,6 +182,13 @@ datalogger.
 **25 HTTP endpoints** are registered. Roughly two-thirds serve the datalogger; the rest
 are upstream's dongle-configuration surface.
 
+**The UI is in better shape than the ledger suggests.** Of 11 elements marked
+`display:none` in `homepage_full.html`, nine are ordinary runtime-conditional UI. Only
+**two** are permanently hidden dead surface: `ble_section` and `wakeup_every_row`, with
+zero references in `main.js`. Whatever else is wrong with a 4,359-line `main.js`, it is
+not carrying a graveyard — which weakens the "the UI has accreted beyond saving" version
+of the rewrite argument. Its problem is structure, not dead weight.
+
 ### The one that is not dead: the MIC3624 / ELM327 path
 
 I went in expecting to find this deletable. It is the single largest deletion candidate

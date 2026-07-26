@@ -40,6 +40,33 @@ It does exactly two jobs:
 Everything else in the tree is either supporting infrastructure (Wi-Fi, config,
 web UI, SD, logging) or inherited from upstream and no longer used.
 
+**The shipped feature set**, as the user meets it — seven tabs in the embedded
+web UI (`homepage_full.html:1087`), because "what the product does" is otherwise
+surprisingly hard to reconstruct from the source:
+
+| Tab | What it offers |
+|---|---|
+| **Console** | The Field Console — live gauges for the polled channels; the Trip Recorder (Start Trip, Mark Event); Recent Trips; a tail of the Event Log |
+| **Files** | SD browser — new folder, download/delete selected, size/modified/type |
+| **Logger** | The **sensor set**: Polled PIDs, Broadcast PIDs, Calculated PIDs, plus Export/Import Sensors and the engine-gating and low-voltage-protection options |
+| **Settings** | Wi-Fi (AP mode, Station mode, Backup Networks, Scan), Sleep Mode, Battery Alert/MQTT, and the protocol selector (OBD App `elm327` / Bench SLCAN) |
+| **Status** | Live device status |
+| **System** | Firmware update (OTA) |
+| **About** | Version and links |
+
+> The **Logger** tab is the product. Everything else is either operating the
+> recorder (Console, Files), configuring the device (Settings, System), or
+> inherited (the Battery Alert/MQTT block, the protocol selector).
+
+**Hidden UI is a much smaller story than issue #28 implies.** Of the 11 elements
+carrying `style="display:none"` in `homepage_full.html`, nine are ordinary
+conditional UI that `main.js` shows and hides at runtime (`ota_progress_row`,
+`csv_grid_hz_row`, `console_mark_btn`, `sleep_warning_div`, `wifi_networks_row`,
+`csv_require_engine_row`, `pid_polling_min_voltage_row`, and two file inputs).
+Only **two are permanently hidden** — `ble_section` (`:1522`) and
+`wakeup_every_row` (`:1334`) — with zero references anywhere in `main.js`. Those
+two are the real "hide, don't delete" residue.
+
 **Scope constraints that explain a lot of the design:**
 
 - **One vehicle.** Mazda NC only. There is no vehicle-selection logic worth
