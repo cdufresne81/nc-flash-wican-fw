@@ -73,7 +73,11 @@ two are the real "hide, don't delete" residue.
   keeping; if you find some, it is upstream residue.
 - **One board.** `CMakeLists.txt:54` hardcodes `set(HARDWARE_VER ${WICAN_PRO})`.
   The V210 / V300 / USB_V100 lines above it are commented out.
-- **One protocol, in practice.** The device always runs `poll_log`. Other
+- **One protocol, in practice — but not out of the box.** A configured device
+  runs `poll_log`. The **factory default is `elm327`** (`"protocol":"elm327"` in
+  `device_config_default[]`, `config_server.c:197`), so a freshly flashed or
+  factory-reset device runs the legacy front-end until someone configures it.
+  Worth knowing before you conclude a bench device is broken. Other
   protocols still exist behind the `protocol` config key for bench use; the
   selector is hidden in the UI.
 - **No serial console.** The USB-C port is a USB **host** at runtime. You cannot
@@ -258,7 +262,7 @@ They live in three files and none of them references the others:
 |---|---|
 | Held **at boot**, SD card holds `/wican.bin` | silent SD-card OTA via `sdcard_perform_ota_update()`, then reboot (`main.c:579-582`) |
 | Held **at boot** 5 s, no such file | `safemode_start()` -> recovery AP (`main.c:539-553`) |
-| Held 5 s **any time after boot** | `config_mode_task()`: BLE off, Wi-Fi forced to AP+STA, LED alternating white/blue until reboot (`config_mode.c:70-88`) |
+| Held 5 s **any time after boot** | `config_mode_task()`: BLE off, Wi-Fi forced to AP+STA, LED alternating **yellow**/blue until reboot — `led_set_level(MAX, MAX, 0)` then `(0, 0, MAX)` (`config_mode.c:62-66`) |
 
 ### `config_server_start()` is not just "start a web server"
 
@@ -322,15 +326,31 @@ yield-free prio-5 loop starves both IDLE and the CSV writer, which is why
 
 Two traps when adding a task:
 
-- **Priority 5 is crowded** — `can_rx`, `can_tx`, `obd_rx`, `adc_task`,
-  `smartconnect`, `wifi_reconnect`, `uart_tx_task`, `uart_rx_task`,
-  `autopid_task`, `config_mode_task` all sit there. Most are inert under
-  `poll_log`, so the effective ladder is clean, but **the number 5 by itself
-  tells you nothing about importance.**
-- **`xTaskCreateStatic` takes stack depth in *words*, `heap_caps_malloc` takes
-  *bytes*.** Two call sites carry comments warning about exactly this
-  (`can_task_stack_depth_words` at `main.c:1093`, and `sync_sys_time.c:200`).
-  Get it wrong and you over- or under-allocate by 4x.
+- **Priority 5 is crowded** — `can_rx`, `can_tx`, `obd_rx`, `smartconnect`,
+  `wifi_reconnect`, `uart_tx_task`, `uart_rx_task`, `autopid_task`,
+  `config_mode_task` all sit there. Most are inert under `poll_log`, so the
+  effective ladder is clean, but **the number 5 by itself tells you nothing
+  about importance.** (`adc_task` is *not* on this list: its only creation,
+  `sleep_mode.c:581`, is inside `#if HARDWARE_VER != WICAN_PRO` — compiled out,
+  not merely inert. The same dead half holds the MQTT client handle, which is
+  why the battery-alert feature cannot work on this board.)
+- **Stack depth is in *bytes*, and the in-code comments that say otherwise are
+  wrong.** ESP-IDF documents `usStackDepth` / `ulStackDepth` as "the NUMBER OF
+  BYTES. Note that this differs from vanilla FreeRTOS"
+  (`freertos/FreeRTOS-Kernel/include/freertos/task.h:315`, `:428`). Two call
+  sites in this repo carry comments claiming *words* —
+  `can_task_stack_depth_words` (`main.c:1093`) and `sync_sys_time.c:200`.
+  > **They are harmless here, and only here.** On the Xtensa port
+  > `portSTACK_TYPE` is `uint8_t` (`portable/xtensa/include/freertos/portmacro.h:88`),
+  > so `sizeof(StackType_t) == 1` and words and bytes coincide. `main.c:1095`'s
+  > `depth_words * sizeof(StackType_t)` is a no-op multiply, and
+  > `StackType_t s_rx_task_stack[POLLLOG_RX_STACK_BYTES]` (`poll_log.c:196`) is
+  > exactly 8,192 bytes, as intended. Nothing is over-allocated.
+  >
+  > The hazard is **portability and review**: the same reasoning on a port where
+  > `StackType_t` is 4 bytes gives you a silent 4x error, and a reviewer who
+  > believes the comments will "fix" correct code. Trust the IDF header, not the
+  > comment.
 
 ### There are TWO paths to the CAN bus, and `can.c` only knows about one
 
@@ -356,7 +376,8 @@ flowchart LR
 ```
 
 `elm327.c` is 3,353 lines split by `#if HARDWARE_VER != WICAN_PRO` at line 65
-with its `#else` at ~1296. **On this board the first ~1,230 lines are dead**, and
+with its `#else` at `:1297` and `#endif` at `:3353`. **On this board the first
+1,232 lines (`:65-1296`, 37% of the file) are dead**, and
 the live half is a **UART bridge to an external MIC3624 OBD chip** — every
 `can_send()` / `twai_*` call in that file is inside the compiled-out branch.
 
