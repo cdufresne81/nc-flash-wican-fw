@@ -111,6 +111,40 @@ So the practical picture is: **~12,000 lines of firmware are effectively ours**
 (fork-created plus the fork-written share of the heavily-modified files), sitting inside
 a ~34,000-line general-purpose OBD-dongle firmware we inherited and mostly do not use.
 
+### Where the defects actually live — and why that is a weaker argument than it looks
+
+Attributing every defect in [audit-2026-07.md](audit-2026-07.md) by `git blame` on the
+offending line:
+
+| Defect | File | Line authored by |
+|---|---|---|
+| 2.1 parser NULL panic (#68) | `config_server.c` | upstream |
+| 2.2 failed OTA leaves CAN off (#69) | `config_server.c:1698, :1743` | upstream (`92b769e6`, `1878aec3`) |
+| 2.4 `ecu_status` always offline | `autopid.c` | upstream |
+| 2.5 credentials logged at INFO | `config_server.c` | upstream |
+| 2.6 `app_main` returns on alloc failure | `main.c` | upstream |
+| 2.7 rollback theatre | `main.c` | upstream |
+| §1 SD reformats on FAT corruption (#71) | `sdcard.c:198` | upstream (`b0b4038d`) |
+| **2.3 dead-man's switch inoperative (#70)** | `datalog_lease_task.c` | **fork** |
+| **#67 sweep predictor assumes uniform PID cost** | `main.js` | **fork** |
+
+Eight of ten in inherited code. That looks like a clean argument for "the inherited code
+is the problem" — **and I do not think you should lean on it**, for two reasons.
+
+First, **the audit was not uniformly distributed.** It concentrated on the code that
+actually runs. The 18,362 untouched inherited lines score well on defect count mostly
+because nobody looked at them, and nobody looked because they never execute. That is a
+selection artifact, not a quality signal.
+
+Second, **the two fork-authored defects are the more serious kind.** The upstream ones
+are mostly sloppiness — a missing NULL check, a log line with a password in it, an early
+return. Each is a local fix. The fork's two are *design* errors: a dead-man's switch
+whose triggering condition can never occur on a running engine, and a scheduler
+predictor built on an assumption (uniform per-PID cost) that mode 22/23 violates by ~7x.
+Those are the failures a rewrite does **not** protect you from, because you would carry
+the same reasoning into v2. Writing the code again does not make you think differently
+about it.
+
 ---
 
 ## 2. What the hardware budget says
