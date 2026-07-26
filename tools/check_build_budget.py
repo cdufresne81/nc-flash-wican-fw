@@ -50,6 +50,13 @@ MAX_PARTITION_USE = 0.85
 # gcc/clang: path:line:col: warning: message [-Wflag]
 WARNING = re.compile(r"^(.+?):(\d+):(?:\d+:)?\s+warning:\s+(.*)$")
 
+# ninja: "[123/456] Building C object ..."
+COMPILE_STEP = re.compile(r"Building (?:C|CXX) object ")
+# Below this share of the baseline's compile steps, the log is from an
+# incremental build and its warning count means nothing -- ninja only re-emits
+# warnings for files it actually recompiled.
+FULL_BUILD_RATIO = 0.9
+
 OURS = ("/main/", "\\main\\", "/components/", "\\components\\")
 NOT_OURS = ("managed_components", "/build/", "\\build\\")
 
@@ -75,6 +82,10 @@ def parse_warnings(log_text: str) -> tuple:
         else:
             external.add(identity)
     return ours, external
+
+
+def count_compile_steps(log_text: str) -> int:
+    return len(COMPILE_STEP.findall(log_text))
 
 
 def app_partition_bytes() -> int | None:
@@ -160,28 +171,46 @@ def main() -> None:
     if not log_path.is_file():
         sys.exit(f"error: missing build log {log_path}")
 
-    ours, external = parse_warnings(
-        log_path.read_text(encoding="utf-8", errors="replace"))
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    ours, external = parse_warnings(log_text)
+    steps = count_compile_steps(log_text)
     image = find_app_image(args.image)
     partition = app_partition_bytes()
     baseline = load_baseline()
 
     if args.update:
+        if baseline.get("compile_steps") and steps < baseline["compile_steps"] * FULL_BUILD_RATIO:
+            sys.exit(f"refusing to update the baseline from an incremental build "
+                     f"({steps} compile steps vs {baseline['compile_steps']} for a "
+                     f"full one). Run `idf.py fullclean && idf.py build` first, "
+                     f"otherwise the warning baseline would be set from the "
+                     f"handful of files that happened to recompile.")
         BASELINE.write_text(json.dumps({
             "_comment": "Ratchet baselines checked by tools/check_build_budget.py. "
                         "Bump in the same PR that legitimately changes a number.",
             "warnings": len(ours),
             "app_image_bytes": image.stat().st_size if image else 0,
+            "compile_steps": steps,
         }, indent=2) + "\n", encoding="utf-8")
         print(f"baseline updated: warnings={len(ours)} "
-              f"app_image_bytes={image.stat().st_size if image else 0}")
+              f"app_image_bytes={image.stat().st_size if image else 0} "
+              f"compile_steps={steps}")
         sys.exit(0)
 
     failed = False
 
     # --- warnings -----------------------------------------------------------
+    # Only meaningful on a full build. ninja re-emits warnings only for files it
+    # recompiled, so an incremental log shows a fraction of them -- which would
+    # read as a large improvement and invite someone to ratchet the baseline down
+    # to a number no full build can ever meet. CI always builds clean; this guard
+    # is for local runs.
+    full_steps = baseline.get("compile_steps")
     limit = baseline.get("warnings")
-    if limit is None:
+    if full_steps and steps < full_steps * FULL_BUILD_RATIO:
+        print(f"skip warnings: incremental build ({steps} compile steps vs "
+              f"{full_steps} for a full one) -- warning count not comparable")
+    elif limit is None:
         print(f"FAIL warnings: {len(ours)} in our code, but no baseline to "
               f"compare against. Run with --update and commit "
               f"tools/build_baseline.json")

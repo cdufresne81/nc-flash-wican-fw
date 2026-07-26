@@ -1,5 +1,6 @@
 {
   "_comment": "Ratchet baselines checked by tools/check_build_budget.py. Bump in the same PR that legitimately changes a number.",
   "warnings": 40,
-  "app_image_bytes": 2743616
+  "app_image_bytes": 2743616,
+  "compile_steps": 1347
 }
