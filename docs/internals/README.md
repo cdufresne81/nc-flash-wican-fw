@@ -14,7 +14,7 @@ Ground rules for these docs:
 |---|---|
 | **[architecture.md](architecture.md)** | **Start here.** The whole-system map: the fork/upstream layering, boot order, task topology, the two paths to the CAN bus, the bus interlock, config model, extension seams, invariants, and how to build/flash/verify |
 | [audit-2026-07.md](audit-2026-07.md) | Dated snapshot (July 2026): verified defects, dead weight with sizes, the refactor that pays for itself, sequencing, and an explicit *what not to do* list |
-| [rewrite-vs-evolve-2026-07.md](rewrite-vs-evolve-2026-07.md) | Decision brief: keep evolving, trim hard, or rebuild v2 from scratch — provenance, flash/RAM budget, the three paths costed, and what evidence would change the recommendation |
+| [rewrite-vs-evolve-2026-07.md](rewrite-vs-evolve-2026-07.md) | Decision brief: keep evolving, trim, rebuild, or extract-then-grow-v2-beside-v1 — provenance, flash/RAM budget, four costed paths, an adversarial review that overturned the first recommendation, and what evidence would change the current one |
 | [poll_log.md](poll_log.md) | The Datalogger protocol: free-running PID polling, hybrid broadcast capture, engine-off quiesce, sweep-rate measurement, `/poll_status` |
 | [csv_logger.md](csv_logger.md) | The wide-CSV trip logger: the fixed-rate grid, the Auto (fastest) rate, registration patterns, RTC crash guard |
 | [web_ui.md](web_ui.md) | Web UI build pipeline, lint gates, and the hidden-feature (streamline) pattern |

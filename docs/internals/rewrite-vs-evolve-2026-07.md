@@ -11,38 +11,75 @@ list of the specific facts that would change that recommendation.
 
 ---
 
+> **Revised 2026-07-26 after adversarial review.** The first draft of this brief
+> recommended "path B — subtractive rebuild in place." That recommendation does
+> not survive its own evidence, and §9 records exactly what broke and why. The
+> recommendation is now **path D** (§4). Three of the first draft's load-bearing
+> claims were wrong: the deletion target, the PPSW experiment design, and the
+> ordering — which contradicted [audit-2026-07.md](audit-2026-07.md):197-198,
+> my own document. I have left the errors visible rather than quietly editing
+> them out, because the *reasons* they were wrong are the most useful content
+> here.
+
+---
+
 ## 0. The short version
 
 The instinct behind "maybe rebuild" is correct, but it is aimed at the wrong target.
 
-The pain in this codebase is **not** distributed across 46,000 lines. It is
-concentrated in three places, and only one of them is inherited:
+The pain in this codebase is **not** distributed across 46,000 lines, and it is **not**
+mostly the dead code:
 
-| Where it hurts | Lines | Who wrote it | Rebuildable in isolation? |
+| Where it hurts | Lines | Who wrote it | What actually fixes it |
 |---|---|---|---|
-| The config model (839-line hand-rolled parser, 51 flat keys) | ~900 | inherited, fork-extended | **Yes** |
-| The web UI (one 4,359-line `main.js`, no framework, no build step until recently) | ~4,400 | ~59% fork | **Yes** |
-| Carrying dead product surface you never use (ELM327, BLE, SLCAN, MQTT, sleep, IMU, multi-board) | ~18,000 | inherited, untouched | **Yes — by deletion** |
+| **Coupling** — 5 components declare `REQUIRES main`, so no firmware logic can be tested off-device at all | structural | fork + inherited | Break the cycles behind a **~12-function facade** (§4, path D) |
+| The config model (839-line hand-rolled parser, 51 flat keys, 12 remote-panic sites) | ~900 | inherited, fork-extended | A schema table — audit §3 |
+| The web UI (one 4,359-line `main.js`) | ~4,400 | ~59% fork | Modules with real boundaries |
+| **Interleaving** — `can.c` 42% fork, `autopid.c` 44%, `config_server.c` 21%: you need `git blame` to know if a line is trustworthy | ~12,000 | mixed | Only a rewrite of those files |
+| Dead product surface (ELM327, console, SLCAN, IMU, SmartConnect…) | **~8-10k realistically**, not the ~26k I first claimed | inherited | Falls out free when v1 retires |
 
-None of those three requires a greenfield firmware. All three are *subsystem-scoped*.
-Meanwhile, the things a greenfield would force you to re-earn — board bring-up, OTA and
-the unbrick paths, the CAN interlock, the external OBD chip — are the parts that are
-currently **working and hard-won**, and the parts with the least test coverage to catch
-a regression.
+The first four are what cost you. **Deletion is last**, which is also exactly where
+[audit-2026-07.md](audit-2026-07.md):197-198 puts it — a fact the first draft of this
+brief managed to contradict.
 
-**Recommendation: a subtractive rebuild in place** (path B below). Delete the ~18,000
-lines of product surface you do not ship, then rewrite the config model and the web UI
-as first-class subsystems inside the existing tree. That gets you most of the
-greenfield's clarity, keeps every step bench-testable, and never puts you in a state
-where the device does not boot.
+**Recommendation: path D — extract the product, then grow v2 beside v1** (§4).
 
-**One experiment gates a third of that deletion.** The ELM327 / MIC3624 path is the
-largest single removal candidate (~500 KB flash, ~52 KB internal RAM, 3,353 lines) and
-the datalogger provably does not poll through it — but its boot path sets an
-undocumented vendor register (`PPSW`) that may be what connects the CAN pins at all. See
-§3. Resolve that on the bench before planning anything else.
+1. **Now, and independent of the decision:** fix storage (audit §1 — the defect that
+   eats the product's only deliverable), replace the config parser with a schema table
+   (audit §3), and build host tests (audit §4). While doing the tests, **break the five
+   `main` dependency cycles and land a platform facade** — measured below at *four call
+   sites, three functions*, plus the `can_*` lease API and a voltage peek. The tests
+   force that boundary into existence anyway.
+2. **Then:** a second `app_main` in the same repo. Two images from one tree — v1 stays
+   the daily driver while v2 grows: designed task topology, a dispatch table, the
+   guardrail files ported verbatim, the fork's components running on the facade. The
+   bench A/Bs them by OTA. v2 ships when it passes the runbook two weeks running.
+3. **Deletion happens implicitly.** v2 never references `elm327`, `console`,
+   `smartconnect`. When v1 retires, one commit removes it. Nobody bench-tests two dozen
+   janitorial PRs.
 
-The honest counter-argument is in §6. Read it before agreeing with me.
+**Why not the subtractive rebuild I first recommended.** Three reasons, all of them
+things my own documents already said:
+
+- **The deletion target was wrong.** I claimed ~46,000 → ~20,000 lines. The honest
+  ledger is **~8-10k**, i.e. ~20%, not 55% — `obd2_standard_pids.h` (3,654 lines) is
+  *live*, `sleep_mode.c` is partly live, BLE contradicts a recorded keep decision, and
+  ELM327 is entangled with PPSW. See §4, path B.
+- **It leads with the work my own audit ranks last.**
+  [audit-2026-07.md](audit-2026-07.md):197-198 says dead code is the *"Lowest-value
+  tier... **Do this after §1, §3 and §4**, not before."* The decision brief promoted it
+  to stage 1. That contradiction is the clearest evidence of motivated reasoning in this
+  document, and I did not spot it myself.
+- **Deletion doesn't touch what actually costs.** The comprehension tax is in the
+  *interleaved* files — `can.c` 42% fork, `autopid.c` 44%, `config_server.c` 21%,
+  `main.js` 59% — where you need `git blame` to know whether a line is trustworthy.
+  Stage 1 deletes inert lines and leaves every one of those.
+
+**The PPSW experiment as I first designed it does not work** — see §3. It is also
+unnecessary: carry a ~40-line "ensure PPSW=10, sleep the chip" shim into v2 and delete
+the other ~3,300 lines plus the 494 KB blob without answering the scary question.
+
+The honest counter-argument is in §6, and §9 records what the review changed.
 
 ---
 
@@ -259,32 +296,39 @@ typically routes OBD-II connector pins to a transceiver. If PPSW=10 is what conn
 CAN-H/CAN-L to the TWAI transceiver, then removing this "dead" subsystem silently kills
 the datalogger.
 
-This cannot be settled by reading code. **It is a bench experiment** — and it is worth
-more to this decision than any further analysis, because it decides ~500 KB of flash,
-~52 KB of internal RAM and 3,353 lines of source, and it is a precondition for *both*
-path B and path C.
+> ### ⚠️ The obvious experiment does not work — and this is the interesting part
+>
+> My first draft proposed: comment out `elm327_powerpin_commands()`, flash, see whether
+> polling still works. **That experiment is invalid**, and the code says why.
+>
+> Read `elm327.c:1415-1436`. It is **check-then-set**: send `VTPPSWS`, and write
+> `VTPPSW10` *only if the readback isn't already 10* — then hard-reset the chip. A
+> check-then-set with an "already 10" fast path only makes sense if **the setting
+> persists inside the MIC3624**. The bench unit has booted the writing firmware
+> hundreds of times, so its chip already holds 10.
+>
+> Therefore skipping the call and observing that polling still works proves **nothing**.
+> It would report "safe to delete" even if PPSW=10 were strictly required, because
+> nothing reset it. It measures the state of one already-configured chip, not the
+> dependency.
+>
+> A valid experiment needs either a **factory-fresh unit**, or a deliberate PPSW reset
+> to a non-10 value first — writing an undocumented vendor register on the one device
+> that works, which is exactly the kind of thing that turns a bench into a paperweight.
 
-**The protocol** (about an hour, one OTA, fully reversible):
+**So do not gate anything on it.** The question decouples from the deletion entirely:
 
-1. Keep the current known-good `.bin` on hand — that is the rollback.
-2. Baseline the device first: `GET /poll_status`, record `ok` / `timeout` / `txfail` /
-   `pids_unpollable` and `sweep_hz`.
-3. Comment out the single line `elm327_powerpin_commands();` at `elm327.c:3287`.
-   Change nothing else — leave `elm327_init()` and the chip firmware update in place,
-   so the experiment isolates `PPSW` and nothing else.
-4. `idf.py build`, then OTA:
-   `curl -F "file=@build/wican-fw_obd_pro_<ver>.bin" http://<device>/upload/ota.bin`
-   (multipart is mandatory — a raw body fails).
-5. After the reboot, `GET /poll_status` again.
-   - **`ok` still climbing, `txfail` 0** → `PPSW` is irrelevant to the TWAI path.
-     ELM327/MIC3624 becomes deletable in one PR, and it should go first.
-   - **`ok` frozen or `txfail` climbing** → `PPSW` gates the CAN pins. Keep the chip
-     path, and **add a comment at `elm327.c:3287` saying so**, because the next person
-     to read that code will draw exactly the conclusion I did.
-6. Either way, restore the previous `.bin` before drawing further conclusions.
+**Keep a ~40-line shim** — take the UART, `VTPPSWS`, write `VTPPSW10` if needed,
+hard-reset, then put the chip to sleep — and delete the other ~3,300 lines of
+`elm327.c` and the 494,260 B firmware-update blob. You get essentially the whole win
+without answering the scary question, and the shim is small enough to read in one
+sitting and comment properly at the call site.
 
-Do it with the engine off and, ideally, not on the car — a device that cannot reach the
-bus is a non-event on the bench and an annoyance in a driveway.
+Settle the register question opportunistically, on a fresh unit, if one ever exists. It
+is a curiosity, not a blocker. **My first draft made it "the top recommendation" and
+said "everything else waits on it" — that was wrong, and conveniently so: it put a fun
+one-hour bench experiment in front of the grinding config-parser rewrite that the audit
+actually ranks first.**
 
 It is also the perfect illustration of why path C is riskier than it looks: a greenfield
 would have to *rediscover* PPSW from scratch, on a device with no serial console, with
@@ -292,7 +336,7 @@ the symptom "CAN doesn't work" and no obvious cause.
 
 ---
 
-## 4. The three paths
+## 4. The four paths
 
 ### Path A — Evolve as-is
 
@@ -304,32 +348,42 @@ Work the defect ledger ([audit-2026-07.md](audit-2026-07.md)), leave the structu
 - **Failure mode:** every future feature keeps paying the comprehension tax. This is the
   status quo, and the status quo is why the question is being asked.
 
-### Path B — Subtractive rebuild in place *(recommended)*
+### Path B — Subtractive rebuild in place *(first draft's recommendation — withdrawn)*
 
-Same repo, same git history, same device that boots at every step. Three ordered stages:
+Delete the unshipped surface first, then rewrite the config model and the web UI in
+place. Stages 2 and 3 survive into path D; **stage 1 is what fails.**
 
-1. **Delete the product surface you do not ship.** SLCAN, BLE serial bridge,
-   comm_server, SmartConnect, `console.c`, IMU, the generic PID table, MQTT, the
-   multi-board preprocessor, vehicle profiles — and ELM327/MIC3624 **if and only if the
-   PPSW experiment (§3) clears it**, in which case it is by far the biggest win and
-   should go first. Each deletion is independently
-   bench-testable; if a deletion breaks the device you revert *that* commit, not the
-   project. Target: **~46,000 → ~20,000 lines.**
-2. **Rewrite the config model.** Replace the 839-line hand-rolled parser with a
-   table-driven schema — one array of `{key, type, default, live_appliable, validator}`
-   and a generic apply loop. This kills issue #68 (the panic-on-non-string bug) as a
-   *class*, kills the "keep 5 places in lockstep" recipe, and makes the reboot-vs-live
-   decision data instead of a macro list.
-3. **Rewrite the web UI as a built artifact.** The build pipeline
-   (`tools/build_web.py`, `tools/lint_web.py`, `tools/webtest/`) already exists. The
-   remaining work is splitting `main.js` into modules with real boundaries.
+**The deletion ledger does not sum to what I claimed.** I wrote "target ~46,000 →
+~20,000." Actually counting, with each item's real status:
 
-- **Cost:** medium. Stage 1 is mostly mechanical and high-confidence. Stages 2 and 3 are
-  genuine rewrites, but each is one subsystem with a testable contract at its edge.
-- **Buys:** ~55% less code, the two worst subsystems replaced, no bring-up risk.
-- **Failure mode:** stage 1 stalls halfway and you end up with a tree that is neither
-  the old thing nor the new thing. Mitigate by making each deletion its own PR with its
-  own bench pass.
+| Candidate | Lines | Reality |
+|---|---:|---|
+| `elm327.c` | 3,353 | PPSW-entangled — a ~40-line shim must stay (§3) |
+| `obd2_standard_pids.h` | 3,654 | **NOT DEAD.** Included by `config_server.c`, `autopid.c`, `autopid_config.c`, `autopid_http_test_pid.c`, `obd2_standard_pids.c` — it feeds the #61 standard-form authoring path |
+| `sleep_mode.c` | 1,245 | **Only ~524 deletable** (the non-PRO half, `:61-584`). `csv_logger.c:388` calls `sleep_mode_get_voltage()` for the BATT_V column |
+| `ble.c` | 1,562 | Contradicts the keep decision recorded in `README.md:76-79` |
+| `console.c` | 1,166 | Genuinely deletable |
+| IMU (`icm42670.c` + `imu.c`) | 1,101 | Genuinely deletable |
+| `smartconnect.c` (+ header) | 819 | Genuinely deletable |
+| `slcan.c` | 645 | Genuinely deletable — verified `slcan_port.c` includes only `types.h`, never `slcan.h` |
+| `comm_server.c` | 549 | Genuinely deletable |
+| `obd.c` | 386 | Partial — `obd.h` is included by `sleep_mode.c` and `wc_uart.c` |
+| autopid legacy half | ~1,700 | A split, not a delete (§7 of architecture.md) |
+
+Generous gross: **~13-16k**. Realistic near-term: **~8-10k**, i.e. 46k → ~36-38k.
+**~20%, not the 55% I claimed.** Two of the three biggest line items are entangled or
+live, and a third contradicts a recorded decision.
+
+- **Cost:** medium — but the bench cost was never priced. One PR per deletion, each with
+  an OTA and a runbook pass, is *dozens* of cycles of the scarcest resource here: one
+  person, one bench, one car.
+- **Buys:** ~20% fewer lines, none of them the lines that cost comprehension.
+- **Why it's withdrawn:** it leads with the work [audit-2026-07.md](audit-2026-07.md)
+  ranks last, it doesn't touch the interleaved god files where the defects and the
+  comprehension tax actually live, and its terminal state still contains every trap in
+  architecture.md §11 — including the one that document *predicts* someone will trip
+  ("`can_tx_task`… will look like dead code wrapping five live lines — and somebody will
+  delete or repurpose the task").
 
 ### Path C — Greenfield v2
 
@@ -354,31 +408,117 @@ New ESP-IDF project, port the fork-created components, design the rest fresh.
   the LED means nothing, and the bench device is bricked once. Meanwhile v1 is still the
   only thing that drives the car.
 
+### Path D — Extract the product, then two mains in one tree *(recommended)*
+
+The option the first draft missed entirely, because I framed the question as
+evolve/trim/rebuild and never asked whether the *coupling* could be fixed independently
+of either.
+
+**Stage 1 — extract (path-independent; do this whatever you decide later).**
+
+Work [audit-2026-07.md](audit-2026-07.md) in its own stated order: §1 storage, §3 the
+config schema table, §4 host tests. While building the tests, break the five
+`main` dependency cycles and define a platform facade — because host tests cannot exist
+until you do, which is precisely why they don't exist today.
+
+**The facade is small, and this is measurable rather than hopeful.** Across all four
+fork components (`csv_logger`, `fast_log`, `sd_filemgr`, `event_log`) there are exactly
+**four `config_server_*` call sites covering three functions**:
+
+```
+2x  config_server_get_can_rate()
+1x  config_server_get_csv_grid_hz()
+1x  config_server_get_csv_require_engine()
+```
+
+plus the `can_*` lease/bus API and one `sleep_mode_get_voltage()` peek. That is roughly
+a dozen functions, not an abstraction project.
+
+**And the tree already proves it works:** `components/event_log` has **no `main` in its
+`REQUIRES`** at all (`freertos fatfs vfs esp_timer log esp_http_server`), and neither
+does `crash_report`. The other four declare `REQUIRES main` out of convenience, not
+necessity. Move the `/datalog` lease endpoints out of `csv_logger` while you are there —
+architecture.md §9 already calls that "the one boundary worth fixing."
+
+**Stage 2 — grow v2 beside v1.**
+
+A second, thin `app_main` in the same repo: one protocol, one board, a dispatch table
+instead of an if/else chain, designed task topology, real post-boot supervision. The
+guardrail files (`safemode.c`, `multipart_upload.c`) come across **verbatim** — they are
+self-contained and contract-documented, so that is a copy plus a CMake entry, not a
+rewrite. The extracted components come across on the facade.
+
+Build **both images from one tree**. The bench A/Bs them by OTA. v1 remains the daily
+driver until v2 passes the full runbook two weeks running.
+
+**Stage 3 — deletion happens by itself.** v2 never references `elm327`, `console`,
+`smartconnect`, `comm_server`, `slcan`. When v1 retires, one commit removes it. Nobody
+bench-tests two dozen janitorial PRs.
+
+- **Cost:** the same total work as B, in a different order, with the janitorial part
+  free at the end instead of expensive at the front.
+- **Buys:** host-testability (the thing that unblocks everything else on a device you
+  cannot plug into), a genuine redesign, and — critically — the B-vs-C decision becomes
+  *cheap and reversible* instead of a commitment made now on incomplete evidence.
+- **Preserves the one constraint that is non-negotiable:** there is never a moment
+  without a shippable image.
+- **Failure mode:** v2 stalls at 80% and you maintain two firmwares. Mitigate with a
+  hard rule — v2 does not get a second feature until it passes the runbook once.
+
+**This is the strangler fig adapted to firmware.** You cannot strangle at runtime on a
+single MCU, so you strangle at the *build system*.
+
 ---
 
-## 5. Why B and not C
+## 5. Why I first said B not C — and what was wrong with it
 
-Three arguments, in decreasing order of how much I believe them.
+Three arguments. Each has a real core, and each was pushed further than it supports.
 
-**1. The risk is inverted from where it feels.** It feels like the 46,000 lines are the
-risk and a clean 12,000-line v2 is the safe end state. But the 46,000 lines *currently
-boot, flash a PCM without bricking it, and survive a power cut*. The riskiest code in a
-v2 is the code you would write in week one — bring-up, OTA, partition layout — which is
-exactly the code you have never had to write, because you inherited it working.
+**1. "The risk is inverted from where it feels."** The 46,000 lines *do* currently boot,
+flash a PCM without bricking it, and survive a power cut. That part stands.
 
-**2. You cannot test your way out of a big bang here.** The device has no serial console
-(USB-C is host-mode at runtime), so every verification is an OTA away. Path B keeps that
-loop at "one deletion, one OTA, one `/poll_status` check". Path C makes it "several
-thousand lines of new bring-up, then find out."
+> **But the conclusion doesn't follow.** Week-one bring-up — LED, SD mount, LittleFS,
+> Wi-Fi AP — is the most example-saturated, most-portable code in embedded. The
+> genuinely subtle code is the fork's own: the two-flag interlock, sweep self-pacing,
+> the lock-timeout contract, hot-reload-under-mutex. That is already written,
+> bench-proven over 25M polls, and **ports with the product**. And the things that
+> actually bit this project — the `interrupt_wdt` from I2C/SD contention (#59),
+> init-order preemption (`csv_logger.c:1418-1430`), RAM placement
+> (`poll_log.c:118`) — are *integration* hazards, which every path-B deletion PR
+> also reshuffles, on the same console-less device.
 
-**3. The flash budget removes the strongest pro-rewrite argument.** 47% free. There is
-no forcing function. A rewrite would be chosen, not compelled — which means it must
-justify itself purely on maintainability, and deletion buys most of that maintainability
-at a fraction of the risk.
+**2. "You cannot test your way out of a big bang here."** True, and I used it only
+against C.
 
-## 6. The strongest case *against* my recommendation
+> **Follow it one step further and it argues for C.** The more expensive on-device
+> verification is, the more valuable it is to run logic *off-device*. This tree cannot:
+> five components declare `REQUIRES main`; `poll_log.c:70-75` includes `can.h`,
+> `autopid.h`, `config_server.h` and `expression_parser.h`; `csv_logger` drives bus
+> arbitration. My own audit §4 calls host tests "a hard prerequisite" and they don't
+> exist **because the structure forbids them**. A design with a hardware seam gets
+> host-testability by construction — worth more here than on a device you *can* plug
+> into. I wielded the console-less constraint in one direction only.
 
-I should argue the other side properly, because it is not weak.
+**3. "The flash budget removes the pro-rewrite argument."** 47% free, no forcing
+function — correct.
+
+> **But it cuts against path B's stage 1 just as hard.** If deletion buys neither flash
+> nor RAM, its only product is comprehension — and comprehension cost per line is
+> wildly non-uniform. `obd2_standard_pids.h`'s 3,654 lines are a passive table nobody
+> reads. `elm327.c`'s dead half sits behind one `#if` that architecture.md now explains
+> in a paragraph. The lines that actually cost are the interleaved ones, which stage 1
+> never touches. **I measured line counts because they are measurable, not because they
+> are the cost.**
+
+**And the one I never repriced.** The expensive part of a rewrite here was always the
+undocumented couplings — boot order, the priority ladder, config reads before
+`main.c:815`, PPSW. I have just spent this whole exercise documenting exactly those.
+*The document written to justify not rewriting is the artifact that makes rewriting
+affordable.* The brief priced path C at its pre-documentation cost and never went back.
+
+## 6. The strongest case *against* the recommendation
+
+Path D is not free of objections either. The honest ones:
 
 - **Deletion is not design.** Path B ends with a smaller version of a structure that was
   never designed for this product. `main.c` still creates 40-odd tasks by hand; the
@@ -431,55 +571,120 @@ Concrete, checkable facts — not vibes:
    undocumented driver and recovery code onto a console-less device" is the honest
    description of path C's first milestone, and two of those files are marked
    **guardrail** precisely because breaking them costs you the device.
-2. **If the MIC3624 chip's `PPSW` setting is not load-bearing for the TWAI path.**
-   Answered halfway in §3: the datalogger provably does *not* poll through the chip, but
-   `elm327_init()` still runs every boot and sets an undocumented vendor power-switch
-   register. Resolve it with **one bench experiment** (skip `elm327_powerpin_commands()`,
-   flash, confirm `/poll_status` still counts). If PPSW turns out to be irrelevant to
-   CAN, ~500 KB of flash, ~52 KB of internal RAM and 3,353 lines become deletable in a
-   single PR, and path B's stage 1 pays for itself immediately.
-3. **If upstream is now genuinely abandoned for our purposes.** We are 4 commits behind
-   `upstream/wican-pro` and have taken nothing since 2026-04-12. If the intent is never
-   to merge upstream again, the "deletion can be undone by a merge" objection to B
-   disappears, and so does most of the reason to preserve upstream's structure at all.
-4. **If a second vehicle or a second product ever appears.** Then the inherited
-   generality stops being dead weight and a rewrite that assumes one car is the wrong
-   bet in the other direction.
-5. **If DIRAM headroom drops below ~60 KB.** Then memory *does* become a forcing
+2. ~~**If the MIC3624 chip's `PPSW` setting is not load-bearing.**~~ **Withdrawn as a
+   gate.** The experiment I proposed is invalid (§3 — check-then-set implies the
+   register persists, so the bench unit's chip already holds 10 and would report "safe"
+   either way), and the question decouples from the deletion anyway via the ~40-line
+   shim. Answer it opportunistically on a fresh unit or not at all.
+
+3. **⭐ Is a bad image actually recoverable — i.e. is "brick" real?** This is the
+   question neither the first draft nor its critique asked, and it is worth more than
+   PPSW. Both paths' risk models rest on "a bad OTA can cost you the device." From the
+   tree, the firmware side shows **no barrier to ROM recovery**:
+
+   - `CONFIG_SECURE_BOOT is not set` (`sdkconfig:493`) — the ROM will accept an unsigned
+     image.
+   - No efuse config here disables ROM download mode or UART download.
+   - `CONFIG_SOC_USB_SERIAL_JTAG_SUPPORTED=y`, `CONFIG_USJ_ENABLE_USB_SERIAL_JTAG=y` —
+     and the ROM's USB-Serial-JTAG sits *below* the application, so the runtime USB
+     host role does not govern it.
+   - `wusb3801_init()` only reads the device ID and CC status; the `CTRL_REG` write is
+     commented out (`wusb3801.c:78-79`), so the USB role is chip-default/strap-level,
+     not something the firmware asserts.
+
+   **What I cannot determine from source:** whether the board physically exposes
+   GPIO0/BOOT, and whether USB-C D+/D− actually reach the ESP32-S3's native USB pins.
+   That is a schematic question, answerable with a multimeter and the case open.
+
+   **If download mode is reachable, "brick" means "screwdriver and ten minutes."** The
+   guardrail files stop being existential, every risk rating in §4 drops a tier, and the
+   single largest argument for staying inside v1's structure evaporates. **Answer this
+   before anything else.** Related and cheaper: a second WiCAN PRO is roughly $60-100,
+   and the entire console-less-risk edifice is downstream of owning exactly one device.
+4. ~~**If upstream is now genuinely abandoned.**~~ **Already answered by the data, and
+   presenting it as an open question was deferral.** `main.js` churn is +2,556/−3,687 —
+   a merge there *is* a rewrite of the merge. 180 fork commits, 4 behind, nothing taken
+   in three and a half months. The decision was made in April; only the admission is
+   outstanding.
+
+5. **If your sustained time budget is a few hours a week.** Then neither rewrite. Do
+   audit §1, §3 and §4 and stop — path A plus the config table is the right answer for
+   that budget, and both the brief and its critique should stop dressing it up as
+   anything more ambitious. **This is the single most decision-relevant fact and only
+   you have it.**
+
+6. **If de-cycling the components turns out expensive** — if the facade balloons past
+   ~20 functions once you actually try it — then "ports cleanly" was false for path D
+   *and* for the B→C composition, and evolve-in-place is what remains. The measured
+   four call sites say otherwise, but measuring call sites is easier than moving them.
+
+7. **If a second vehicle or a second product ever appears.** Then the inherited
+   generality stops being dead weight and a design that assumes one car is the wrong bet
+   in the other direction.
+
+8. **If DIRAM headroom drops below ~60 KB.** Then memory *does* become a forcing
    function and the calculus changes.
 
-**Item 1 is now answered and it moved the needle toward B.** Item 2 is the one that
-still matters and it is an experiment, not an analysis. Items 3–5 are yours to decide.
-**Do not commit either way until item 2 is run.**
+**Item 1 is answered. Items 2 and 4 are withdrawn as gates.** Item 3 (is a brick really
+a brick?) is now the highest-value unknown, and it is a hardware determination, not a
+firmware one. Item 5 is yours alone and it dominates everything else.
 
 ## 8. The decision the owner has to make
 
 ```mermaid
 flowchart TB
-    START(["Start here"]) --> PPSW{"PPSW bench experiment:<br/>skip elm327_powerpin_commands(),<br/>does polling still work?"}
-    PPSW -->|"yes — chip not load-bearing"| BIG["Delete ELM327 / MIC3624<br/><b>~500 KB flash · ~52 KB RAM · 3,353 lines</b><br/>one PR, one bench pass"]
-    PPSW -->|"no — chip gates the CAN pins"| KEEP["Keep the chip path.<br/>Document PPSW at the call site<br/>so nobody deletes it later"]
-    BIG --> UP
-    KEEP --> UP{"Do we ever merge<br/>upstream again?"}
-    UP -->|"no"| FREE["Delete freely.<br/>Upstream layout stops<br/>being a constraint"]
-    UP -->|"yes"| CARE["Keep the structure<br/>recognisable; delete only<br/>what upstream also considers dead"]
-    FREE --> ONE{"Is one vehicle<br/>permanent?"}
-    CARE --> ONE
-    ONE -->|"yes"| B["<b>Path B</b> — subtractive rebuild:<br/>stage 1 deletions, then rewrite<br/>the config model and the web UI"]
-    ONE -->|"no / unsure"| A["<b>Path A</b> — fix defects only.<br/>Inherited generality may<br/>turn out to be an asset"]
+    START(["Start here"]) --> TIME{"Sustained time budget?"}
+    TIME -->|"a few hours a week"| A["<b>Path A+</b> — audit §1 storage,<br/>§3 config schema table, stop.<br/>No rewrite. Be honest about this."]
+    TIME -->|"more than that"| WORK["<b>Do the path-independent work</b><br/>audit §1 storage · §3 config table · §4 host tests<br/><i>+ break the 5 REQUIRES-main cycles,<br/>land the ~12-function facade</i>"]
+    WORK --> BRICK{"Is ROM download mode<br/>reachable with the case open?<br/><i>(multimeter + schematic)</i>"}
+    BRICK -->|"yes — a brick is a screwdriver"| D["<b>Path D</b> — second app_main in this tree.<br/>Two images, v1 stays the daily driver,<br/>v2 grows beside it, deletion falls out free"]
+    BRICK -->|"no, and only one device"| D2["<b>Path D, slower</b> — same shape,<br/>but buy a second unit first (~$60-100)<br/>or accept a longer A/B period"]
+    D --> SHIP{"v2 passes the full runbook<br/>two weeks running?"}
+    D2 --> SHIP
+    SHIP -->|"yes"| RETIRE["Retire v1 in one commit.<br/>elm327 / console / smartconnect<br/>go with it, never individually deleted"]
+    SHIP -->|"no, stalled at 80%"| HOLD["Stop adding v2 features.<br/>v1 is still shipping —<br/>this is a delay, not a failure"]
 ```
 
 Not "rewrite or not". These, in order:
 
-1. **Run the PPSW bench experiment.** Not a judgement call — an experiment, and the
-   cheapest high-value thing on this list. It gates ~500 KB of image, ~52 KB of internal
-   RAM, and a third of the "dead weight" list. Everything else waits on it.
-2. **Do we ever merge upstream again?** Yes ⇒ keep the structure recognisable. No ⇒
-   delete freely and stop treating upstream's layout as a constraint.
-3. **Is one vehicle a permanent product decision or a current simplification?**
-4. **Then**, and only then: stage 1 of path B as a series of bench-tested PRs, with the
-   config model and web UI rewrites scheduled as their own projects — inside this repo,
-   or as the seed of a v2, depending on how 1–3 land.
+1. **How many hours a week, sustained?** Everything downstream depends on it, and only
+   you know. A few hours a week ⇒ audit §1 + §3 and stop; anything more ⇒ path D.
+2. **Is a brick actually a brick?** One hardware determination — does the board expose
+   GPIO0/BOOT, and does USB-C reach the S3's native USB pins? Secure boot is off and
+   nothing in the config disables ROM download, so the firmware side is already clear
+   (§7.3). If recovery is a screwdriver away, every risk rating in this document drops a
+   tier.
+3. **Then start the path-independent work regardless** — storage, config schema, host
+   tests, and the facade. None of it is wasted under any outcome, and it is the only
+   sequence [audit-2026-07.md](audit-2026-07.md) itself endorses.
+4. **Decide B-vs-C only after the facade exists**, when the choice is cheap and
+   reversible instead of a bet placed now.
+
+**What *not* to do:** do not start deleting. It is the most satisfying work available
+and the least valuable, my own audit ranks it last, and the honest ledger says it buys
+~20% of the lines and none of the comprehension.
+
+---
+
+## 9. What the adversarial review changed
+
+Recorded because the errors are more instructive than the conclusion.
+
+| First draft said | Reality | Why I got it wrong |
+|---|---|---|
+| Delete ~26,000 lines; 46k → 20k | ~8-10k realistically; `obd2_standard_pids.h` is live, `sleep_mode` partly live, BLE contradicts a recorded decision | Never summed my own ledger. The unchecked total was the number that made path B look transformative rather than janitorial |
+| PPSW: one bench experiment settles it; everything waits on it | The experiment is invalid — check-then-set implies persistence, so the bench chip already holds 10 and would report "safe" either way | Did not read `elm327.c:1415-1436` closely enough before designing an experiment on it |
+| Stage 1 = deletion | `audit-2026-07.md:197-198`, my own document, says dead code is the *lowest*-value tier and to do it **after** §1/§3/§4 | Motivated ordering. Deletion is pleasant; the config rewrite is not |
+| Three paths: evolve / trim / rebuild | A fourth exists and is better: extract the product behind a facade, then two mains in one tree | Framed it as a choice about *code volume* rather than about *coupling* |
+| Path C must re-earn ~3,900 lines, so it is expensive | Those are lines to **move**, and the couplings that made a rewrite expensive are exactly what architecture.md just documented | Priced path C at its pre-documentation cost and never repriced it after writing the map |
+| "No console ⇒ big bang is too risky" (against C) | Same fact argues *for* a design with a hardware seam, because off-device testing is worth more here than anywhere | Used a constraint in one direction only |
+| "47% flash free ⇒ no forcing function" (against C) | True, and it undercuts path B's stage 1 just as hard — if deletion buys no flash and no RAM, its only product is comprehension, which stage 1 doesn't deliver | Measured what was measurable |
+| Gate: "do we ever merge upstream again?" | Already answered by the churn data — 4 behind, nothing taken since April, `main.js` +2,556/−3,687 | Deferral dressed as a question |
+
+Two of the critique's own claims did **not** survive checking, and are not reflected
+above: that `autopid_get_config()` does not exist (it does — `autopid.c:1250`), and a
+reported 4x stack over-allocation (`StackType_t` is `uint8_t` on Xtensa, so there is
+none). Verify before conceding, in both directions.
 
 ---
 

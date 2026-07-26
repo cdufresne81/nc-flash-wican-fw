@@ -1049,7 +1049,7 @@ Worth saying, because a refactor can easily destroy these:
 | Doc | Covers |
 |---|---|
 | [audit-2026-07.md](audit-2026-07.md) | Dated defect ledger: what is broken, what is dead weight, and in what order to fix it |
-| [rewrite-vs-evolve-2026-07.md](rewrite-vs-evolve-2026-07.md) | Decision brief: keep evolving this tree, trim it hard, or design v2 from scratch — with the measured numbers behind each option |
+| [rewrite-vs-evolve-2026-07.md](rewrite-vs-evolve-2026-07.md) | Decision brief: keep evolving, trim, rebuild, or extract-then-grow-v2-beside-v1 — the measured numbers behind each, and the review that overturned the first answer |
 | [poll_log.md](poll_log.md) | The Datalogger protocol: sweep model, divisors, quiesce, hybrid capture, Mode 23, `/poll_status` |
 | [csv_logger.md](csv_logger.md) | The wide CSV: fixed-rate grid, Auto rate, registration seams, RTC crash guard |
 | [web_ui.md](web_ui.md) | Web build pipeline, lint gates, the hide-don't-delete pattern, config round-trip gotchas, the sensor-set file |
