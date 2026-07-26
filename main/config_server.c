@@ -713,6 +713,85 @@ static esp_err_t index_handler(httpd_req_t *req)
 	X(batt_alert_url) X(batt_alert_port) X(batt_alert_topic) \
 	X(batt_mqtt_user) X(batt_mqtt_pass)
 
+// ---- Stored secrets ---------------------------------------------------------
+// Every credential the device stores, in one place: the JSON key on the wire and
+// the matching device_config_t field. This drives all three halves of the
+// contract -- redaction on the way out (/check_status, /load_config), restoration
+// on the way in (/store_config), and log redaction in the parser -- so a secret
+// added later cannot be handled in one place and forgotten in the others.
+#define CONFIG_SECRET_FIELDS(X) \
+	X("sta_pass",        sta_pass) \
+	X("ap_pass",         ap_pass) \
+	X("ble_pass",        ble_pass) \
+	X("home_password",   home_password) \
+	X("drive_password",  drive_password) \
+	X("batt_alert_pass", batt_alert_pass) \
+	X("batt_mqtt_pass",  batt_mqtt_pass)
+
+// Sent in place of a stored secret, so the UI can show that one is set and hand
+// it back untouched on the next Submit without ever holding the real value.
+//
+// Redaction and round-tripping have to be solved together: the UI repopulates
+// its form from the device and posts the whole form back, so redacting to an
+// empty string would erase the user's Wi-Fi password on their next Submit. That
+// coupling is why the redaction plumbing already in this file was never switched
+// on. A placeholder breaks the tie.
+//
+// The 0x01 bytes are control characters. A browser will not put them in a
+// password field, so a real password cannot collide with this sentinel; if one
+// somehow did, the failure is benign -- the stored secret simply stays as it was.
+#define CONFIG_SECRET_PLACEHOLDER "\x01stored\x01"
+
+static inline bool config_secret_is_placeholder(const char *v)
+{
+	return v != NULL && strcmp(v, CONFIG_SECRET_PLACEHOLDER) == 0;
+}
+
+// Log a credential's shape, never its value. The length is what makes these
+// lines useful for debugging (it distinguishes "never set" from "set but
+// truncated"), and it is not the secret. These fire on every /store_config, not
+// just at boot, and the log ring is readable over the network via /event_log.
+#define CONFIG_LOG_SECRET(NAME, VAL) \
+	ESP_LOGI(TAG, NAME ": %s (%u chars)", (VAL)[0] ? "<set>" : "<empty>", \
+		 (unsigned)strlen(VAL))
+
+// Emit a secret into a response: the real value when not redacting, the
+// placeholder when redacting and something is stored, and an empty string when
+// nothing is stored -- so "no password set" stays distinguishable from "hidden".
+static void config_add_secret(cJSON *root, const char *key, const char *value,
+			      bool redact)
+{
+	if (redact)
+	{
+		cJSON_AddStringToObject(root, key,
+			(value && value[0]) ? CONFIG_SECRET_PLACEHOLDER : "");
+		return;
+	}
+	cJSON_AddStringToObject(root, key, value ? value : "");
+}
+
+// Replace any placeholder the UI handed back with the value already stored, so
+// the caller can persist the result verbatim. Returns the number restored.
+// Anything that is not the exact placeholder is left alone and taken literally,
+// which keeps a direct API client (curl) working as before.
+static int config_restore_placeholder_secrets(cJSON *root)
+{
+	int restored = 0;
+	#define RESTORE_SECRET(KEY, FIELD)                                           \
+		{                                                                    \
+			cJSON *item = cJSON_GetObjectItem(root, KEY);                \
+			if (item && cJSON_IsString(item) &&                          \
+			    config_secret_is_placeholder(item->valuestring))         \
+			{                                                            \
+				cJSON_SetValuestring(item, device_config.FIELD);      \
+				restored++;                                          \
+			}                                                            \
+		}
+	CONFIG_SECRET_FIELDS(RESTORE_SECRET)
+	#undef RESTORE_SECRET
+	return restored;
+}
+
 // Single authority for the honest apply-envelope wire contract (issue #39), shared by
 // /store_config and /store_auto_data. `applied` is one of "reboot"|"live"|"deferred";
 // `msg` is a fixed literal (never user input), so no JSON escaping is needed.
@@ -847,6 +926,56 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 				return ESP_FAIL;
 			}
 		}
+	}
+
+	// ---- Restore placeholder secrets ----------------------------------------
+	// The settings form is repopulated from a redacted /load_config, so a password
+	// the user did not touch comes back as CONFIG_SECRET_PLACEHOLDER. Swap the
+	// stored value back in HERE, before anything downstream sees the body: the
+	// shadow parse, the file write and the cached raw config all consume this
+	// buffer, and persisting the placeholder would destroy the real password on
+	// the next boot. Only exact placeholders are touched, so a direct API client
+	// posting a real password is unaffected.
+	if (config_restore_placeholder_secrets(json) > 0)
+	{
+		char *restored_body = cJSON_PrintUnformatted(json);
+		if (restored_body == NULL)
+		{
+			ESP_LOGE(TAG, "config: failed to serialize restored secrets");
+			cJSON_Delete(json);
+			free(buf);
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+			return ESP_ERR_NO_MEM;
+		}
+		size_t restored_len = strlen(restored_body);
+		// Restoring makes the body longer (a real password outweighs the
+		// placeholder), so re-check it against the same ceiling as the raw upload.
+		if (restored_len > MAX_FILE_SIZE)
+		{
+			ESP_LOGE(TAG, "config: payload %u bytes after restoring secrets exceeds max %s",
+				 (unsigned)restored_len, MAX_FILE_SIZE_STR);
+			cJSON_free(restored_body);
+			cJSON_Delete(json);
+			free(buf);
+			httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Configuration too large");
+			return ESP_FAIL;
+		}
+		char *swap = (char *)heap_caps_malloc(restored_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if (swap == NULL)
+		{
+			ESP_LOGE(TAG, "config: failed to allocate %u bytes for restored payload",
+				 (unsigned)(restored_len + 1));
+			cJSON_free(restored_body);
+			cJSON_Delete(json);
+			free(buf);
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory allocation failed");
+			return ESP_ERR_NO_MEM;
+		}
+		memcpy(swap, restored_body, restored_len + 1);
+		cJSON_free(restored_body);
+		free(buf);
+		buf = swap;
+		received = (int)restored_len;
 	}
 
 	cJSON_Delete(json);
@@ -1015,13 +1144,44 @@ static esp_err_t load_pid_auto_handler(httpd_req_t *req)
 
 static esp_err_t load_config_handler(httpd_req_t *req)
 {
-    const char* resp_str = (const char*)device_config_file;
+	// This is what seeds the settings form, so it must keep returning every key
+	// (main.js Load() repopulates from it, and PASSTHROUGH_KEYS re-sends UI-less
+	// keys verbatim). Serve a copy with the secrets swapped for the placeholder
+	// rather than the raw stored file; /store_config swaps them back on the way in.
+	cJSON *root = cJSON_Parse((const char *)device_config_file);
+	if (root == NULL)
+	{
+		// Unparseable stored config: say so rather than falling back to sending
+		// the raw file, which is exactly the leak this is here to prevent.
+		ESP_LOGE(TAG, "load_config: stored config is not valid JSON");
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Stored configuration is unreadable");
+		return ESP_FAIL;
+	}
+
+	#define REDACT_SECRET(KEY, FIELD)                                            \
+		{                                                                    \
+			cJSON *item = cJSON_GetObjectItem(root, KEY);                \
+			if (item && cJSON_IsString(item) && item->valuestring)       \
+			{                                                            \
+				cJSON_SetValuestring(item, item->valuestring[0]       \
+					? CONFIG_SECRET_PLACEHOLDER : "");           \
+			}                                                            \
+		}
+	CONFIG_SECRET_FIELDS(REDACT_SECRET)
+	#undef REDACT_SECRET
+
+	char *resp_str = cJSON_PrintUnformatted(root);
+	cJSON_Delete(root);
+	if (resp_str == NULL)
+	{
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+		return ESP_FAIL;
+	}
+
 	httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, (const char*)resp_str, HTTPD_RESP_USE_STRLEN);
-    ESP_LOGI(TAG, "device_config_file: %s", device_config_file);
-	UBaseType_t stack_high_watermark = uxTaskGetStackHighWaterMark(NULL);
-	ESP_LOGI(TAG, "Task stack high watermark: %u words", stack_high_watermark);
-    return ESP_OK;
+	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+	cJSON_free(resp_str);
+	return ESP_OK;
 }
 
 
@@ -1386,27 +1546,27 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "ap_ssid_en", device_config.ap_ssid_en);
 	cJSON_AddStringToObject(root, "ap_ssid", device_config.ap_ssid);
 	cJSON_AddStringToObject(root, "ap_auto_disable", device_config.ap_auto_disable);
-	if(!remove_sensitive_info)
-	{
-		cJSON_AddStringToObject(root, "sta_ssid", device_config.sta_ssid);
-		cJSON_AddStringToObject(root, "sta_pass", device_config.sta_pass);
-		cJSON_AddStringToObject(root, "sta_security", device_config.sta_security);
-		cJSON_AddStringToObject(root, "home_ssid", device_config.home_ssid);
-		cJSON_AddStringToObject(root, "home_password", device_config.home_password);
-		cJSON_AddStringToObject(root, "home_security", device_config.home_security);
-		cJSON_AddStringToObject(root, "drive_ssid", device_config.drive_ssid);
-		cJSON_AddStringToObject(root, "drive_password", device_config.drive_password);
-		cJSON_AddStringToObject(root, "drive_security", device_config.drive_security);
-	}
+	// Redaction is per-field, not per-block: an SSID or a security mode is not a
+	// secret and the UI needs it to render, so only the passwords are replaced.
+	// The old all-or-nothing guard dropped the whole group, which is a second
+	// reason it could never be switched on -- doing so blanked the SSID too.
+	cJSON_AddStringToObject(root, "sta_ssid", device_config.sta_ssid);
+	config_add_secret(root, "sta_pass", device_config.sta_pass, remove_sensitive_info);
+	cJSON_AddStringToObject(root, "sta_security", device_config.sta_security);
+	cJSON_AddStringToObject(root, "home_ssid", device_config.home_ssid);
+	config_add_secret(root, "home_password", device_config.home_password, remove_sensitive_info);
+	cJSON_AddStringToObject(root, "home_security", device_config.home_security);
+	cJSON_AddStringToObject(root, "drive_ssid", device_config.drive_ssid);
+	config_add_secret(root, "drive_password", device_config.drive_password, remove_sensitive_info);
+	cJSON_AddStringToObject(root, "drive_security", device_config.drive_security);
 	cJSON_AddStringToObject(root, "home_protocol", device_config.home_protocol);
 	cJSON_AddStringToObject(root, "drive_protocol", device_config.drive_protocol);
 	cJSON_AddStringToObject(root, "drive_connection_type", device_config.drive_connection_type);
 	cJSON_AddStringToObject(root, "drive_mode_timeout", device_config.drive_mode_timeout);
 	cJSON_AddStringToObject(root, "sta_status", (wifi_mgr_is_sta_connected()?"Connected":"Not Connected"));
-	if(!remove_sensitive_info)
-	{
-		cJSON_AddStringToObject(root, "sta_ip", ip_str);
-	}
+	// The device's own LAN address, shown on the Status tab (main.js checkStatus).
+	// Not a credential, and the caller is already talking to it.
+	cJSON_AddStringToObject(root, "sta_ip", ip_str);
 	cJSON_AddStringToObject(root, "mdns", wc_mdns_get_hostname());
 	cJSON_AddStringToObject(root, "ble_status", device_config.ble_status);
 	cJSON_AddStringToObject(root, "ble_power", device_config.ble_power);
@@ -1429,15 +1589,12 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "wakeup_interval", device_config.wakeup_interval);
 
 	cJSON_AddStringToObject(root, "batt_alert", device_config.batt_alert);
-	if(!remove_sensitive_info)
-	{
-		cJSON_AddStringToObject(root, "batt_alert_ssid", device_config.batt_alert_ssid);
-		cJSON_AddStringToObject(root, "batt_alert_pass", device_config.batt_alert_pass);
-		cJSON_AddStringToObject(root, "batt_alert_url", device_config.batt_alert_url);
-		cJSON_AddStringToObject(root, "batt_alert_port", device_config.batt_alert_port);
-		cJSON_AddStringToObject(root, "batt_mqtt_user", device_config.batt_mqtt_user);
-		cJSON_AddStringToObject(root, "batt_mqtt_pass", device_config.batt_mqtt_pass);
-	}
+	cJSON_AddStringToObject(root, "batt_alert_ssid", device_config.batt_alert_ssid);
+	config_add_secret(root, "batt_alert_pass", device_config.batt_alert_pass, remove_sensitive_info);
+	cJSON_AddStringToObject(root, "batt_alert_url", device_config.batt_alert_url);
+	cJSON_AddStringToObject(root, "batt_alert_port", device_config.batt_alert_port);
+	cJSON_AddStringToObject(root, "batt_mqtt_user", device_config.batt_mqtt_user);
+	config_add_secret(root, "batt_mqtt_pass", device_config.batt_mqtt_pass, remove_sensitive_info);
 	cJSON_AddStringToObject(root, "batt_alert_protocol", device_config.batt_alert_protocol);
 	cJSON_AddStringToObject(root, "batt_alert_volt", device_config.batt_alert_volt);
 	cJSON_AddStringToObject(root, "batt_alert_topic", device_config.batt_alert_topic);
@@ -1495,11 +1652,6 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	sprintf(volt, "%.1fV", tmp);
 	cJSON_AddStringToObject(root, "batt_voltage", volt);
 
-	if(!remove_sensitive_info)
-	{
-	
-
-	}
 	cJSON_AddStringToObject(root, "device_id", device_id);
 	cJSON_AddStringToObject(root, "subnet_overlap", dev_status_is_bit_set(DEV_STA_AP_OVERLAP_BIT) ? "yes" : "no");
 
@@ -1519,7 +1671,10 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 
 static esp_err_t check_status_handler(httpd_req_t *req)
 {
-	char *resp_str = config_server_get_status_json(false);
+	// Redacted: passwords come back as CONFIG_SECRET_PLACEHOLDER. Nothing in the
+	// UI reads a credential from this endpoint (main.js checkStatus only renders
+	// status fields), so this costs nothing and closes the larger of the two leaks.
+	char *resp_str = config_server_get_status_json(true);
 
 	httpd_resp_set_type(req, "application/json");
 	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
@@ -2250,7 +2405,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 		goto config_error;
 	}
 	strlcpy(dst->sta_pass, key->valuestring, sizeof(dst->sta_pass));
-	ESP_LOGI(TAG, "dst->sta_pass: %s", dst->sta_pass);
+	CONFIG_LOG_SECRET("dst->sta_pass", dst->sta_pass);
 
 	key = cJSON_GetObjectItem(root,"can_datarate");
 	if(key == 0)
@@ -2307,7 +2462,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 		goto config_error;
 	}
 	strlcpy(dst->ap_pass, key->valuestring, sizeof(dst->ap_pass));
-	ESP_LOGI(TAG, "dst->ap_pass: %s", dst->ap_pass);
+	CONFIG_LOG_SECRET("dst->ap_pass", dst->ap_pass);
 
 	key = cJSON_GetObjectItem(root,"protocol");
 	if(key == 0)
@@ -2331,7 +2486,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 		goto config_error;
 	}
 	strlcpy(dst->ble_pass, key->valuestring, sizeof(dst->ble_pass));
-	ESP_LOGI(TAG, "dst->ble_pass: %s", dst->ble_pass);
+	CONFIG_LOG_SECRET("dst->ble_pass", dst->ble_pass);
 
 	key = cJSON_GetObjectItem(root,"ble_power");
 	if(key && key->valuestring) {
@@ -2439,7 +2594,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	}
 
 	strlcpy(dst->batt_alert_pass, key->valuestring, sizeof(dst->batt_alert_pass));
-	ESP_LOGI(TAG, "dst->batt_alert_pass: %s", dst->batt_alert_pass);
+	CONFIG_LOG_SECRET("dst->batt_alert_pass", dst->batt_alert_pass);
 	//*****
 
 	//*****
@@ -2516,7 +2671,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	}
 
 	strlcpy(dst->batt_mqtt_pass, key->valuestring, sizeof(dst->batt_mqtt_pass));
-	ESP_LOGI(TAG, "dst->batt_mqtt_pass: %s", dst->batt_mqtt_pass);
+	CONFIG_LOG_SECRET("dst->batt_mqtt_pass", dst->batt_mqtt_pass);
 	//*****
 
 	//*****
@@ -2647,7 +2802,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	{
 		strlcpy(dst->home_password, key->valuestring, sizeof(dst->home_password));
 	}
-	ESP_LOGI(TAG, "dst->home_password: %s", dst->home_password);
+	CONFIG_LOG_SECRET("dst->home_password", dst->home_password);
 
 	key = cJSON_GetObjectItem(root,"home_security");
 	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->home_security) - 1)
@@ -2691,7 +2846,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	{
 		strlcpy(dst->drive_password, key->valuestring, sizeof(dst->drive_password));
 	}
-	ESP_LOGI(TAG, "dst->drive_password: %s", dst->drive_password);
+	CONFIG_LOG_SECRET("dst->drive_password", dst->drive_password);
 
 	key = cJSON_GetObjectItem(root,"drive_security");
 	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->drive_security) - 1)
@@ -3166,7 +3321,11 @@ static httpd_handle_t config_server_init(void)
 				memset(device_config_file, 0, filesize + 1);
 				fread(device_config_file, sizeof(char), filesize, f);
 				device_config_file[filesize] = 0;
-				ESP_LOGI(TAG, "config.json: %s", device_config_file);
+				// Size only, never the body: this file holds every stored
+				// credential in plaintext, and it used to be dumped whole at
+				// each boot. The per-field logging further down reports each
+				// key's shape without its value.
+				ESP_LOGI(TAG, "config.json loaded: %ld bytes", filesize);
 				fclose(f);	//close file after reading, config_server_load_cfg might unlink it
 				config_server_load_cfg(device_config_file);
 			}
