@@ -20,7 +20,7 @@ concentrated in three places, and only one of them is inherited:
 
 | Where it hurts | Lines | Who wrote it | Rebuildable in isolation? |
 |---|---|---|---|
-| The config model (843-line hand-rolled parser, 51 flat keys) | ~900 | inherited, fork-extended | **Yes** |
+| The config model (839-line hand-rolled parser, 51 flat keys) | ~900 | inherited, fork-extended | **Yes** |
 | The web UI (one 4,359-line `main.js`, no framework, no build step until recently) | ~4,400 | ~59% fork | **Yes** |
 | Carrying dead product surface you never use (ELM327, BLE, SLCAN, MQTT, sleep, IMU, multi-board) | ~18,000 | inherited, untouched | **Yes — by deletion** |
 
@@ -238,7 +238,7 @@ Work the defect ledger ([audit-2026-07.md](audit-2026-07.md)), leave the structu
 
 - **Cost:** low. Days, incremental, always shippable.
 - **Buys:** the security and correctness fixes. Nothing structural.
-- **Leaves:** 18,000 lines of dead surface, the 843-line parser, the 4,359-line `main.js`.
+- **Leaves:** 18,000 lines of dead surface, the 839-line parser, the 4,359-line `main.js`.
 - **Failure mode:** every future feature keeps paying the comprehension tax. This is the
   status quo, and the status quo is why the question is being asked.
 
@@ -253,7 +253,7 @@ Same repo, same git history, same device that boots at every step. Three ordered
    should go first. Each deletion is independently
    bench-testable; if a deletion breaks the device you revert *that* commit, not the
    project. Target: **~46,000 → ~20,000 lines.**
-2. **Rewrite the config model.** Replace the 843-line hand-rolled parser with a
+2. **Rewrite the config model.** Replace the 839-line hand-rolled parser with a
    table-driven schema — one array of `{key, type, default, live_appliable, validator}`
    and a generic apply loop. This kills issue #68 (the panic-on-non-string bug) as a
    *class*, kills the "keep 5 places in lockstep" recipe, and makes the reboot-vs-live
@@ -280,7 +280,7 @@ New ESP-IDF project, port the fork-created components, design the rest fresh.
 
   | Must re-earn | Currently | Risk |
   |---|---|---|
-  | Board bring-up: LED, WuSB3801 USB-PD, ICM42670, RTC, ADC voltage thresholds | works, undocumented | **high** — no tests, no console (USB is host-mode) |
+  | Board + platform glue: LED/AW2023, SD/FATFS, LittleFS, RTC, time sync, USB-PD, dev_status — **~3,900 lines measured** (§7) | works, undocumented | **high** — no tests, no console (USB is host-mode) |
   | OTA + partition layout + the SD-card `/wican.bin` unbrick path + safe mode | works | **high** — a bad OTA path on a console-less device is a brick |
   | MIC3624 external OBD chip bring-up + its 494 KB firmware updater | works | **high** — vendor chip, little documentation |
   | Wi-Fi manager: AP+STA, home/drive switching, reconnect | works | medium |
@@ -324,10 +324,11 @@ I should argue the other side properly, because it is not weak.
   HTTP routing, config parsing, OTA, and business logic. You would have removed the
   noise without ever getting the architecture you would have chosen.
 - **Sunk-cost dressed as risk-management.** "It works today" is exactly what every team
-  says right before spending three more years in a codebase they hate. The bring-up code
-  is genuinely a few hundred lines of driver init — its difficulty is *unknown*, not
-  necessarily *high*, and it can be de-risked by porting it verbatim first and cleaning
-  it later.
+  says right before spending three more years in a codebase they hate. And the bring-up
+  bill can be paid by *porting verbatim first, cleaning later* — the 3,900 lines in §7
+  are lines to **move**, not lines to **invent**. (I counted them expecting to defend
+  path C's cheapness and ended up documenting the opposite; the count is the honest
+  version, but the porting mitigation is real and I do not want to overstate the risk.)
 - **The 18,000 dead lines may already be nearly free.** They cost ~0 flash pressure and
   the compiler already discards most of them. If the real cost is comprehension, a
   greenfield removes that cost *permanently and by construction*, whereas deletion is a
@@ -344,10 +345,30 @@ I should argue the other side properly, because it is not weak.
 
 Concrete, checkable facts — not vibes:
 
-1. **If board bring-up turns out to be small.** Read `main.c`'s init sequence, `led.c`,
-   `wusb3801.c`, `icm42670.c` and the ADC/voltage path and count the lines that are
-   genuinely board-specific. If it is under ~1,500 lines of straightforward driver init,
-   path C's biggest risk mostly evaporates and C becomes competitive.
+1. ~~**If board bring-up turns out to be small.**~~ **Answered — and the answer does not
+   favour path C.** Counted:
+
+   | Group | Lines | v2 needs it? |
+   |---|---:|---|
+   | LED (`led.c` 355 + `led_indicator.c` 271, AW2023 over I2C) | 626 | yes |
+   | SD / FATFS mount (`sdcard.c`) | 460 | yes |
+   | OTA multipart parser (`multipart_upload.c`) **[guardrail]** | 770 | yes |
+   | Safe-mode recovery AP (`safemode.c`) **[guardrail]** | 350 | yes |
+   | LittleFS mount (`filesystem.c`) | 251 | yes |
+   | RTC (`rtcm.c`) + time sync (`sync_sys_time.c`) | 584 | yes |
+   | `dev_status.c`, `wc_uart.c`, `wc_timer.c`, `hw_config`, `vehicle.c`, `config_mode.c` | 775 | yes |
+   | USB-PD (`wusb3801.c`) | 88 | yes |
+   | **Subtotal — unavoidable** | **3,904** | |
+   | IMU (`icm42670.c` 728 + `imu.c` 373) | 1,101 | optional |
+   | Sleep / ADC voltage thresholds (`sleep_mode.c`) | 1,245 | optional (issue #4) |
+   | **Total** | **6,250** | |
+
+   So a v2 must account for **~3,900 lines minimum** of board and platform glue before
+   it logs a single PID — roughly 2.6x the 1,500-line threshold I set. The mitigation is
+   real (most of it *ports* rather than gets rewritten), but "port 3,900 lines of
+   undocumented driver and recovery code onto a console-less device" is the honest
+   description of path C's first milestone, and two of those files are marked
+   **guardrail** precisely because breaking them costs you the device.
 2. **If the MIC3624 chip's `PPSW` setting is not load-bearing for the TWAI path.**
    Answered halfway in §3: the datalogger provably does *not* poll through the chip, but
    `elm327_init()` still runs every boot and sets an undocumented vendor power-switch
@@ -365,8 +386,9 @@ Concrete, checkable facts — not vibes:
 5. **If DIRAM headroom drops below ~60 KB.** Then memory *does* become a forcing
    function and the calculus changes.
 
-Items 1 and 2 are cheap to answer — a few hours of reading — and they are the two that
-move the decision most. **Answer those before committing either way.**
+**Item 1 is now answered and it moved the needle toward B.** Item 2 is the one that
+still matters and it is an experiment, not an analysis. Items 3–5 are yours to decide.
+**Do not commit either way until item 2 is run.**
 
 ## 8. The decision the owner has to make
 

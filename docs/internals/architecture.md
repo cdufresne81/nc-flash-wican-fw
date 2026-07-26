@@ -602,7 +602,7 @@ entirely at features this fork hides.
 > reboots". That is stale — fix it when you next touch that file.
 
 Config keys are parsed in `config_server_parse_cfg_into()`
-(`config_server.c:2158`). Be warned: it is **843 lines** — 23% of the file — of
+(`config_server.c:2158-2996`). Be warned: it is **839 lines** — 23% of the file — of
 one repeated block per key. Adding a key today means editing the struct, the
 parser, the status-JSON builder and the UI.
 
