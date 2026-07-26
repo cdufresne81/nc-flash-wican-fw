@@ -14,6 +14,40 @@ on:
   pull_request:
 
 jobs:
+  # Everything that needs neither a toolchain nor hardware. Runs in parallel with
+  # the build so a stale generated file or a doc citing a deleted symbol fails in
+  # seconds instead of after a full ESP-IDF build.
+  checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Dangling getElementById targets, inline handlers calling functions that
+      # no longer exist, and a stale src/homepage.html (build_web.py --check).
+      - name: Web UI lint + generated-file freshness
+        run: python tools/lint_web.py
+
+      # docs/internals/ citing symbols or files that have since been renamed or
+      # deleted. Dated snapshot docs are exempt by design.
+      - name: Docs match the code
+        run: python tools/check_docs.py
+
+      # Pure-logic tests for main.js, run in a vm sandbox with DOM stubs.
+      - name: Host tests
+        run: node --test tools/webtest/*.test.mjs
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -21,6 +55,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Build (ESP-IDF v5.5.3, esp32s3)
         uses: espressif/esp-idf-ci-action@v1
@@ -32,7 +71,20 @@ jobs:
           # which avoids the Windows-CRLF vs Linux-LF component_hash clash on the git-sourced
           # ch34x driver (still pinned to an immutable commit in main/idf_component.yml). Nothing
           # mutates the working tree here, so tagged builds produce clean (non-dirty) artifacts.
-          command: 'idf.py build'
+          #
+          # Redirected rather than piped: a pipe would make the step's exit status
+          # tee's, silently turning a failed build into a green one. The log is
+          # replayed by the next step and parsed by the budget gate after that.
+          command: 'idf.py build > build_output.log 2>&1'
+
+      - name: Build log
+        if: always()
+        run: tail -n 200 build_output.log || echo "(no build log produced)"
+
+      # Warnings in our own code and app-image size, both ratcheted against
+      # tools/build_baseline.json. Growth is allowed but must be declared.
+      - name: Build budget (warnings + image size)
+        run: python tools/check_build_budget.py --log build_output.log
 
       - name: Stage flashable artifacts
         run: |
@@ -55,7 +107,7 @@ jobs:
           path: dist/**
 
   release:
-    needs: build
+    needs: [build, checks]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
