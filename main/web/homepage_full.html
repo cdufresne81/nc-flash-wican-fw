@@ -1361,7 +1361,7 @@
                             </tr>
                             <tr>
                                 <td><label for="batt_alert_pass"><b>Password:</b></label></td>
-                                <td><input id="batt_alert_pass" name="batt_alert_pass" value="TomatoSauce"></td>
+                                <td><input autocomplete="off" id="batt_alert_pass" name="batt_alert_pass" type="password" value=""></td>
                             </tr>
                             <tr>
                                 <td><label for="batt_alert_volt"><b>Alert Voltage:</b></label></td>
@@ -1387,7 +1387,7 @@
                             </tr>
                             <tr>
                                 <td><label for="batt_mqtt_pass"><b>Alert MQTT Pass:</b></label></td>
-                                <td><input id="batt_mqtt_pass" name="batt_mqtt_pass" value="meatpi"></td>
+                                <td><input autocomplete="off" id="batt_mqtt_pass" name="batt_mqtt_pass" type="password" value=""></td>
                             </tr>
                             <tr>
                                 <td><label for="batt_alert_topic"><b>Alert Topic:</b></label></td>
@@ -1465,7 +1465,7 @@
                         </tr>
                         <tr>
                             <td>AP Password:</td>
-                            <td><input id="ap_pass_value" name="ap_pass_value" value="Testpass"></td>
+                            <td><input autocomplete="off" id="ap_pass_value" name="ap_pass_value" type="password" value=""></td>
                         </tr>
                         <tr>
                             <td>Auto-Disable AP:</td>
@@ -1495,7 +1495,7 @@
                             </tr>
                             <tr>
                                 <td>Password:</td>
-                                <td><input disabled="" id="pass_value" name="pass_value" value="TomatoSauce"></td>
+                                <td><input autocomplete="off" disabled="" id="pass_value" name="pass_value" type="password" value=""></td>
                             </tr>
                             <tr>
                                 <td>Security:</td>
@@ -1518,7 +1518,13 @@
                      BLE stays in the firmware and may return if users need it (e.g. a phone whose
                      Wi-Fi is captive to CarPlay/Android Auto). The elements must stay in the DOM:
                      Load()/postConfig() round-trip ble_pass/ble_status/ble_power through them.
-                     See the BLE note in README.md. -->
+                     See the BLE note in README.md.
+                     ble_pass_value MUST stay type="text": /load_config returns the redaction
+                     sentinel "\x01stored\x01" for every secret, and a type="number" input runs
+                     the HTML value-sanitization algorithm on assignment -- it silently drops any
+                     non-numeric value to "". That made Load() blank the field and postConfig()
+                     send ble_pass:"", which the firmware takes literally and wipes the passkey
+                     (and forces a reboot, since ble_pass is not in LIVE_APPLY_WHITELIST). -->
                 <div id="ble_section" style="display:none">
                 <div class="divider"></div>
                 <div class="section-title">BLE</div>
@@ -1526,7 +1532,7 @@
                     <tbody>
                         <tr>
                             <td>Passkey:</td>
-                            <td><input id="ble_pass_value" max="999999" min="0" name="ble_pass_value" type="number" value="000000"></td>
+                            <td><input autocomplete="off" id="ble_pass_value" inputmode="numeric" maxlength="6" name="ble_pass_value" type="text" value=""></td>
                         </tr>
                         <tr>
                             <td>BLE Status:</td>
