@@ -25,6 +25,24 @@ static sdmmc_card_t sdcard;
 #endif
 static bool s_card_mounted = false;
 
+// Why the card is not usable, for /check_status. Without this the new
+// no-auto-format behaviour would trade silent data loss for a silently missing
+// log -- and this device has no console to explain either. "unreadable" is the
+// one that needs a human: the card is there and it is not being erased, so the
+// data on it is recoverable, but only if someone is told.
+static sd_status_t s_mount_status = SD_STATUS_ABSENT;
+
+const char *sdcard_status_str(void)
+{
+    switch (s_mount_status)
+    {
+        case SD_STATUS_MOUNTED:    return "mounted";
+        case SD_STATUS_UNREADABLE: return "unreadable";
+        case SD_STATUS_ABSENT:
+        default:                   return "absent";
+    }
+}
+
 esp_err_t sdcard_perform_ota_update(const char* firmware_path)
 {
     if (!sdcard_is_mounted() || !sdcard_is_available()) 
@@ -193,9 +211,16 @@ esp_err_t sd_card_init(void)
     // Mount the filesystem
     #ifdef USE_SD_FATFS
     // Mount configuration
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = 
+    esp_vfs_fat_sdmmc_mount_config_t mount_config =
     {
-        .format_if_mount_failed = true,
+        // NEVER true. This used to be true, which meant a card that failed to
+        // mount for any reason -- a loose connector, a bad read during boot, a
+        // filesystem the driver did not recognise -- was silently reformatted,
+        // destroying every trip log on it. A mount failure is a diagnostic to
+        // report, not a problem to solve by erasing the user's data. Logging is
+        // the feature the SD card exists for; wiping it to make mounting succeed
+        // trades the whole point of the card for a clean boot.
+        .format_if_mount_failed = false,
         .max_files = 5,
         .allocation_unit_size = 65536
     };
@@ -203,15 +228,23 @@ esp_err_t sd_card_init(void)
     // Mount the filesystem
     ret = esp_vfs_fat_sdmmc_mount(SD_CARD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
 
-    if (ret != ESP_OK) 
+    if (ret != ESP_OK)
     {
-        if (ret == ESP_FAIL) 
+        if (ret == ESP_FAIL)
         {
-            ESP_LOGE(TAG, "Failed to mount filesystem");
-        } 
-        else 
+            // The card responded but holds no filesystem we can mount. With
+            // auto-format off this is where the old code would have erased it.
+            s_mount_status = SD_STATUS_UNREADABLE;
+            ESP_LOGE(TAG, "SD card present but no mountable FAT filesystem. "
+                          "NOT reformatting: copy anything you need off the card, "
+                          "then format it as FAT32 to use it for logging.");
+        }
+        else
         {
-            ESP_LOGE(TAG, "Failed to initialize the card (%s)", esp_err_to_name(ret));
+            // No card, or the card never answered -- nothing to preserve, and
+            // nothing that formatting would have fixed either.
+            s_mount_status = SD_STATUS_ABSENT;
+            ESP_LOGW(TAG, "No usable SD card detected (%s)", esp_err_to_name(ret));
         }
         return ret;
     }
@@ -248,7 +281,11 @@ esp_err_t sd_card_init(void)
             .partition_label = NULL,  // Not using internal flash partition
             .partition = NULL,        // Not using internal flash partition
             .sdcard = &sdcard,           // Using SD card
-            .format_if_mount_failed = true,
+            // Same rule as the FAT path above: never auto-format a card that
+            // holds the user's logs. (This branch is not built for OBD-PRO --
+            // hw_config.h defines USE_SD_FATFS -- but it must not carry the
+            // landmine either.)
+            .format_if_mount_failed = false,
             .dont_mount = false,
             .read_only = false,
             .grow_on_mount = true,
@@ -258,12 +295,14 @@ esp_err_t sd_card_init(void)
         ret = esp_vfs_littlefs_register(&conf);
 
         if (ret != ESP_OK) {
-            if (ret == ESP_FAIL) {
-                ESP_LOGE(TAG, "Failed to mount or format filesystem");
-            } else if (ret == ESP_ERR_NOT_FOUND) {
-                ESP_LOGE(TAG, "Failed to find LittleFS on SD card");
+            if (ret == ESP_FAIL || ret == ESP_ERR_NOT_FOUND) {
+                s_mount_status = SD_STATUS_UNREADABLE;
+                ESP_LOGE(TAG, "SD card present but no mountable LittleFS. "
+                              "NOT reformatting: copy anything you need off the "
+                              "card before formatting it.");
             } else {
-                ESP_LOGE(TAG, "Failed to initialize LittleFS on SD card (%s)", esp_err_to_name(ret));
+                s_mount_status = SD_STATUS_ABSENT;
+                ESP_LOGW(TAG, "Failed to initialize LittleFS on SD card (%s)", esp_err_to_name(ret));
             }
             return ret;
         }
@@ -280,6 +319,7 @@ esp_err_t sd_card_init(void)
     #endif
 
     s_card_mounted = true;
+    s_mount_status = SD_STATUS_MOUNTED;
     dev_status_set_bits(DEV_SDCARD_MOUNTED_BIT);
     ESP_LOGI(TAG, "SD card mounted successfully");
     
