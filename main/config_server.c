@@ -2695,8 +2695,14 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	//*****
 
 	//*****
+	//***** Optional keys (issue #68): an absent key falls back to its default, and so
+	//      does a key whose value is not a JSON string. cJSON only fills valuestring
+	//      for string items, so a number/bool/null/array leaves it NULL and copying it
+	//      panics the httpd task. A wrong type is treated as absent rather than as an
+	//      error, because this same parse runs on the stored config at boot -- rejecting
+	//      there would factory-restore the device (the failure mode fixed in #44).
 	key = cJSON_GetObjectItem(root,"wakeup_volt");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->wakeup_volt, "13.5", sizeof(dst->wakeup_volt));
 	}
@@ -2710,7 +2716,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	
 	//*****
 	key = cJSON_GetObjectItem(root,"sleep_time");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->sleep_time, "5", sizeof(dst->sleep_time));
 	}
@@ -2731,7 +2737,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 
 	//*****
 	key = cJSON_GetObjectItem(root,"sta_security");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->sta_security, "wpa3", sizeof(dst->sta_security));
 	}
@@ -2900,7 +2906,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 
 	//*****
 	key = cJSON_GetObjectItem(root,"csv_log");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->csv_log, "disable", sizeof(dst->csv_log));
 	}
@@ -2922,7 +2928,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 
 	//*****
 	key = cJSON_GetObjectItem(root,"log_filesystem");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->log_filesystem, "littlefs", sizeof(dst->log_filesystem));
 	}
@@ -2936,7 +2942,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	//*****
 	key = cJSON_GetObjectItem(root,"log_storage");
 
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->log_storage, "sdcard", sizeof(dst->log_storage));
 	}
@@ -2950,7 +2956,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 
 	//*****
 	key = cJSON_GetObjectItem(root,"log_period");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->log_period, "10", sizeof(dst->log_period));
 	}
@@ -2992,7 +2998,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	//      removed: issue #53 -- the grid is always fixed-rate, a stored key is ignored and
 	//      disappears from config.json on the first Submit after the update.)
 	key = cJSON_GetObjectItem(root,"csv_grid_hz");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->csv_grid_hz, "10", sizeof(dst->csv_grid_hz));
 	}
@@ -3032,7 +3038,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	//*****
 
 	key = cJSON_GetObjectItem(root,"ap_auto_disable");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->ap_auto_disable, "disable", sizeof(dst->ap_auto_disable));
 	}
@@ -3066,7 +3072,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 
 	//*****	
 	key = cJSON_GetObjectItem(root,"wakeup_interval");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->wakeup_interval, "60", sizeof(dst->wakeup_interval));
 	}
@@ -3082,7 +3088,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	//*****
 	// sleep_disable_agree
 	key = cJSON_GetObjectItem(root,"sleep_disable_agree");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		strlcpy(dst->sleep_disable_agree, "no", sizeof(dst->sleep_disable_agree));
 	}
@@ -3097,7 +3103,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	//*****
 	// imu_threshold
 	key = cJSON_GetObjectItem(root,"imu_threshold");
-	if(key == 0)
+	if(key == 0 || key->valuestring == NULL)
 	{
 		ESP_LOGI(TAG, "imu_threshold not found, loading default");
 		strcpy(dst->imu_threshold, "8");
