@@ -8,6 +8,37 @@ Ground rules for these docs:
 - When behavior was verified on a real device, say so and with which build.
 - If a doc contradicts the code, the code wins — fix the doc in the same PR.
 
+## How these docs stay current
+
+Prose discipline alone does not survive contact with a year of refactoring, so
+part of it is enforced. `tools/check_docs.py` runs in CI on every PR and fails
+the build when a doc cites a file, function, or constant that no longer exists.
+That catches the way these docs actually rot — a symbol gets renamed and the doc
+keeps naming the old one — without anyone having to notice.
+
+It does **not** catch prose that describes behavior the code no longer has while
+still citing symbols that exist. Nothing automated can. That is what the third
+ground rule above is for, and it is on whoever reviews the PR.
+
+There are two classes of doc here, and only one is maintained:
+
+| Class | Named | Checked? | Updated? |
+|---|---|---|---|
+| **Evergreen** | plain (`architecture.md`, `poll_log.md`) | yes | must track the code |
+| **Dated snapshot** | `-YYYY-MM` suffix (`audit-2026-07.md`) | no | never — it is a record |
+
+A dated snapshot states what was true on a date. It is *supposed* to go stale;
+rewriting one destroys the record. When its content matters again, write a new
+snapshot with a new date rather than editing the old one. `check_docs.py` keys
+off the filename suffix to decide which rules apply, so the naming is load-
+bearing — a doc that should be frozen must carry the date in its name.
+
+Run the checker yourself before pushing:
+
+```sh
+python tools/check_docs.py
+```
+
 ## Contents
 
 | Doc | Covers |
