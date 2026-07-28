@@ -38,7 +38,35 @@ stateDiagram-v2
     QUIESCED --> PROBING : any RX frame, or POLLLOG_MAX_QUIESCE_MS (10 min) self-heal
 ```
 
-While QUIESCED the task never transmits, drains RX non-blocking on a ~20 ms cadence, and `s_engine_running=false` suppresses CSV logging (csv_logger asks via the registered `poll_log_engine_running` callback — see [csv_logger.md](csv_logger.md)). The 10-minute self-heal (`POLLLOG_MAX_QUIESCE_MS`) guarantees a stuck detector can never permanently strand the logger. State transitions emit `EVL_ENGINE_STOP`/start events to event_log.
+While QUIESCED the task never transmits, drains RX non-blocking on a ~20 ms cadence, and `s_engine_running=false` suppresses CSV logging (csv_logger asks via the registered `poll_log_gate_open` callback — see [csv_logger.md](csv_logger.md)). The 10-minute self-heal (`POLLLOG_MAX_QUIESCE_MS`) guarantees a stuck detector can never permanently strand the logger. State transitions emit `EVL_ENGINE_STOP`/start events to event_log.
+
+### The recording gate: WATCH vs FAST
+
+`s_engine_running` means **the ECU answers**, not **the engine turns** — a parked car at key-on answers every request. On its own it therefore kept the sweep at full rate (~430 req/s) whenever the key was on, whether or not anything was being recorded.
+
+A NORMAL-mode sweep now runs in one of two speeds:
+
+| State | Sweep | When |
+|---|---|---|
+| PROBE | full rate | `!s_confirmed` — never slowed, resume-in-one-frame depends on it |
+| WATCH | one full sweep per `POLLLOG_WATCH_SWEEP_MS` (1 s, ~15 req/s on the 19-PID table) | ECU answers but the engine is not running |
+| FAST | full rate, today's path unchanged | the gate is open |
+
+The gate (`polllog_eval_gate`) asks one question — *is the engine running* — from voltage **and** RPM:
+
+- **Open**: `s_confirmed` **and** voltage ≥ `engine_volt` **and** RPM > `POLLLOG_GATE_RPM_ON` (the RPM term drops out when no RPM channel exists). A CSV session already being open forces it too — that is what keeps the web **Start** button and bench work at full rate, since a bench PCM reports RPM 0.
+- **Close**: the same test against `engine_volt - VEHICLE_IGN_HYSTERESIS_V`, sustained for `CSV_LOGGER_IGN_OFF_DEBOUNCE_MS`. **Either** signal dropping closes it.
+
+Both thresholds and the debounce are **shared constants, not copies** (`vehicle.h`, `csv_logger.h`), because the gate must agree with the CSV writer about when the engine stopped.
+
+Symmetry is the point, and getting it wrong is easy: an earlier version let RPM alone close the gate, meaning to hold a recording alive through an alternator sag at idle. It cannot — `csv_logger` decides on **voltage alone**, so it closes that trip regardless (reason `ignition_off`), and the gate would then sit open at full rate recording nothing. The gate is open exactly when a trip could be recording.
+
+Watch sweeps are excluded from the sweep-rate measurement, so `fast_hz` **freezes** at the last FAST value across watch and quiesce rather than collapsing to ~1 Hz and dragging the Auto CSV grid down with it. The RPM channel is matched by name (case-insensitive `"RPM"`) on both the polled and the broadcast decode path.
+
+Two consequences worth knowing:
+
+- The engine-off detector is wall-clock based, so it still fires at watch cadence — just later. Worst case is `POLLLOG_ENGINE_OFF_MS` plus one full watch iteration (~6.5 s on the 19-PID table) instead of ~5.03 s.
+- An RPM channel that reads a wrong **low** value is the one way this can lose data: the gate never opens on the auto path and automatic trips stop. `state` and `rpm` in `/poll_status`, and the "waiting for engine" hint on the Logger page, are the diagnostic.
 
 Probe sweeps (no OK yet) are deliberately excluded from the sweep-rate measurement below, so cranking/parked periods can't poison the Auto rate.
 
@@ -62,12 +90,13 @@ Not every channel deserves the same rate: coolant temp at 21 Hz is waste that co
 - **Phasing**: `polllog_prepare_schedule()` gives each PID in a divisor group an even phase offset (2 PIDs at N=4 → sweeps 0 and 2, not 0 and 1) so same-divisor channels don't all fire on the same sweep and make sweep duration oscillate. Phases are **re-derived, never preserved**, on every config load and every live hot-reload — deterministic from the JSON, so an unrelated edit reproduces them exactly. Known and deliberate: this equalises *within* a divisor group, not across groups, so an N=2 and an N=4 group still co-fire every 4th sweep. Residual oscillation is directly measurable as `sweep_min_ms`/`sweep_max_ms`.
 - **Rows that can never be polled** (disabled, no `cmd`, unparseable `cmd`) are excluded from the schedule entirely — they must not pin `sched_min_n` or consume a phase slot.
 
-Two bypasses skip the gate completely, and while bypassed the counters do **not** tick, so phase resumes where it left off:
+Three bypasses skip the gate completely, and while bypassed the counters do **not** tick, so phase resumes where it left off:
 
 | Bypass | Condition | Why |
 |---|---|---|
 | Probing | `!s_confirmed` | Boot and every quiesce-resume run full sweeps, so an all-gated table can never starve `POLLLOG_PROBE_MS` of attempts and strand the logger in a quiesce loop. |
 | Stale OK | no OK for `POLLLOG_GATE_STALE_MS` (2.5 s) | A long divisor on the only answering channel could otherwise push `now - s_last_ok_us` past `POLLLOG_ENGINE_OFF_MS` and fire a **false** `ENGINE_STOP`, closing the CSV require-engine gate mid-drive. With the engine genuinely off, un-gated sweeps still yield no OK and still quiesce at 5 s. |
+| Watch | `!s_gate_open` | A watch sweep already runs at a fraction of the divisors' intended rate; applying them on top would starve channels and leave the gate's own RPM input stale. |
 
 `can_should_park()` and the QUIESCED branch both `continue` *above* the gate, so a 10 s flash session can't burn every PID's skip budget and then fire them all at once on the first unparked sweep.
 
@@ -146,7 +175,9 @@ The Auto (fastest) logging rate is a **measurement, not an estimate** — this i
  "sweep_min_ms":38.2,"sweep_max_ms":52.7,"fast_ms":49.6,"fast_hz":20.15,
  "win_ok":1197,"win_timeout":0,"win_txfail":0,
  "engine_running":true,"quiesced":false,"bus_idle_ms":4294967295,
- "reload_ok":true,"reload_pending":false}
+ "reload_ok":true,"reload_pending":false,
+ "state":"fast","gate_open":true,
+ "gate_volt":13.2,"rpm_known":true,"rpm":2150}
 ```
 
 `ok/timeout/txfail` are cumulative; `win_*` are the last 3 s window; `bus_idle_ms` saturates at UINT32_MAX when no broadcast traffic is tracked.
@@ -166,6 +197,16 @@ The divisor fields (issue #29) are the whole diagnostic surface for the feature 
 | `sweep_min_ms` / `sweep_max_ms` | Sweep-duration spread over the 3 s window — the phasing-quality readout. A wide spread means divisor groups are co-firing. |
 | `fast_ms` / `fast_hz` | Fastest channel's cadence = mean executed sweep × `sched_min_n`. **This**, not `sweep_hz`, is what the Auto CSV grid tracks. |
 | `reload_pending` | A live hot-reload is armed but not yet applied (deferred under an open trip). |
+
+The recording-gate fields. `req_s` alone is ambiguous once the gate exists — ~15 req/s is healthy in WATCH and alarming in FAST — so read `state` first:
+
+| Field | Meaning |
+|---|---|
+| `state` | `inactive` / `quiesced` / `probe` / `watch` / `fast`. The one field that says what the poll task is doing. `probe` is the short post-boot or post-resume window before the ECU has answered — still full rate. |
+| `gate_open` | The recording gate itself. Not redundant with `state`: a CSV session opened during `probe` shows `gate_open:true` while `state` is still `probe`. |
+| `gate_volt` | The `engine_volt` threshold in use, read once at init. The close edge sits `VEHICLE_IGN_HYSTERESIS_V` under it. |
+| `rpm_known` | An RPM channel exists **and** its last value is fresh (within `POLLLOG_RPM_STALE_MS`). `false` ⇒ the gate is running on voltage alone. |
+| `rpm` | Last RPM seen, from either the polled or the broadcast copy. **`rpm_known:true` with a wrong low value is the one way this feature can silently stop automatic trips** — check it first if logging stops. |
 
 ## Measured limits (bench, `v1.9.4-3-gd8b8180`, 2026-07-21)
 

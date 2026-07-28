@@ -58,6 +58,10 @@ float poll_log_sweep_hz(void);
  */
 bool     poll_log_engine_running(void);
 bool     poll_log_quiesced(void);
+/* The RECORDING gate: true while the conditions to log are met and the sweep runs at full rate.
+ * Different question from poll_log_engine_running() -- the ECU answers at key-on with the engine
+ * off. This is what the CSV logger gates on. True when POLL_LOG is not the active mode. */
+bool     poll_log_gate_open(void);
 uint32_t poll_log_bus_idle_ms(void);
 
 /*

@@ -30,6 +30,11 @@
 extern "C" {
 #endif
 
+/* How long the ignition must read OFF before a trip is closed. Shared, not copied: poll_log's
+ * recording gate debounces on the same value, so the poller and the writer agree on the moment the
+ * engine stopped instead of drifting apart. */
+#define CSV_LOGGER_IGN_OFF_DEBOUNCE_MS  3000
+
 #define CSV_LOGGER_DIR              "/sdcard/logs"
 #define CSV_LOGGER_NAME_MAX         48
 #define CSV_LOGGER_UNIT_MAX         16
@@ -97,10 +102,12 @@ void csv_logger_set_column_provider(csv_column_provider_t provider);
 /**
  * @brief Engine-running predicate for the "Require engine running" CSV gate.
  *
- * Returns true while the engine is running. poll_log registers poll_log_engine_running here so
- * the logger can stop on engine-off without a circular component dependency (poll_log already
- * depends on csv_logger). Registered once at boot; when no provider is set the gate degrades to
- * the voltage ignition gate only. Must be cheap and lock-free (called from the writer task).
+ * Returns true while logging is warranted. poll_log registers poll_log_gate_open() here so the
+ * logger can stop on engine-off without a circular component dependency (poll_log already depends
+ * on csv_logger). NOT poll_log_engine_running(): that one means "the ECU answers", which is also
+ * true of a parked car at key-on. Registered once at boot; when no provider is set the gate
+ * degrades to the voltage ignition gate only. Must be cheap and lock-free (called from the writer
+ * task).
  */
 typedef bool (*csv_engine_state_fn_t)(void);
 void csv_logger_set_engine_state_fn(csv_engine_state_fn_t fn);

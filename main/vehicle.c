@@ -36,7 +36,8 @@ static EventGroupHandle_t vehicle_event_group;
 // 0.1 V ADC quantization avoids flapping at idle; csv_logger adds a 3 s ON->OFF debounce on
 // top for cranking dips. This gate is consumed ONLY by csv_logger (the writer task), so it
 // never touches sleep/wake or battery protection -- logging-only, cannot brick.
-#define VEHICLE_IGN_HYSTERESIS_V 0.3f   // OFF edge = engine_on_volt - band; 3x the 0.1 V ADC step
+/* VEHICLE_IGN_HYSTERESIS_V moved to vehicle.h: poll_log's recording gate applies the same band
+ * and the two must not drift apart. */
 
 static float engine_on_volt = 13.2f;    // set in vehicle_init() from config (config_server_get_engine_volt)
 // Held ignition state for hysteresis. Mutated only by the single caller (csv_logger writer
