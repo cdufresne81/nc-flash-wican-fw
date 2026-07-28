@@ -2722,13 +2722,12 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	}
 	else
 	{
-		uint32_t sleep_time = atoi(dst->sleep_time);
-
-		if(sleep_time > 30 && sleep_time < 1)
-		{
-			strlcpy(dst->sleep_time, "5", sizeof(dst->sleep_time));
-		}
-
+		/* No range check here on purpose. The 1..30 validation lives in
+		 * config_server_get_sleep_time(), which rejects out-of-range values and lets both
+		 * callers fall back to a safe default (main/obd.c, main/sleep_mode.c). Validating
+		 * at parse time would have to write a default IN PLACE, never reject -- this same
+		 * parse runs on the stored config at boot and a rejection factory-restores the
+		 * device (issue #44). */
 		strlcpy(dst->sleep_time, key->valuestring, sizeof(dst->sleep_time));
 	}
 
@@ -2962,13 +2961,8 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	}
 	else
 	{
-		uint32_t log_period = atoi(dst->log_period);
-
-		if(log_period > 300 && log_period < 1)
-		{
-			strlcpy(dst->log_period, "10", sizeof(dst->log_period));
-		}
-
+		/* No range check here, same reasoning as sleep_time above: config_server_get_log_period()
+		 * owns the 1..300 validation and main.c falls back to 60 on failure. */
 		strlcpy(dst->log_period, key->valuestring, sizeof(dst->log_period));
 	}
 	ESP_LOGI(TAG, "dst->log_period: %s", dst->log_period);
