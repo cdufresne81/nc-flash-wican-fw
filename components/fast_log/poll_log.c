@@ -49,6 +49,7 @@
  */
 
 #include <string.h>
+#include <strings.h>   /* strcasecmp */
 #include <math.h>
 #include <float.h>
 #include <stdbool.h>
@@ -73,6 +74,12 @@
 #include "event_log.h"
 #include "config_server.h"
 #include "expression_parser.h"
+/* Battery voltage for the recording gate (fast_log already REQUIRES main). NOTE: sleep_mode.h
+ * declares sleep_mode_get_voltage() TWICE behind #if HARDWARE_VER -- esp_err_t on WICAN_PRO, but
+ * int8_t (1 on success) on the older targets. The `== ESP_OK` test below is right for the PRO
+ * build this product ships; it would need revisiting if an older target is ever revived. */
+#include "sleep_mode.h"
+#include "vehicle.h"        /* VEHICLE_IGN_HYSTERESIS_V -- shared with the CSV ignition gate */
 
 #include "poll_log.h"
 
@@ -138,6 +145,38 @@ static inline uint16_t polllog_rmba_size(const uint8_t *req)
  * min_n sweeps, i.e. tens of ms) and does not weaken the real detector: with the engine
  * genuinely off, un-gated full sweeps still yield no OK and we still quiesce at 5 s. */
 #define POLLLOG_GATE_STALE_MS    (POLLLOG_ENGINE_OFF_MS / 2)
+
+/* ---- Recording gate: WATCH vs FAST ------------------------------------- */
+/* s_engine_running means "the ECU answers", NOT "the engine turns" -- a car sitting at key-on
+ * with the engine off answers every request, so the sweep used to run at the full ~430 req/s
+ * whenever the key was on and whether or not anything was being recorded. That is ECU diag-task
+ * load, bus utilisation and power spent on samples nobody keeps.
+ *
+ * WATCH is the same full sweep held to one pass per POLLLOG_WATCH_SWEEP_MS (~16-19 req/s on a
+ * 19-PID table). Deliberately the SAME sweep and not an RPM-only probe: every channel stays warm,
+ * and a table with no RPM row still works -- the gate simply drops the RPM term. FAST is today's
+ * path unchanged.
+ *
+ * PROBE is never slowed (see the pacing block): resume-in-one-frame depends on it.
+ *
+ * The gate cannot react faster than the battery ADC, which refreshes every 3 s
+ * (main/sleep_mode.c), so a faster watch cadence would buy nothing. */
+#define POLLLOG_WATCH_SWEEP_MS   1000     /* one full sweep per second while waiting for the engine */
+#define POLLLOG_WATCH_CHUNK_MS   20       /* the inter-sweep wait is chunked at this step -- see below */
+/* Both borrowed, not re-typed: the CSV writer closes a trip on the same debounce and vehicle.c
+ * uses the same band, so a copy here could silently drift and leave the poller and the writer
+ * disagreeing about when the engine stopped. */
+#define POLLLOG_GATE_OFF_MS      CSV_LOGGER_IGN_OFF_DEBOUNCE_MS
+#define POLLLOG_GATE_HYST_V      VEHICLE_IGN_HYSTERESIS_V
+#define POLLLOG_GATE_RPM_ON      400.0f   /* under any idle, over cranking noise */
+#define POLLLOG_GATE_VOLT_DEF    13.2f    /* fallback when engine_volt is unreadable (same default as main.c) */
+#define POLLLOG_RPM_STALE_MS     (2u * POLLLOG_WATCH_SWEEP_MS)  /* older than this and RPM stops counting */
+
+/* The engine-off detector is wall-clock based, so it works unchanged at watch cadence: after
+ * key-off every watch sweep is all-timeouts (~45 x 30 ms = ~1.4 s) and the 5 s budget still
+ * fires. That only holds while a watch sweep stays comfortably inside the budget. */
+_Static_assert(POLLLOG_WATCH_SWEEP_MS <= 2000,
+               "watch cadence must stay well under POLLLOG_ENGINE_OFF_MS or engine-off detection slips");
 
 /* HARD RATE CAP: no PID is ever polled more often than every POLLLOG_MIN_SWEEP_MS.
  * Each PID is requested once per sweep, so a floor on sweep duration IS a per-PID rate
@@ -268,6 +307,19 @@ static volatile int64_t s_last_ok_us     = 0;     /* esp_timer stamp of last mat
 static volatile bool    s_confirmed      = false; /* got an OK in the CURRENT NORMAL session -> engine truly running */
 static volatile int64_t s_norm_start_us  = 0;     /* when the current NORMAL session began (boot/resume) = probe-window ref */
 static volatile int64_t s_last_rx_us     = 0;     /* esp_timer stamp of last received frame (any id) */
+
+/* Recording gate (WATCH vs FAST). Same single-writer/no-mutex contract as the fields above.
+ * s_gate_open is what the CSV logger now gates on; s_engine_running keeps its old meaning
+ * ("the ECU answers") so /poll_status stays honest about the two being different things. */
+static volatile bool     s_gate_open = false;
+static float             s_gate_volt_on = POLLLOG_GATE_VOLT_DEF;  /* engine_volt, read once at init */
+/* Last RPM seen on EITHER path (polled or broadcast). 32-bit on purpose: a 64-bit volatile is
+ * not atomic on this core and could tear across the httpd/poll task boundary. s_rpm_seen stays
+ * false when the table carries no RPM channel at all -- that is how the gate knows to drop the
+ * RPM term instead of refusing to open. */
+static volatile bool     s_rpm_seen  = false;
+static volatile float    s_rpm_value = 0;
+static volatile uint32_t s_rpm_ms    = 0;
 static volatile int64_t s_last_flip_us   = 0;     /* dwell timer for POLLLOG_FLIP_MIN_MS */
 
 /* Live per-row Test under POLL_LOG (issue #41). The httpd handler stages ONE request here and
@@ -377,6 +429,125 @@ static bool polllog_match(const twai_message_t *m, const uint8_t *req, size_t rl
     return true;
 }
 
+/* Feed the gate's RPM input. Matched on the channel NAME, exactly and case-insensitively: both the
+ * polled and the broadcast copy are named "RPM" in the NC table (the "[PID]" / "[CANFLT]" suffix is
+ * added by the CSV writer, not part of the name). Exact rather than a prefix so a channel called
+ * something like "RPM_target" cannot be mistaken for the real thing.
+ *
+ * A table with no RPM channel never reaches the assignment, s_rpm_seen stays false, and the gate
+ * falls back to voltage alone -- exactly the pair that opens a CSV session today, so the gate can
+ * never end up stricter than what already ships. */
+static inline void polllog_stamp_rpm(const char *name, float value)
+{
+    if (!name || strcasecmp(name, "RPM") != 0)
+        return;
+    s_rpm_value = value;
+    s_rpm_ms    = (uint32_t)(esp_timer_get_time() / 1000);
+    s_rpm_seen  = true;
+}
+
+/* Decide whether the fast sweep is warranted right now. Runs once per sweep on the poll task,
+ * above the sweep itself.
+ *
+ * "Running" = voltage at or above engine_volt AND (RPM over the threshold, when an RPM channel
+ * exists). Opening measures against engine_volt; closing measures against engine_volt minus the
+ * hysteresis band and must hold for POLLLOG_GATE_OFF_MS. Opening additionally needs s_confirmed,
+ * so we never transmit flat out at a bus that has not answered.
+ *
+ * BOTH signals must agree to stay open, and EITHER one dropping closes the gate. That mirrors the
+ * CSV writer, which records only while `ignition_on && engine_ok` (csv_logger.c) -- the gate is
+ * open exactly when a trip could be recording, which is the whole point of having it.
+ *
+ * Getting this asymmetric was tempting and wrong. An earlier version let RPM alone close the gate
+ * and ignored voltage, meaning to protect a live recording on a tired charging system that sags
+ * under the band at idle. It protects nothing: the CSV writer decides on VOLTAGE alone, so it
+ * closes that trip regardless (reason "ignition_off"), and the gate would then sit open at full
+ * rate with nothing being recorded -- exactly the waste this state machine exists to remove.
+ *
+ * The CSV-session term is what keeps the web Start button and bench work at full rate: a manual
+ * start opens a session from the slow watch records, this sees it and goes fast on the next pass.
+ * A bench PCM reports RPM 0, so manual start is the only way to reach FAST there -- by design.
+ *
+ * vehicle_ignition_state() is deliberately NOT used: its hysteresis is a single static latched by
+ * one caller (the CSV writer task, main/vehicle.c), so a second caller would race it. This applies
+ * the same shared band (VEHICLE_IGN_HYSTERESIS_V) against its own state.
+ *
+ * An unreadable voltage does NOT hold the gate shut. Today's behaviour is "always fast", so
+ * failing open is the only choice that cannot turn a broken ADC into silently lost data. With no
+ * RPM channel configured the RPM term drops out and the gate becomes voltage-only -- the same
+ * decision the CSV writer already makes, so it can never be stricter than what ships. */
+static void polllog_eval_gate(int64_t now_us)
+{
+    static int64_t low_since_us = 0;   /* poll task only */
+
+    if (csv_logger_session_active())
+    {
+        if (!s_gate_open)
+        {
+            s_gate_open  = true;
+            ESP_LOGI(TAG, "recording gate OPEN (CSV session active) -> full-rate sweep");
+        }
+        low_since_us = 0;
+        return;
+    }
+
+    float      volts  = 0;
+    const bool have_v = (sleep_mode_get_voltage(&volts) == ESP_OK);
+
+    /* RPM counts only while an RPM channel exists AND its last value is recent. Anything older
+     * than two watch periods is treated as absent, not as zero. */
+    bool rpm_known = false, rpm_running = false;
+    if (s_rpm_seen)
+    {
+        const uint32_t now_ms = (uint32_t)(now_us / 1000);
+        if ((uint32_t)(now_ms - s_rpm_ms) <= POLLLOG_RPM_STALE_MS)
+        {
+            rpm_known   = true;
+            rpm_running = (s_rpm_value > POLLLOG_GATE_RPM_ON);
+        }
+    }
+
+    /* One "is the engine running" answer, asked against a threshold that depends on which side of
+     * the gate we are on: engine_volt to open, engine_volt minus the band to close. That band IS
+     * the hysteresis, so a voltage hovering on the line cannot flap the gate. */
+    const float volt_line = s_gate_open ? (s_gate_volt_on - POLLLOG_GATE_HYST_V) : s_gate_volt_on;
+    const bool  volt_ok   = !have_v || (volts >= volt_line);
+    const bool  rpm_ok    = !rpm_known || rpm_running;
+    const bool  running   = volt_ok && rpm_ok;
+
+    if (!s_gate_open)
+    {
+        if (s_confirmed && running)
+        {
+            s_gate_open  = true;
+            low_since_us = 0;
+            ESP_LOGI(TAG, "recording gate OPEN (%.2fV, rpm %s) -> full-rate sweep",
+                     have_v ? (double)volts : 0.0,
+                     rpm_known ? (rpm_running ? "running" : "stopped") : "n/a");
+        }
+        return;
+    }
+
+    if (running)
+    {
+        low_since_us = 0;          /* still running -> restart the debounce */
+        return;
+    }
+    if (low_since_us == 0)
+    {
+        low_since_us = now_us;
+        return;
+    }
+    if ((now_us - low_since_us) > (int64_t)POLLLOG_GATE_OFF_MS * 1000)
+    {
+        s_gate_open  = false;
+        low_since_us = 0;
+        ESP_LOGI(TAG, "recording gate CLOSED (%s for %dms) -> watch sweep every %dms",
+                 !rpm_ok ? "rpm stopped" : "voltage under band",
+                 POLLLOG_GATE_OFF_MS, POLLLOG_WATCH_SWEEP_MS);
+    }
+}
+
 #if POLLLOG_HYBRID
 /*
  * Hybrid: decode one drained NON-response frame against the configured broadcast filters and push
@@ -441,6 +612,7 @@ static void polllog_decode_broadcast(const twai_message_t *msg)
                 continue;
 
             p->value = (float)result;
+            polllog_stamp_rpm(p->name, p->value);   /* broadcast copy feeds the gate too */
             csv_logger_record(p->name, p->value, p->unit, "CANFLT");
         }
         /* no break: a frame_id may appear in more than one filter entry */
@@ -561,6 +733,7 @@ static bool polllog_poll_one(pid_data_t *pid)
                     if (p->max != FLT_MAX && result > (double)p->max)
                         continue;
                     p->value = (float)result;
+                    polllog_stamp_rpm(p->name, p->value);
                     csv_logger_record(p->name, p->value, p->unit, "PID");
                 }
                 autopid_unlock();
@@ -963,6 +1136,13 @@ static void polllog_rx_task(void *arg)
             const uint32_t sweep_ok_before = s_cum_ok;
             const int64_t  sweep_t0 = now;
 
+            /* Decide FAST vs WATCH before the sweep, so pacing and the divisor bypass below
+             * both see one consistent answer for this pass. */
+            polllog_eval_gate(now);
+            /* WATCH == confirmed-answering but not worth recording. PROBE (!s_confirmed) is
+             * deliberately excluded: it must stay full-rate or resume-in-one-frame breaks. */
+            const bool watch_mode = s_confirmed && !s_gate_open;
+
             /* The divisor gate applies only when the ECU is confirmed answering AND an OK is
              * not going stale. Captured once so the whole sweep is consistent even if
              * s_confirmed flips mid-sweep.
@@ -975,9 +1155,12 @@ static void polllog_rx_task(void *arg)
              *     always TIME OUT (30 ms each) combined with a high divisor on the only
              *     answering channel can push (now - s_last_ok_us) past POLLLOG_ENGINE_OFF_MS
              *     and fire a FALSE ENGINE_STOP, closing the csv require-engine gate mid-drive.
-             * Both bypasses skip polllog_pid_due() entirely, so counters do NOT tick and
+             *   BYPASS 3 -- WATCH (!s_gate_open): the slow sweep already runs at a fraction of
+             *     the divisors' intended rate, so applying them on top would starve channels and
+             *     leave the gate's own RPM input stale.
+             * All three bypasses skip polllog_pid_due() entirely, so counters do NOT tick and
              * phase resumes exactly where it left off. */
-            const bool gate_active = s_confirmed &&
+            const bool gate_active = s_confirmed && s_gate_open &&
                 ((now - s_last_ok_us) < (int64_t)POLLLOG_GATE_STALE_MS * 1000);
             /* "the sweep shape currently in effect is a GATED one". Drives both the EMA rule
              * and the fast-channel multiplier, so the measurement and the multiplier always
@@ -1057,16 +1240,56 @@ static void polllog_rx_task(void *arg)
              * polllog_poll_one. The `polled == 0` fallback exists so that a future change
              * which lifts a sweep past the floor cannot silently produce a yield-free loop. */
             {
+                const int64_t floor_us = watch_mode
+                    ? (int64_t)POLLLOG_WATCH_SWEEP_MS * 1000
+                    : POLLLOG_MIN_SWEEP_US;
                 const int64_t raw_us = esp_timer_get_time() - sweep_t0;
                 uint32_t pace_ms = 0;
-                if (raw_us < POLLLOG_MIN_SWEEP_US)
-                    pace_ms = (uint32_t)((POLLLOG_MIN_SWEEP_US - raw_us + 999) / 1000);
+                if (raw_us < floor_us)
+                    pace_ms = (uint32_t)((floor_us - raw_us + 999) / 1000);
                 if (pace_ms == 0 && polled == 0)
                     pace_ms = 1;
                 if (pace_ms > 0)
                 {
                     s_pace_sweeps++;
-                    vTaskDelay(pdMS_TO_TICKS(pace_ms));
+                    if (!watch_mode)
+                    {
+                        vTaskDelay(pdMS_TO_TICKS(pace_ms));
+                    }
+                    else
+                    {
+                        /* A watch wait is ~1 s, which is far too long to spend not draining: the
+                         * RX queue overflows many times over at the frame rate quoted on the
+                         * empty-sweep drain above. It would also blind the broadcast decode, which
+                         * feeds the gate its own RPM input -- the thing that decides when to go
+                         * fast. So the wait is chunked: sleep a little, drain, repeat. Same 20 ms
+                         * cadence the QUIESCED branch uses, which also keeps can_should_park()
+                         * reaction quick. */
+                        uint32_t left = pace_ms;
+                        while (left > 0 && !can_should_park())
+                        {
+                            const uint32_t step = (left > POLLLOG_WATCH_CHUNK_MS)
+                                                ? POLLLOG_WATCH_CHUNK_MS : left;
+                            vTaskDelay(pdMS_TO_TICKS(step));
+                            left -= step;
+                            twai_message_t m;
+                            bool got_frame = false;
+                            while (can_receive(&m, 0) == ESP_OK)
+                            {
+                                got_frame = true;
+#if POLLLOG_HYBRID
+                                polllog_decode_broadcast(&m);
+#endif
+                            }
+                            /* Stamped once per chunk, not once per frame: at bus rate that is 50
+                             * timer reads a second instead of ~2000, and the stamp can only be up
+                             * to one 20 ms chunk old -- invisible to its readers, which work in
+                             * hundreds of ms (poll_log_bus_idle_ms) and seconds (the quiesce
+                             * detector). Same shape as the QUIESCED branch below. */
+                            if (got_frame)
+                                s_last_rx_us = esp_timer_get_time();
+                        }
+                    }
                 }
             }
 
@@ -1079,8 +1302,14 @@ static void polllog_rx_task(void *arg)
              * non-empty mean is 3.125 ms, x2 = 6.25 ms, but the N=2 channel's true mean
              * interval is 4.83 ms -- 29% high). Empty sweeps are folded ONLY while gating is
              * live, so the anti-poison guard (probe sweeps against a silent ECU) and the
-             * all-PIDs-disabled case keep today's exact behaviour. */
-            if ((s_cum_ok != sweep_ok_before) || gating_live)
+             * all-PIDs-disabled case keep today's exact behaviour.
+             * WATCH sweeps are excluded outright: folding a 1 s sweep in would hand the Auto CSV
+             * grid a ~1 Hz rate and fill the next trip with duplicate rows. s_fast_hz instead
+             * FREEZES at the last FAST measurement across watch and quiesce -- the same thing it
+             * already does across a quiesce today, and accurate because the table has not
+             * changed. First boot is the one exception: nothing has been measured yet, so the
+             * grid starts at its 10 Hz default and converges within ~8 sweeps once FAST begins. */
+            if (s_gate_open && ((s_cum_ok != sweep_ok_before) || gating_live))
             {
                 static float ema_us = 0;   /* poll-task-local; the volatiles below are the readers' view */
                 static bool  ema_gated = false;
@@ -1134,6 +1363,7 @@ static void polllog_rx_task(void *arg)
                     s_quiesced       = true;
                     s_engine_running = false;
                     s_confirmed      = false;
+                    s_gate_open      = false;  /* ECU gone -> nothing to record; re-decide on resume */
                     s_last_rx_us     = now;   /* arm the idle clock from the flip instant */
                     s_last_flip_us   = now;
                     if (was_confirmed)
@@ -1301,8 +1531,19 @@ void poll_log_init(char *id, uint32_t log_period)
 
     /* Let the CSV logger gate on engine-running via our CAN-derived signal. Registration (not a
      * direct include) avoids a circular component dependency: poll_log already depends on
-     * csv_logger, not the reverse. */
-    csv_logger_set_engine_state_fn(poll_log_engine_running);
+     * csv_logger, not the reverse. Registers the RECORDING gate, not poll_log_engine_running --
+     * see the WATCH vs FAST block near the top for why those are different questions. */
+    csv_logger_set_engine_state_fn(poll_log_gate_open);
+
+    /* The gate's voltage threshold. Read once here rather than per sweep: changing engine_volt
+     * goes through /store_config, which reboots, so it cannot change under a running task. */
+    if (config_server_get_engine_volt(&s_gate_volt_on) == -1)
+    {
+        s_gate_volt_on = POLLLOG_GATE_VOLT_DEF;
+        ESP_LOGW(TAG, "engine_volt unreadable; recording gate uses %.1fV", (double)s_gate_volt_on);
+    }
+    ESP_LOGI(TAG, "recording gate: >= %.1fV (plus RPM when configured); watch sweep every %dms",
+             (double)s_gate_volt_on, POLLLOG_WATCH_SWEEP_MS);
 
     /* Same registration pattern for the measured sweep rate (issue #23): the CSV writer's
      * "Auto" fixed-rate grid tracks poll_log's real sweep frequency with no reverse dep. */
@@ -1333,6 +1574,13 @@ bool poll_log_engine_running(void)
 bool poll_log_quiesced(void)
 {
     return s_active ? s_quiesced : false;
+}
+
+/* The RECORDING gate (see the WATCH vs FAST block near the top). Returns true when POLL_LOG is not
+ * the active mode, so other modes and any stale read can never suppress logging. */
+bool poll_log_gate_open(void)
+{
+    return s_active ? s_gate_open : true;
 }
 
 float poll_log_sweep_hz(void)
@@ -1369,6 +1617,16 @@ char *poll_log_get_status_json(void)
     char *buf = malloc(POLLLOG_STATUS_JSON_SZ);
     if (buf == NULL)
         return NULL;
+
+    /* One word for what the poll task is doing, because req_s alone is now ambiguous: ~16/s is
+     * healthy in watch and alarming in fast. "probe" is the short window after a boot or a resume
+     * where the ECU has not answered yet -- still full rate, by design. */
+    const char *state = !s_active      ? "inactive"
+                      : s_quiesced     ? "quiesced"
+                      : !s_confirmed   ? "probe"
+                      : s_gate_open    ? "fast"
+                                       : "watch";
+
     int n = snprintf(buf, POLLLOG_STATUS_JSON_SZ,
              "{\"active\":%s,\"ok\":%u,\"timeout\":%u,\"txfail\":%u,"
              "\"rtt_avg_ms\":%.2f,\"rtt_min_ms\":%.2f,\"rtt_max_ms\":%.2f,\"req_s\":%.1f,"
@@ -1379,7 +1637,9 @@ char *poll_log_get_status_json(void)
              "\"sweep_min_ms\":%.1f,\"sweep_max_ms\":%.1f,\"fast_ms\":%.1f,\"fast_hz\":%.2f,"
              "\"win_ok\":%u,\"win_timeout\":%u,\"win_txfail\":%u,"
              "\"engine_running\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s,"
-             "\"reload_pending\":%s}",
+             "\"reload_pending\":%s,"
+             "\"state\":\"%s\",\"gate_open\":%s,"
+             "\"gate_volt\":%.1f,\"rpm_known\":%s,\"rpm\":%.0f}",
              s_active ? "true" : "false",
              (unsigned)s_cum_ok, (unsigned)s_cum_timeout, (unsigned)s_cum_txfail,
              (double)s_win_rtt_avg_ms, (double)s_win_rtt_min_ms, (double)s_win_rtt_max_ms,
@@ -1398,7 +1658,12 @@ char *poll_log_get_status_json(void)
              s_quiesced ? "true" : "false",
              (unsigned)poll_log_bus_idle_ms(),
              s_last_reload_ok ? "true" : "false",
-             s_reload_requested ? "true" : "false");
+             s_reload_requested ? "true" : "false",
+             state,
+             s_gate_open ? "true" : "false",
+             (double)s_gate_volt_on,
+             s_rpm_seen ? "true" : "false",
+             (double)s_rpm_value);
     /* Silent truncation would emit INVALID JSON to the web UI and to any tooling polling
      * this endpoint -- log loudly rather than let a future field addition break it quietly. */
     if (n < 0 || n >= POLLLOG_STATUS_JSON_SZ)

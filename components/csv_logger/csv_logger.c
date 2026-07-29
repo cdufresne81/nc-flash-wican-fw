@@ -73,7 +73,8 @@ _Static_assert(CSV_LOGGER_SOURCE_MAX == 8, "wide column source dim must match pr
 #define CSV_LOGGER_IGNITION_POLL_MS 500
 // Ignition-off must persist this long before the session closes, so a voltage
 // dip during cranking doesn't split the log file.
-#define CSV_LOGGER_IGN_OFF_DEBOUNCE_MS  3000
+/* CSV_LOGGER_IGN_OFF_DEBOUNCE_MS moved to csv_logger.h: poll_log's recording gate debounces on the
+ * same value and the two must not drift apart. */
 #define CSV_LOGGER_SD_RETRY_MS      5000
 
 typedef struct

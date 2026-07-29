@@ -1832,6 +1832,7 @@ const effDivisor = n => (Number.isInteger(n) && n >= 2) ? n : 1;
 
 var pollActive   = false;  // /poll_status .active
 var pollQuiesced = false;  // /poll_status .quiesced
+var pollWatching = false;  // /poll_status .state === 'watch' (slow sweep, waiting for the engine)
 var pollSweepMs  = 0;      // last measured mean sweep, ms; 0 = unknown
 var pollReach    = true;   // last fetch succeeded
 
@@ -1896,9 +1897,10 @@ function pollSweepRefresh() {
             pollReach    = true;
             pollActive   = !!(j && j.active === true);
             pollQuiesced = !!(j && j.quiesced === true);
+            pollWatching = !!(j && j.state === 'watch');
             pollSweepMs  = (pollActive && Number.isFinite(j.sweep_ms) && j.sweep_ms > 0) ? j.sweep_ms : 0;
         })
-        .catch(function () { pollReach = false; pollActive = false; pollSweepMs = 0; })
+        .catch(function () { pollReach = false; pollActive = false; pollWatching = false; pollSweepMs = 0; })
         .then(updateAllSampleHints);
 }
 
@@ -1908,6 +1910,10 @@ function sampleUnknownReason() {
     if (!pollReach)   return 'device unreachable';
     if (!pollActive)  return 'not in Datalogger mode';
     if (pollQuiesced) return 'engine off';
+    // Watch mode polls slowly on purpose while waiting for the engine, so no fast-sweep rate has
+    // been measured yet. Without this the hint would sit on 'measuring…' for as long as the car
+    // is parked and read like something is stuck.
+    if (pollWatching) return 'waiting for engine';
     return 'measuring…';
 }
 

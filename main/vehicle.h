@@ -31,6 +31,12 @@
 extern "C" {
 #endif
 
+/* Ignition-voltage hysteresis band: the OFF edge sits this far under engine_on_volt. 3x the 0.1 V
+ * ADC step. Shared, not copied: poll_log's recording gate applies the same band to decide when to
+ * drop back to its slow watch sweep, and a device that disagrees with itself about when the engine
+ * stopped would close one gate while the other stays open. */
+#define VEHICLE_IGN_HYSTERESIS_V 0.3f
+
 // Vehicle event bits
 #define VEHICLE_IGNITION_ON_BIT     BIT0
 #define VEHICLE_STATIONARY_BIT      BIT1
