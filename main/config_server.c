@@ -1650,7 +1650,9 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	char volt[8]= {0};
 	float tmp = 0;
 	sleep_mode_get_voltage(&tmp);
-	sprintf(volt, "%.1fV", tmp);
+	/* Two decimals, not one: the reading is no longer rounded to 0.1 V and this endpoint is the
+	 * primary way to observe a crank dip or measure the dip-wake threshold on a real car. */
+	snprintf(volt, sizeof(volt), "%.2fV", tmp);
 	cJSON_AddStringToObject(root, "batt_voltage", volt);
 
 	cJSON_AddStringToObject(root, "device_id", device_id);

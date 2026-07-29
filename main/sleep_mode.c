@@ -611,6 +611,17 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 #define CRITICAL_VOLTAGE  11.90f
 #define ERROR_VOLTAGE     12.1f
 
+/* Battery sample period. 500 ms, down from 3000 ms: a crank pulls the battery to 9-11 V for well
+ * under a second, and at 3 s that dip was usually sampled either side of and never seen at all.
+ * The 8-sample ADC burst behind each reading is cheap; what this rate really costs is that every
+ * voltage comparison in this task now fires 6x more often, which is why the DEV_WAKE_VOLTAGE_OK
+ * latch and the LOW_VOLTAGE recovery dwell below both exist. */
+#define VOLTAGE_READ_PERIOD_MS   500
+
+/* Consecutive fresh samples above wakeup_voltage needed to abandon the sleep countdown. 4 samples
+ * ~= 2 s. Guards the countdown against a single noise spike -- see STATE_LOW_VOLTAGE. */
+#define VOLT_RECOVER_SAMPLES     4
+
 static adc_oneshot_unit_handle_t adc_handle;
 static adc_cali_handle_t cali_handle = NULL;
 static bool do_calibration = false;
@@ -768,16 +779,22 @@ esp_err_t read_ss_adc_voltage(float *voltage_out)
         float avg_voltage = (float)sum_voltage / valid_samples;
         
         #ifdef HV_PRO_V140
-        float volt_rounded = ((float)avg_voltage * 7.25f) / 1000;
+        float volts = ((float)avg_voltage * 7.25f) / 1000;
         #else
-        float volt_rounded = ((float)avg_voltage * 11) / 1000;
-        volt_rounded+=0.1f;  // Adjust for calibration offset
+        float volts = ((float)avg_voltage * 11) / 1000;
+        volts+=0.1f;  // Adjust for calibration offset
         #endif
-        
-        volt_rounded = roundf(volt_rounded * 10.0f) / 10.0f;
-        *voltage_out = volt_rounded;
-        
-        ESP_LOGI(TAG, "Summary: Raw=%d (min=%lu, max=%lu, avg of %lu), Voltage=%.2f V [%s]", 
+
+        /* Deliberately NOT rounded to 0.1 V. Cranking drops the battery to 9-11 V for under a
+         * second; at 0.1 V granularity that dip is indistinguishable from noise, and the dip-wake
+         * detector needs to see a ~0.25 V step. Every threshold compare downstream shifts by at
+         * most 0.05 V as a result (a raw 13.16 used to round UP to 13.2 and pass a >= 13.2 test;
+         * it now fails it). That is a real change to sleep/wake edges -- see the dwell on the
+         * LOW_VOLTAGE escape and the DEV_WAKE_VOLTAGE_OK latch, both of which exist because this
+         * value now moves 6x more often. */
+        *voltage_out = volts;
+
+        ESP_LOGD(TAG, "Summary: Raw=%d (min=%lu, max=%lu, avg of %lu), Voltage=%.2f V [%s]",
                  avg_raw, min_raw, max_raw, valid_samples, *voltage_out,
                  do_calibration ? "CALIBRATED" : "UNCALIBRATED");
                  
@@ -906,29 +923,80 @@ void light_sleep_task(void *pvParameters)
     ESP_LOGI(TAG, "Sleep task started. Sleep enabled: %d, Sleep voltage: %.2f, Wakeup voltage: %.2f, Sleep time: %lu, Periodic wakeup: %d, Wakeup interval: %lu", 
              sleep_en, sleep_voltage, wakeup_voltage, sleep_time, periodic_wakeup, wakeup_interval);
 
-    // Initialize voltage read timer
+    /* Read the battery once every VOLTAGE_READ_PERIOD_MS. This used to be 3 s, which is far too
+     * coarse to see a crank: the starter pulls the battery to 9-11 V for well under a second and
+     * the old cadence would usually miss it completely. */
     wc_timer_set(&voltage_read_timer, 10);
+
+    /* DEV_WAKE_VOLTAGE_OK_BIT is the only voltage compare with no hysteresis of its own, and
+     * AutoPID parks on it with portMAX_DELAY -- so a bit that chatters parks and unparks that task
+     * repeatedly. At 3 s that was rare; at 500 ms it would not be. The latch below only ever
+     * changes on the two OUTER edges and holds inside the band. It needs one exception: on the
+     * very first sample (and after any ADC failure gap) there is no previous state to hold, and
+     * resolving an unknown state as "cleared" would park AutoPID forever on a device that booted
+     * inside the band -- at a voltage that works fine today. So the first sample resolves against
+     * sleep_voltage exactly as the old code did, and only later samples use the raised set edge. */
+    bool volt_ok_resolved = false;
+
+    /* Consecutive fresh samples seen at or above wakeup_voltage while in STATE_LOW_VOLTAGE. */
+    uint8_t volt_recover_count = 0;
+
+    /* Boot-loop guard input, cached once. See the guard below for why this is not re-read. */
+    uint32_t boot_unexpected_resets = 0;
+    {
+        restart_tracker_state_t boot_state;
+        if(restart_tracker_get_state(&boot_state) == ESP_OK)
+        {
+            boot_unexpected_resets = boot_state.unexpected_reset_count;
+        }
+    }
+
     vTaskDelay(pdMS_TO_TICKS(1000));
-    while (1) 
+    while (1)
 	{
-        // Read voltage every 3 seconds
-        if(wc_timer_is_expired(&voltage_read_timer)) 
+        /* True only on a loop pass that actually produced a NEW reading. The loop runs faster than
+         * the ADC cadence, so anything that counts consecutive samples must count this and not
+         * loop passes -- otherwise it counts the same reading several times over. */
+        bool fresh_sample = false;
+
+        if(wc_timer_is_expired(&voltage_read_timer))
 		{
             // ret = sleep_mode_get_voltage(&battery_voltage);
             // ret = read_adc_voltage(&battery_voltage);
             ret = read_ss_adc_voltage(&battery_voltage);
-            wc_timer_set(&voltage_read_timer, 3000);
+            wc_timer_set(&voltage_read_timer, VOLTAGE_READ_PERIOD_MS);
             if(ret == ESP_OK)
             {
+                fresh_sample = true;
                 update_battery_voltage(&battery_voltage);
-                if (battery_voltage < sleep_voltage)
+                if (!volt_ok_resolved)
+                {
+                    /* No previous state to hold -- resolve exactly as the pre-hysteresis code did. */
+                    if (battery_voltage < sleep_voltage)
+                    {
+                        dev_status_clear_bits(DEV_WAKE_VOLTAGE_OK_BIT);
+                    }
+                    else
+                    {
+                        dev_status_set_bits(DEV_WAKE_VOLTAGE_OK_BIT);
+                    }
+                    volt_ok_resolved = true;
+                }
+                else if (battery_voltage < sleep_voltage)
                 {
                     dev_status_clear_bits(DEV_WAKE_VOLTAGE_OK_BIT);
                 }
-                else
+                else if (battery_voltage >= wakeup_voltage)
                 {
                     dev_status_set_bits(DEV_WAKE_VOLTAGE_OK_BIT);
                 }
+                /* else: inside [sleep_voltage, wakeup_voltage) -> hold the latched state */
+            }
+            else
+            {
+                /* Lost the ADC. Whatever the bit says now is stale by the time reads resume, so
+                 * make the next good sample re-resolve from scratch instead of holding. */
+                volt_ok_resolved = false;
             }
         }
 
@@ -942,17 +1010,41 @@ void light_sleep_task(void *pvParameters)
 					{
                         ESP_LOGW(TAG, "Battery voltage low (%.2fV), starting low voltage timer", battery_voltage);
                         current_state = STATE_LOW_VOLTAGE;
+                        volt_recover_count = 0;
                         wc_timer_set(&sleep_timer, sleep_time);
                     }
                     break;
 
                 case STATE_LOW_VOLTAGE:
-                    if (battery_voltage >= wakeup_voltage) 
+                    /* Leaving LOW_VOLTAGE ABANDONS the sleep countdown, and re-entering re-arms
+                     * the FULL sleep_time. On a single sample that is a trap now that readings are
+                     * unrounded and 6x more frequent: one noise spike above wakeup_voltage throws
+                     * away however much of the countdown had elapsed, and a car resting near the
+                     * threshold could keep resetting it and never sleep at all -- which is exactly
+                     * the parked-battery drain this state machine exists to prevent. Require the
+                     * recovery to hold across VOLT_RECOVER_SAMPLES real samples (~2 s). */
+                    if (fresh_sample)
+                    {
+                        if (battery_voltage >= wakeup_voltage)
+                        {
+                            if (volt_recover_count < VOLT_RECOVER_SAMPLES)
+                            {
+                                volt_recover_count++;
+                            }
+                        }
+                        else
+                        {
+                            volt_recover_count = 0;
+                        }
+                    }
+
+                    if (volt_recover_count >= VOLT_RECOVER_SAMPLES)
 					{
                         ESP_LOGI(TAG, "Battery voltage recovered (%.2fV)", battery_voltage);
                         current_state = STATE_NORMAL;
-                    } 
-                    else if (wc_timer_is_expired(&sleep_timer)) 
+                        volt_recover_count = 0;
+                    }
+                    else if (wc_timer_is_expired(&sleep_timer))
 					{
                         ESP_LOGI(TAG, "Low voltage timeout expired, entering sleep mode");
                         current_state = STATE_SLEEPING;
@@ -1022,7 +1114,9 @@ void light_sleep_task(void *pvParameters)
             xQueueOverwrite(sleep_state_queue, &state_info);
 
             // Log current status
-            ESP_LOGI(TAG, "State: %d, Battery: %.2fV", current_state, battery_voltage);
+            /* LOGD, not LOGI: this fires once per loop pass, which is 2x/s after the sample-rate
+             * change. At LOGI it floods the log and pushes out anything useful. */
+            ESP_LOGD(TAG, "State: %d, Battery: %.2fV", current_state, battery_voltage);
         } 
         else if (ret != ESP_OK) 
 		{
@@ -1043,13 +1137,17 @@ void light_sleep_task(void *pvParameters)
         //     }
         //     // adc_continuous_start(handle);
         // }
-        restart_tracker_state_t restart_tracker_state;
-        if(restart_tracker_get_state(&restart_tracker_state) == ESP_OK)
+        /* unexpected_reset_count is read ONCE, above the loop -- see boot_unexpected_resets. The
+         * count only ever changes inside restart_tracker_init() at boot, so a cached copy is exact,
+         * and restart_tracker_get_state() is not free: it CRC32s ~450 bytes of PSRAM and copies the
+         * struct under a spinlock. Running that every pass was already wasteful; at the 500 ms loop
+         * it would run twice as often, on a device with a history of interrupt_wdt panics in the SD
+         * write path. The comparison below still runs every pass -- only its input is cached. */
         {
-            if(restart_tracker_state.unexpected_reset_count >=3 && battery_voltage < ERROR_VOLTAGE && current_state != STATE_SLEEPING)
+            if(boot_unexpected_resets >= 3 && battery_voltage < ERROR_VOLTAGE && current_state != STATE_SLEEPING)
             {
                 // Guard on !STATE_SLEEPING so this teardown runs once on entry, not every
-                // 2 s loop while voltage stays in the low band (#47).
+                // loop pass while voltage stays in the low band (#47).
                 current_state = STATE_SLEEPING;
                 gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
                 dev_status_clear_bits(DEV_AWAKE_BIT);
@@ -1066,7 +1164,7 @@ void light_sleep_task(void *pvParameters)
                 state_info.state = current_state;
                 state_info.voltage = battery_voltage;
                 xQueueOverwrite(sleep_state_queue, &state_info);
-                printf("\r\nUnexpected reset count: %lu, entering sleep mode to prevent potential boot loop...\r\n", restart_tracker_state.unexpected_reset_count);
+                printf("\r\nUnexpected reset count: %lu, entering sleep mode to prevent potential boot loop...\r\n", boot_unexpected_resets);
                 led_indicator_suspend();
                 led_set_level(0,0,0);
                 led_pattern_ms_t breathing_pattern = {
@@ -1133,9 +1231,11 @@ void light_sleep_task(void *pvParameters)
         }
         if(current_state != STATE_SLEEPING)
         {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            /* Must track VOLTAGE_READ_PERIOD_MS. This delay is what actually paces the awake loop,
+             * so shortening the ADC timer alone would silently leave the real sample rate at 1 Hz. */
+            vTaskDelay(pdMS_TO_TICKS(VOLTAGE_READ_PERIOD_MS));
         }
-        
+
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
