@@ -3227,10 +3227,11 @@ function checkStatus() {
         document.getElementById("fw_version").innerHTML = obj.git_version;
         document.getElementById("hw_version").innerHTML = obj.hw_version;
         document.getElementById("protocol").value = obj.protocol;
-        // PID polling works under auto_pid (legacy ELM poller) and poll_log (native
-        // poller); fast_log records only CAN-filter/calculated channels. Warn only when
-        // the protocol can't record PIDs at all.
-        if (["auto_pid", "poll_log", "fast_log"].indexOf(obj.protocol) === -1) {
+        // poll_log is the native poller; fast_log records only CAN-filter/calculated
+        // channels. auto_pid (the legacy ELM poller) is no longer listed: the config parser
+        // coerces it to poll_log, so /check_status can never report it -- and if it ever did,
+        // it deserves the warning rather than the silent pass it used to get.
+        if (["poll_log", "fast_log"].indexOf(obj.protocol) === -1) {
             document.getElementById("autopid_warning_div").style.display = "block";
         }else {
             document.getElementById("autopid_warning_div").style.display = "none";

@@ -199,12 +199,12 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"st
 										\"home_ssid\":\"MeatPi\",\"home_password\":\"TomatoSauce\",\"home_security\":\"wpa3\",\"home_protocol\":\"elm327\",\
 										\"drive_ssid\":\"MeatPi\",\"drive_password\":\"TomatoSauce\",\"drive_security\":\"wpa3\",\"drive_protocol\":\"elm327\",\"drive_connection_type\":\"wifi\",\"drive_mode_timeout\":\"60\",\
 										\"can_datarate\":\"500K\",\
-										\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\
-								\"ble_status\":\"disable\",\"ble_power\":\"9\",\"sleep_status\":\"enable\",\"periodic_wakeup\":\"disable\",\"sleep_volt\":\"13.1\",\"engine_volt\":\"13.2\",\"wakeup_volt\":\"13.5\",\"sleep_time\":\"5\",\"wakeup_interval\":\"90\",\"batt_alert\":\"disable\",\
+										\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"poll_log\",\"ble_pass\":\"123456\",\
+								\"ble_status\":\"disable\",\"ble_power\":\"9\",\"sleep_status\":\"enable\",\"periodic_wakeup\":\"disable\",\"sleep_volt\":\"13.1\",\"engine_volt\":\"13.0\",\"wakeup_volt\":\"13.5\",\"sleep_time\":\"5\",\"wakeup_interval\":\"90\",\"batt_alert\":\"disable\",\
 										\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\
 										\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\
 								\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\
-										\"csv_log\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"csv_grid_hz\":\"10\",\"csv_require_engine\":\"enable\",\"led_blink\":\"enable\"}";
+										\"csv_log\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"csv_grid_hz\":\"auto\",\"csv_require_engine\":\"enable\",\"led_blink\":\"enable\"}";
 
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"periodic_wakeup\":\"disable\",\"wakeup_interval\":\"5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
@@ -2478,6 +2478,19 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 		goto config_error;
 	}
 	strlcpy(dst->protocol, key->valuestring, sizeof(dst->protocol));
+	// The legacy AutoPID scheduler is retired on this fork (issue #28). It polls one PID at a
+	// time (~0.5 Hz per channel, vs poll_log sweeping the whole table ~20x/s) and it never runs
+	// the calculated-channel pass -- autopid_eval_calculated_channels() is called only from
+	// poll_log.c and fast_log.c -- so its CSVs carry phantom all-empty CALC columns. Devices
+	// that still store the old value are coerced here, in RAM ONLY: no write to config.json, so
+	// a booting device never risks the truncate-then-write path. Every consumer (boot, the
+	// /store_config shadow validation, the live-apply diff) funnels through this parser, and the
+	// coercion is idempotent. slcan / elm327 / fast_log are deliberate choices and are untouched.
+	if(strcmp(dst->protocol, "auto_pid") == 0)
+	{
+		strlcpy(dst->protocol, "poll_log", sizeof(dst->protocol));
+		ESP_LOGW(TAG, "protocol auto_pid is retired on this fork; running poll_log");
+	}
 	ESP_LOGI(TAG, "dst->protocol: %s", dst->protocol);
 
 	key = cJSON_GetObjectItem(root,"ble_pass");
@@ -2554,7 +2567,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	key = cJSON_GetObjectItem(root,"engine_volt");
 	if(key == 0 || key->valuestring == NULL)
 	{
-		strlcpy(dst->engine_volt, "13.2", sizeof(dst->engine_volt));
+		strlcpy(dst->engine_volt, "13.0", sizeof(dst->engine_volt));
 	}
 	else
 	{
@@ -2563,7 +2576,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 		float ev = strtof(dst->engine_volt, &ev_end);
 		if(*ev_end != '\0' || ev_end == dst->engine_volt || ev < 13.0f || ev > 15.0f)
 		{
-			strlcpy(dst->engine_volt, "13.2", sizeof(dst->engine_volt));
+			strlcpy(dst->engine_volt, "13.0", sizeof(dst->engine_volt));
 		}
 	}
 	ESP_LOGI(TAG, "dst->engine_volt: %s", dst->engine_volt);
@@ -2827,7 +2840,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	key = cJSON_GetObjectItem(root,"home_protocol");
 	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->home_protocol) - 1)
 	{
-		strlcpy(dst->home_protocol, "auto_pid", sizeof(dst->home_protocol));
+		strlcpy(dst->home_protocol, "elm327", sizeof(dst->home_protocol));
 	}
 	else
 	{
@@ -2893,7 +2906,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	key = cJSON_GetObjectItem(root,"drive_protocol");
 	if(key == 0 || key->valuestring == NULL || strlen(key->valuestring) == 0 || strlen(key->valuestring) > sizeof(dst->drive_protocol) - 1)
 	{
-		strlcpy(dst->drive_protocol, "auto_pid", sizeof(dst->drive_protocol));
+		strlcpy(dst->drive_protocol, "elm327", sizeof(dst->drive_protocol));
 	}
 	else
 	{
@@ -2994,7 +3007,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	key = cJSON_GetObjectItem(root,"csv_grid_hz");
 	if(key == 0 || key->valuestring == NULL)
 	{
-		strlcpy(dst->csv_grid_hz, "10", sizeof(dst->csv_grid_hz));
+		strlcpy(dst->csv_grid_hz, "auto", sizeof(dst->csv_grid_hz));
 	}
 	else
 	{
@@ -3006,7 +3019,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 			long gh = strtol(dst->csv_grid_hz, &gh_end, 10);
 			if(*gh_end != '\0' || gh_end == dst->csv_grid_hz || gh < 1 || gh > (long)WICAN_LOG_MAX_HZ)
 			{
-				strlcpy(dst->csv_grid_hz, "10", sizeof(dst->csv_grid_hz));
+				strlcpy(dst->csv_grid_hz, "auto", sizeof(dst->csv_grid_hz));
 			}
 		}
 	}

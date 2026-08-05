@@ -982,7 +982,7 @@ void app_main(void)
 	if(config_server_get_engine_volt(&vehicle_config.engine_on_volt) == -1)
 	{
 		ESP_LOGE(TAG, "Error getting engine voltage");
-		vehicle_config.engine_on_volt = 13.2;  // Default value
+		vehicle_config.engine_on_volt = 13.0;  // Default value
 	}
 	vehicle_init(&vehicle_config);
 	wifi_network_init(ap_ssid);
