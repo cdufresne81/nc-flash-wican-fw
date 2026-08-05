@@ -169,7 +169,7 @@ static inline uint16_t polllog_rmba_size(const uint8_t *req)
 #define POLLLOG_GATE_OFF_MS      CSV_LOGGER_IGN_OFF_DEBOUNCE_MS
 #define POLLLOG_GATE_HYST_V      VEHICLE_IGN_HYSTERESIS_V
 #define POLLLOG_GATE_RPM_ON      400.0f   /* under any idle, over cranking noise */
-#define POLLLOG_GATE_VOLT_DEF    13.0f    /* fallback when engine_volt is unreadable (same default as main.c) */
+#define POLLLOG_GATE_VOLT_DEF    VEHICLE_ENGINE_ON_VOLT_DEFAULT  /* fallback when engine_volt is unreadable (vehicle.h) */
 #define POLLLOG_RPM_STALE_MS     (2u * POLLLOG_WATCH_SWEEP_MS)  /* older than this and RPM stops counting */
 
 /* The engine-off detector is wall-clock based, so it works unchanged at watch cadence: after

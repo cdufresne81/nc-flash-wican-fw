@@ -39,7 +39,7 @@ static EventGroupHandle_t vehicle_event_group;
 /* VEHICLE_IGN_HYSTERESIS_V moved to vehicle.h: poll_log's recording gate applies the same band
  * and the two must not drift apart. */
 
-static float engine_on_volt = 13.0f;    // set in vehicle_init() from config (config_server_get_engine_volt)
+static float engine_on_volt = VEHICLE_ENGINE_ON_VOLT_DEFAULT;   // set in vehicle_init() from config (config_server_get_engine_volt)
 // Held ignition state for hysteresis. Mutated only by the single caller (csv_logger writer
 // task) -> no lock needed. Boots OFF so logging starts only once charging is actually seen.
 static vehicle_ignition_state_t ign_state = VEHICLE_STATE_IGNITION_OFF;

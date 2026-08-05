@@ -37,6 +37,17 @@ extern "C" {
  * stopped would close one gate while the other stays open. */
 #define VEHICLE_IGN_HYSTERESIS_V 0.3f
 
+/* Engine-on voltage default, used when config_server_get_engine_volt() cannot supply one.
+ * Shared for the same reason as the hysteresis band above: vehicle.c's ignition state machine,
+ * poll_log's recording gate and main.c's vehicle_config all fall back to it independently, and a
+ * device that disagrees with itself about the engine-on threshold would run one gate against
+ * another. The string form is what config_server.c's parser stores, so the two must stay equal --
+ * keep them on adjacent lines so a retune cannot move one without seeing the other.
+ * NOTE: 13.0 is also the low end of the accepted range; the range check and the web slider's
+ * min= both encode it, so lowering this default means moving those too. */
+#define VEHICLE_ENGINE_ON_VOLT_DEFAULT      13.0f
+#define VEHICLE_ENGINE_ON_VOLT_DEFAULT_STR  "13.0"
+
 // Vehicle event bits
 #define VEHICLE_IGNITION_ON_BIT     BIT0
 #define VEHICLE_STATIONARY_BIT      BIT1

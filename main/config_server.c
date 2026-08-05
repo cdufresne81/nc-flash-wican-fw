@@ -79,6 +79,7 @@
 #include "can.h"
 #include "ble.h"
 #include "sleep_mode.h"
+#include "vehicle.h"   // VEHICLE_ENGINE_ON_VOLT_DEFAULT_STR: engine_volt default, single-sourced
 #include "autopid.h"
 #include "wc_mdns.h"
 #include "elm327.h"
@@ -383,10 +384,10 @@ int8_t config_server_get_home_protocol(void)
 	{
 		return OBD_ELM327;
 	}
-	else if(strcmp(device_config.home_protocol, "auto_pid") == 0)
-	{
-		return AUTO_PID;
-	}
+	// No auto_pid arm: the legacy AutoPID scheduler is retired on this fork (issue #28), so a
+	// stored "auto_pid" falls through to the ELM327 default below. This is the single place that
+	// decision lives -- main.c forces protocol = AUTO_PID from this getter under SmartConnect, so
+	// resurrecting the arm here would restart the legacy poller.
 	return OBD_ELM327;
 }
 
@@ -415,10 +416,7 @@ int8_t config_server_get_drive_protocol(void)
 	{
 		return OBD_ELM327;
 	}
-	else if(strcmp(device_config.drive_protocol, "auto_pid") == 0)
-	{
-		return AUTO_PID;
-	}
+	// See config_server_get_home_protocol(): no auto_pid arm, by design.
 	return OBD_ELM327;
 }
 
@@ -476,10 +474,9 @@ int8_t config_server_protocol(void)
 	{
 		return OBD_ELM327;
 	}
-	else if(strcmp(device_config.protocol, "auto_pid") == 0)
-	{
-		return AUTO_PID;
-	}
+	// No auto_pid arm: the parser coerces a stored "auto_pid" to "poll_log" before it can reach
+	// device_config, so this string is unreachable. Kept out rather than left dead so nobody
+	// reads it as evidence that AUTO_PID is still a selectable protocol.
 	else if(strcmp(device_config.protocol, "fast_log") == 0)
 	{
 		return FAST_LOG;
@@ -2485,7 +2482,9 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	// that still store the old value are coerced here, in RAM ONLY: no write to config.json, so
 	// a booting device never risks the truncate-then-write path. Every consumer (boot, the
 	// /store_config shadow validation, the live-apply diff) funnels through this parser, and the
-	// coercion is idempotent. slcan / elm327 / fast_log are deliberate choices and are untouched.
+	// coercion is idempotent. Unlike home/drive_protocol -- where the getter alone is enough --
+	// this one rewrites the string, because /check_status reports it verbatim and the web UI
+	// keys its "this protocol cannot record PIDs" banner off that value.
 	if(strcmp(dst->protocol, "auto_pid") == 0)
 	{
 		strlcpy(dst->protocol, "poll_log", sizeof(dst->protocol));
@@ -2567,7 +2566,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	key = cJSON_GetObjectItem(root,"engine_volt");
 	if(key == 0 || key->valuestring == NULL)
 	{
-		strlcpy(dst->engine_volt, "13.0", sizeof(dst->engine_volt));
+		strlcpy(dst->engine_volt, VEHICLE_ENGINE_ON_VOLT_DEFAULT_STR, sizeof(dst->engine_volt));
 	}
 	else
 	{
@@ -2576,7 +2575,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 		float ev = strtof(dst->engine_volt, &ev_end);
 		if(*ev_end != '\0' || ev_end == dst->engine_volt || ev < 13.0f || ev > 15.0f)
 		{
-			strlcpy(dst->engine_volt, "13.0", sizeof(dst->engine_volt));
+			strlcpy(dst->engine_volt, VEHICLE_ENGINE_ON_VOLT_DEFAULT_STR, sizeof(dst->engine_volt));
 		}
 	}
 	ESP_LOGI(TAG, "dst->engine_volt: %s", dst->engine_volt);
@@ -2846,18 +2845,10 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	{
 		strlcpy(dst->home_protocol, key->valuestring, sizeof(dst->home_protocol));
 	}
-	// Same retirement as the main `protocol` key above. This one matters even though
-	// SmartConnect is not selectable in this fork's UI: main.c forces protocol = AUTO_PID
-	// when wifi_mode is SmartConnect and home/drive_protocol is auto_pid, which starts the
-	// legacy scheduler AFTER the main protocol has already been coerced -- and /check_status
-	// would still report the coerced "poll_log", hiding the exact bug this coercion exists to
-	// fix. Coercing to elm327 (not poll_log) because these keys only feed SmartConnect's
-	// AUTO_PID-or-ELM327 decision; poll_log is not a value its getter understands.
-	if(strcmp(dst->home_protocol, "auto_pid") == 0)
-	{
-		strlcpy(dst->home_protocol, "elm327", sizeof(dst->home_protocol));
-		ESP_LOGW(TAG, "home_protocol auto_pid is retired on this fork; using elm327");
-	}
+	// A stored "auto_pid" needs no coercion here: config_server_get_home_protocol() has no
+	// auto_pid arm, so it already resolves to ELM327 and the SmartConnect override in main.c
+	// can never see AUTO_PID. The fallback above is "elm327" only so an absent key and a
+	// legacy stored value end up saying the same thing.
 	ESP_LOGI(TAG, "dst->home_protocol: %s", dst->home_protocol);
 
 	key = cJSON_GetObjectItem(root,"drive_ssid");
@@ -2924,12 +2915,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	{
 		strlcpy(dst->drive_protocol, key->valuestring, sizeof(dst->drive_protocol));
 	}
-	// See the home_protocol note above: this is the other half of the SmartConnect back door.
-	if(strcmp(dst->drive_protocol, "auto_pid") == 0)
-	{
-		strlcpy(dst->drive_protocol, "elm327", sizeof(dst->drive_protocol));
-		ESP_LOGW(TAG, "drive_protocol auto_pid is retired on this fork; using elm327");
-	}
+	// See the home_protocol note above: the getter, not the parser, retires auto_pid here.
 	ESP_LOGI(TAG, "dst->drive_protocol: %s", dst->drive_protocol);
 
 	//**** End SmartConnect fields ****
