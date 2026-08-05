@@ -2846,6 +2846,18 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	{
 		strlcpy(dst->home_protocol, key->valuestring, sizeof(dst->home_protocol));
 	}
+	// Same retirement as the main `protocol` key above. This one matters even though
+	// SmartConnect is not selectable in this fork's UI: main.c forces protocol = AUTO_PID
+	// when wifi_mode is SmartConnect and home/drive_protocol is auto_pid, which starts the
+	// legacy scheduler AFTER the main protocol has already been coerced -- and /check_status
+	// would still report the coerced "poll_log", hiding the exact bug this coercion exists to
+	// fix. Coercing to elm327 (not poll_log) because these keys only feed SmartConnect's
+	// AUTO_PID-or-ELM327 decision; poll_log is not a value its getter understands.
+	if(strcmp(dst->home_protocol, "auto_pid") == 0)
+	{
+		strlcpy(dst->home_protocol, "elm327", sizeof(dst->home_protocol));
+		ESP_LOGW(TAG, "home_protocol auto_pid is retired on this fork; using elm327");
+	}
 	ESP_LOGI(TAG, "dst->home_protocol: %s", dst->home_protocol);
 
 	key = cJSON_GetObjectItem(root,"drive_ssid");
@@ -2911,6 +2923,12 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	else
 	{
 		strlcpy(dst->drive_protocol, key->valuestring, sizeof(dst->drive_protocol));
+	}
+	// See the home_protocol note above: this is the other half of the SmartConnect back door.
+	if(strcmp(dst->drive_protocol, "auto_pid") == 0)
+	{
+		strlcpy(dst->drive_protocol, "elm327", sizeof(dst->drive_protocol));
+		ESP_LOGW(TAG, "drive_protocol auto_pid is retired on this fork; using elm327");
 	}
 	ESP_LOGI(TAG, "dst->drive_protocol: %s", dst->drive_protocol);
 
