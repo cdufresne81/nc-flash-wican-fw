@@ -32,9 +32,9 @@ static EventGroupHandle_t vehicle_event_group;
 // Engine-running gate (Task #6). DEDICATED logging threshold, fully decoupled from the
 // deep-sleep voltage (sleep_volt): the alternator-charging level (~13.2 V) is far above the
 // sleep/battery-protection level (~12.4 V) and a resting battery (~12.6-12.8 V), so a parked
-// car no longer reads "ignition on". Hysteresis (a fixed band below the ON edge) plus the
-// 0.1 V ADC quantization avoids flapping at idle; csv_logger adds a 3 s ON->OFF debounce on
-// top for cranking dips. This gate is consumed ONLY by csv_logger (the writer task), so it
+// car no longer reads "ignition on". Hysteresis (a fixed band below the ON edge) is what
+// avoids flapping at idle; csv_logger adds a 3 s ON->OFF debounce on top for cranking dips.
+// This gate is consumed ONLY by csv_logger (the writer task), so it
 // never touches sleep/wake or battery protection -- logging-only, cannot brick.
 /* VEHICLE_IGN_HYSTERESIS_V moved to vehicle.h: poll_log's recording gate applies the same band
  * and the two must not drift apart. */
