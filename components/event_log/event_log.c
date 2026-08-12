@@ -60,6 +60,11 @@ static const char *TAG = "event_log";
 #define EVENT_LOG_GUARD_MAGIC  0xE7106A11u
 RTC_NOINIT_ATTR static uint32_t s_evl_guard;
 
+// True for the rest of this uptime when the guard above made us skip SD persistence. Without a
+// reboot the event log would stay RAM-only for the whole uptime, silently -- which is exactly the
+// evidence trail we rely on to debug the field. See sleep_mode_recovery_needed().
+static bool s_bringup_skipped = false;
+
 typedef struct {
     uint32_t seq;                       // 1-based emit sequence (0 = never written)
     char     line[EVENT_LOG_LINE_MAX];  // preformatted, NUL-terminated, no '\n'
@@ -112,6 +117,7 @@ static const char *evl_code_str(event_log_code_t code)
         case EVL_DATALOG_PARK:  return "DATALOG_PARK";
         case EVL_DATALOG_RESUME:return "DATALOG_RESUME";
         case EVL_REAPER_RESUME: return "REAPER_RESUME";
+        case EVL_CAN_WAKE:      return "CAN_WAKE";
         case EVL_INFO:          return "INFO";
         case EVL_CODE_MAX:      break;
     }
@@ -323,6 +329,11 @@ static void evl_writer_task(void *arg)
     }
 }
 
+bool event_log_bringup_skipped(void)
+{
+    return s_bringup_skipped;
+}
+
 void event_log_init(void)
 {
     if (s_inited)
@@ -335,8 +346,18 @@ void event_log_init(void)
     // never boot-loop the device. The in-RAM ring still records everything; self-recovers next boot.
     if (s_evl_guard == EVENT_LOG_GUARD_MAGIC)
     {
+        /* DISARM HERE, exactly as poll_log.c and fast_log.c do. The "self-recovers next boot"
+         * promise above is only true because of this line: the guard's other clear point is the
+         * writer task after 15 s of stability, and on a skip boot that task never starts. Leave
+         * it armed and one crash inside the 15 s window costs SD event persistence permanently --
+         * and, because resume-in-place refuses to resume while any bring-up was skipped, makes
+         * EVERY wake take the reboot fallback forever while repairing nothing. Worse here than
+         * elsewhere: the "resume refused -- rebooting" line would live only in the RAM ring and
+         * die in the very reboot it announces, so the SD trail would show nothing at all. */
+        s_evl_guard = 0;   /* disarm so the next boot retries */
         ESP_LOGW(TAG, "prior event_log attempt did not complete - SD persistence skipped this boot");
         s_inited = true;   // ring + emit still work; just no writer/SD this boot
+        s_bringup_skipped = true;
         return;
     }
     s_evl_guard = EVENT_LOG_GUARD_MAGIC;   // arm

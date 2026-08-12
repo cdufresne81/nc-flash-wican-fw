@@ -44,6 +44,10 @@ extern "C" {
  */
 void fast_log_init(char *id, uint32_t log_period);
 
+/* True when the RTC crash-guard made fast_log_init() skip bring-up on this boot. See
+ * poll_log_bringup_skipped(). */
+bool fast_log_bringup_skipped(void);
+
 #ifdef __cplusplus
 }
 #endif

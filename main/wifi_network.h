@@ -21,11 +21,16 @@
 #ifndef __WIFI_NETWORK_H__
 #define __WIFI_NETWORK_H__
 
+#include "esp_err.h"        // For esp_err_t
 #include "config_server.h"  // For wifi_security_t type
 
 // bool wifi_network_is_connected(void);
 // void wifi_network_init(char* sta_ssid, char* sta_pass);
-void wifi_network_init(char* ap_ssid_uid);
+/* ESP_OK only when the network stack is genuinely up. The sleep resume path treats any failure
+ * as "reboot instead", so this MUST keep reporting failure rather than swallowing it: a silent
+ * half-resume leaves the device awake and logging but unreachable over WiFi, and this hardware
+ * has no serial console to recover through. */
+esp_err_t wifi_network_init(char* ap_ssid_uid);
 // SmartConnect mode checking function
 bool wifi_network_is_smartconnect_mode(void);
 // Helper function to get SmartConnect credentials

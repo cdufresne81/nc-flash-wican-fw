@@ -77,6 +77,7 @@ typedef enum {
     EVL_DATALOG_PARK,    // datalogger parked for a host session (POST /datalog?op=pause)
     EVL_DATALOG_RESUME,  // datalogger resumed after a host session (POST /datalog?op=resume)
     EVL_REAPER_RESUME,   // dead-man reaper auto-resumed datalog (host vanished) -- highest-value line
+    EVL_CAN_WAKE,        // wake-on-CAN: verdicts, RXD faults, cooldown (#4)
     EVL_INFO,            // generic informational note
     EVL_CODE_MAX
 } event_log_code_t;
@@ -92,6 +93,10 @@ void event_log_set_sd_ready_fn(event_log_sd_ready_fn_t fn);
 // if a prior boot crashed during event_log SD work, SD persistence is skipped THIS boot (the RAM
 // ring still records everything) and self-recovers next boot.
 void event_log_init(void);
+
+// True when the RTC crash-guard made event_log_init() skip SD persistence on this boot (the
+// in-RAM ring still works). See poll_log_bringup_skipped().
+bool event_log_bringup_skipped(void);
 
 // Record one event. Non-blocking, variadic detail (printf-style). Safe from any task and before init.
 // Events are fsync'd to SD by the writer task within ~1s of emission, so a reboot a couple of seconds
