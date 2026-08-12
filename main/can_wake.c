@@ -90,6 +90,9 @@ static bool     s_cooldown_logged = false;  /* per cooldown EPISODE, not per boo
  * deadline outward and lock the feature off forever. The hour always genuinely lapses. */
 static bool     s_wake_open        = false; /* a CAN-wake window is open right now */
 static bool     s_volt_ok_seen     = false; /* voltage recovered since THIS window opened */
+/* ECU answered since THIS window opened. Plain RAM on purpose: it is window-scoped by definition,
+ * so it must NOT go in can_wake_rtc_t -- which also means this addition needs no magic bump. */
+static bool     s_ecu_ok_seen      = false;
 static uint32_t s_fruitless        = 0;     /* consecutive wakes that never saw the voltage rise */
 static int64_t  s_cooldown_until_us = 0;    /* esp_timer deadline; 0 = no cooldown armed */
 
@@ -181,6 +184,7 @@ void can_wake_note_wake(void)
      * pushed outward by the very traffic it is throttling. */
     s_wake_open    = true;
     s_volt_ok_seen = false;
+    s_ecu_ok_seen  = false;
 }
 
 void can_wake_note_sleep_entry(void)
@@ -188,12 +192,24 @@ void can_wake_note_sleep_entry(void)
     if (!s_wake_open) return;   /* this sleep did not follow a CAN wake -- nothing to score */
     s_wake_open = false;
 
-    if (s_volt_ok_seen)
+    /* EITHER proof counts (issue #4). Voltage alone was wrong and cost us a real car test: the
+     * dongle woke, the ECU answered for a full minute and wrote 500+ KB of genuine engine data,
+     * and because the supply never crossed sleep_volt+0.1 all three of those wakes scored
+     * fruitless and switched wake-on-CAN off for an hour. An answering ECU proves the wake led
+     * somewhere just as well as a charging alternator does.
+     *
+     * The voltage half STAYS as the mode-independent fallback. poll_log_ecu_answering() is
+     * permanently false in ELM327/FAST_LOG mode, so scoring on the ECU alone would call every
+     * wake in those modes fruitless and throttle the feature on a perfectly working car after
+     * three ordinary mornings. */
+    if (s_volt_ok_seen || s_ecu_ok_seen)
     {
         if (s_fruitless != 0)
         {
-            ESP_LOGI(TAG, "wake led to a voltage recovery -- fruitless streak cleared (was %u)",
-                     (unsigned)s_fruitless);
+            /* "led somewhere", not "led to a running engine": the ECU answers at key-on with the
+             * engine still off, and that counts. Only the voltage proof implies a real start. */
+            ESP_LOGI(TAG, "wake led somewhere (%s) -- fruitless streak cleared (was %u)",
+                     s_ecu_ok_seen ? "ECU answering" : "voltage recovered", (unsigned)s_fruitless);
         }
         s_fruitless                = 0;
         s_cooldown_until_us        = 0;
@@ -202,7 +218,7 @@ void can_wake_note_sleep_entry(void)
     else
     {
         s_fruitless++;
-        ESP_LOGW(TAG, "wake was fruitless (voltage never recovered) -- streak now %u/%u",
+        ESP_LOGW(TAG, "wake was fruitless (no ECU reply, voltage never recovered) -- streak now %u/%u",
                  (unsigned)s_fruitless, (unsigned)CAN_WAKE_FRUITLESS_LIMIT);
         if (s_fruitless >= CAN_WAKE_FRUITLESS_LIMIT)
         {
@@ -252,6 +268,33 @@ void can_wake_note_voltage_ok(void)
 
     /* Window scoring is unchanged: this only credits the wake that is actually open. */
     if (s_wake_open) s_volt_ok_seen = true;
+}
+
+/* The ECU is answering our polls, i.e. the ignition is on. Deliberately bit-for-bit parallel to
+ * can_wake_note_voltage_ok() above -- including the un-windowed clear and both RTC mirror writes --
+ * so the two clearing paths can never drift apart and leave the cooldown half-reset. Read the long
+ * comment above for why CLEARING is not gated on an open window while SCORING is.
+ *
+ * Called from the same ~500 ms sampling path as the voltage version, so it costs nothing in the
+ * common case where there is no streak to clear. */
+void can_wake_note_ecu_ok(void)
+{
+    if (s_fruitless != 0)
+    {
+        ESP_LOGI(TAG, "ECU answering -- fruitless streak cleared (was %u)", (unsigned)s_fruitless);
+        event_log_emit(EVL_CAN_WAKE, "ECU answering -- wake-on-CAN throttle cleared (streak was %u)",
+                       (unsigned)s_fruitless);
+        s_fruitless                = 0;
+        s_rtc.fruitless            = 0;
+        s_cooldown_until_us        = 0;
+        s_rtc.cooldown_until_epoch = 0;
+    }
+
+    /* Known leak, bounded and deliberately accepted: the ONLY way to enter sleep with the ECU
+     * signal still true is the forced boot-loop teardown, and on the next wake the poller needs a
+     * few seconds to notice the silence and clear s_ecu_answering. That window could wrongly credit
+     * one wake. It errs toward keeping the feature armed, which is the safe direction. */
+    if (s_wake_open) s_ecu_ok_seen = true;
 }
 
 /* True while we are throttling because recent CAN wakes never led to an engine start. */

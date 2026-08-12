@@ -95,4 +95,10 @@ void can_wake_note_sleep_entry(void);
  * window as worthwhile; the streak is cleared when that window closes. */
 void can_wake_note_voltage_ok(void);
 
+/* Called while the ECU is answering our polls (the ignition is on). Marks the open window as
+ * worthwhile exactly like can_wake_note_voltage_ok() does, and clears any streak/cooldown.
+ * EITHER proof is enough -- see the note at the scoring site. Added because voltage alone
+ * scored three data-producing wakes as fruitless during a real car test (issue #4). */
+void can_wake_note_ecu_ok(void);
+
 #endif /* __CAN_WAKE_H__ */

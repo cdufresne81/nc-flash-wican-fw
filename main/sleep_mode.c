@@ -667,6 +667,11 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 static uint8_t s_elm327_sleep_nudges  = 0;
 static uint8_t s_elm327_settle_passes = 0;
 
+/* Shortest gap between two "sleep countdown started" event lines. Not a per-episode latch: every
+ * entry into STATE_LOW_VOLTAGE really is a fresh countdown, so each line is true. This only stops
+ * a battery parked exactly on sleep_volt from writing one every few seconds all night. */
+#define SLEEP_COUNTDOWN_LOG_MIN_GAP_US  (60LL * 1000000LL)
+
 /* How long to let the event-log writer reach the SD card before a restart wipes the RAM ring.
  * restart_tracker_restart() marks and then calls esp_restart() immediately, so any line emitted
  * just beforehand is lost without this. */
@@ -1041,6 +1046,14 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
     s_elm327_settle_passes = 0;
 
     elm327_sleep();
+
+    /* The one permanent marker that a sleep entry happened. Nothing else in the teardown writes to
+     * the event log, so without this a sleep is invisible in the record and can only be inferred
+     * from the device going quiet on the network -- which, on a box with no serial console, means
+     * every future field diagnosis starts by guessing. Emitted after the chip sleep so the line
+     * cannot itself delay the teardown. */
+    event_log_emit(EVL_INFO, "entering sleep (%.2fV)", (double)battery_voltage);
+
     can_disable();
     /* #4: TWAI is now uninstalled, so GPIO1 is a free input again. Put it in the exact state
      * the wake sampler needs (both pulls OFF) while we still know nothing else owns it. */
@@ -1275,6 +1288,24 @@ static system_state_t sleep_mode_wake_now(sleep_state_info_t *state_info, float 
     return STATE_SLEEPING;   /* not reached -- esp_restart() does not return */
 }
 
+/* One event line per veto EPISODE, never per pass (issue #4).
+ *
+ * This is called from the 500 ms sampling loop, so an unlatched line would write two entries a
+ * second for the whole of every drive and bury everything else in the log -- the same per-CYCLE
+ * mistake the wake-on-CAN work already had to fix once. The caller clears the latch as soon as
+ * the ECU stops answering, so each continuous "held awake" period costs exactly one line.
+ * Same shape as postpone_logged in the teardown. */
+static void sleep_log_ecu_veto(float volts, bool *logged)
+{
+    if (*logged) return;
+    *logged = true;
+
+    ESP_LOGI(TAG, "ECU answering at %.2fV -- holding off the sleep countdown (ignition is on)",
+             (double)volts);
+    event_log_emit(EVL_INFO, "staying awake -- ECU answering at %.2fV (ignition on)",
+                   (double)volts);
+}
+
 void light_sleep_task(void *pvParameters)
 {
     static float battery_voltage = 0.0;
@@ -1290,6 +1321,17 @@ void light_sleep_task(void *pvParameters)
 	static int8_t periodic_wakeup;
 	static uint32_t wakeup_interval;
 	static wc_timer_t periodic_wakeup_timer;
+	/* #4: latch for the "staying awake -- ECU answering" event line. Cleared every pass the ECU
+	 * is NOT answering, so it is scoped to a veto episode and not to a boot -- this device
+	 * resumes in place instead of rebooting, and boot-scoped state has already broken this file
+	 * five separate times. */
+	static bool ecu_veto_logged = false;
+	/* Rate limit for the "sleep countdown started" line. Entering LOW_VOLTAGE is a genuinely new
+	 * countdown every time, so a per-episode latch would be wrong -- but a battery sitting exactly
+	 * on the threshold (a tender, or a cycling key-off load) can cross it every ~2.5 s, which would
+	 * write hundreds of truthful-but-useless lines an hour to the SD card. One per minute is plenty
+	 * to reconstruct what happened. Seeded negative so the first countdown always logs. */
+	static int64_t countdown_logged_us = -SLEEP_COUNTDOWN_LOG_MIN_GAP_US;
 
     // Initialize configuration
     sleep_en = config_server_get_sleep_config();
@@ -1450,6 +1492,28 @@ void light_sleep_task(void *pvParameters)
             volt_ok_shadow = -1;
         }
 
+        /* ---- #4 sleep veto: "the ECU is talking, so the ignition is on" -----------------
+         * Sampled ONCE per pass so the credit below and the state machine cannot disagree
+         * within a single iteration. Traffic-derived and voltage-free by design; it fails
+         * closed when nothing maintains the signal -- see poll_log_ecu_answering(). */
+        const bool ecu_answering = poll_log_ecu_answering();
+
+        if (!ecu_answering)
+        {
+            ecu_veto_logged = false;   /* re-arm the one-line-per-episode latch */
+        }
+
+        /* The same credit the voltage path gives just above, on the other proof. Deliberately
+         * OUTSIDE the ADC-success block: an answering ECU shows the wake led somewhere whether or
+         * not this pass managed to read the battery, and tying it to a good ADC read would let a
+         * failing ADC block the one proof that does not need the ADC. The asymmetry with the
+         * voltage credit (which sits inside the fresh-sample branch) is deliberate, not an
+         * oversight -- do not "tidy" it by moving this inside. */
+        if (ecu_answering)
+        {
+            can_wake_note_ecu_ok();
+        }
+
         if (ret == ESP_OK && sleep_en == 1)
 		{
             // State machine logic
@@ -1458,14 +1522,58 @@ void light_sleep_task(void *pvParameters)
                 case STATE_NORMAL:
                     if (battery_voltage < sleep_voltage)
 					{
-                        ESP_LOGW(TAG, "Battery voltage low (%.2fV), starting low voltage timer", battery_voltage);
-                        current_state = STATE_LOW_VOLTAGE;
-                        volt_recover_count = 0;
-                        wc_timer_set(&sleep_timer, sleep_time);
+                        /* #4: an answering ECU means the ignition is on, so the countdown never
+                         * starts and the reported state stays honestly NORMAL. Voltage alone used
+                         * to decide this, and it cost a real drive: with sleep_volt above the
+                         * alternator's output the dongle read "engine off" the whole way, slept a
+                         * minute in, and the fruitless throttle then disabled wake-on-CAN for an
+                         * hour. No voltage floor and no time cap here on purpose -- with the
+                         * ignition on the car itself draws amps, so bounding our tens of mA buys
+                         * nothing. */
+                        if (ecu_answering)
+                        {
+                            sleep_log_ecu_veto(battery_voltage, &ecu_veto_logged);
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG, "Battery voltage low (%.2fV), starting low voltage timer", battery_voltage);
+                            /* Say WHEN, not just THAT. The quiesce line upstream is emitted by
+                             * poll_log, which cannot know whether a countdown followed -- with the
+                             * alternator up the ECU can fall silent and nothing starts at all. This
+                             * is the only place that knows both the voltage and the configured
+                             * sleep_time, so this is where the answer to "when does it sleep?"
+                             * belongs. Rate limited: see countdown_logged_us. */
+                            {
+                                const int64_t now_us = esp_timer_get_time();
+                                if ((now_us - countdown_logged_us) >= SLEEP_COUNTDOWN_LOG_MIN_GAP_US)
+                                {
+                                    countdown_logged_us = now_us;
+                                    event_log_emit(EVL_INFO,
+                                                   "sleep countdown started -- %lu min at %.2fV (below %.2fV)",
+                                                   (unsigned long)(sleep_time / 60000UL),
+                                                   (double)battery_voltage, (double)sleep_voltage);
+                                }
+                            }
+                            current_state = STATE_LOW_VOLTAGE;
+                            volt_recover_count = 0;
+                            wc_timer_set(&sleep_timer, sleep_time);
+                        }
                     }
                     break;
 
                 case STATE_LOW_VOLTAGE:
+                    /* #4: the ECU started answering mid-countdown -- the key just went on.
+                     * Abandon the countdown and go back to NORMAL. Re-entering later re-arms the
+                     * FULL sleep_time, which is deliberate: "sleep N minutes after the car goes
+                     * quiet", counted from ECU silence rather than from the voltage dipping. */
+                    if (ecu_answering)
+                    {
+                        sleep_log_ecu_veto(battery_voltage, &ecu_veto_logged);
+                        current_state      = STATE_NORMAL;
+                        volt_recover_count = 0;
+                        break;
+                    }
+
                     /* Leaving LOW_VOLTAGE ABANDONS the sleep countdown, and re-entering re-arms
                      * the FULL sleep_time. On a single sample that is a trap now that readings are
                      * unrounded and 6x more frequent: one noise spike above wakeup_voltage throws

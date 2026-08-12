@@ -71,6 +71,21 @@ bool     poll_log_gate_open(void);
 uint32_t poll_log_bus_idle_ms(void);
 
 /*
+ * SLEEP VETO input (issue #4): true only while the ECU is genuinely answering OUR requests and
+ * something is actively keeping that fact fresh. The sleep state machine refuses to start (or
+ * continue) its countdown while this is true -- the ECU can only answer with the ignition ON,
+ * so this is "the car is in use", measured on traffic and never on voltage or RPM.
+ *
+ * READ THE POLARITY NOTE BEFORE USING ANYTHING ELSE HERE. Every other predicate in this header
+ * fails OPEN ("true when POLL_LOG is inactive") so that other modes never suppress logging. A
+ * veto needs the OPPOSITE default: unknown must mean "sleep is allowed", or the device simply
+ * never sleeps again and flattens the car battery. That is why this is a separate function and
+ * why poll_log_engine_running() MUST NOT be used for sleep decisions -- it returns true when
+ * POLL_LOG is not running at all.
+ */
+bool     poll_log_ecu_answering(void);
+
+/*
  * Request a live PID-table hot-swap (issue #39). Called on the httpd task after
  * auto_pid.json is rewritten; sets a flag only -- the re-parse + atomic swap runs on the
  * poll task at its safe point (deferred while a CSV trip is open). Returns true if queued,

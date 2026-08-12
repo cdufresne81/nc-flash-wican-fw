@@ -1593,6 +1593,36 @@ bool poll_log_quiesced(void)
     return s_active ? s_quiesced : false;
 }
 
+/* Sleep veto (issue #4). TRUE only while ALL THREE hold:
+ *   s_active           -- the poll task is running THIS uptime, so somebody maintains the rest,
+ *   s_ecu_answering        -- the ECU answered one of OUR requests in the current session,
+ *   !can_should_park() -- the poller is actually free to keep s_ecu_answering fresh.
+ *
+ * FAILS CLOSED (returns false) in every other situation, which is the OPPOSITE default from the
+ * logging predicates above and is the whole reason this is not a wrapper around one of them:
+ *   - a veto that reads true when nothing maintains it means the device NEVER SLEEPS. In
+ *     ELM327/FAST_LOG mode, before the task starts, with a 0-PID table, or after the crash guard
+ *     skipped bring-up, poll_log_engine_running() returns TRUE (:1583). Using it here would
+ *     silently flatten the car battery, and a bench running POLL_LOG would never reveal it.
+ *   - s_ecu_answering rather than s_engine_running: s_engine_running also goes true for up to ~2 s on
+ *     ANY stray frame during a probe (:1417), so a chattering module that never answers a poll
+ *     could hold the veto up indefinitely. s_ecu_answering cannot rise without a matched reply to a
+ *     frame we transmitted (:715 -> :759).
+ *   - !can_should_park(): while the poller is parked (flash, host claim, datalog pause, sleep
+ *     fence) s_ecu_answering stops being updated and freezes at its last value. A frozen TRUE with no
+ *     bound is a second forever-awake path -- notably if a flash lease is ever left raised, the
+ *     case sleep_mode.c:973-976 calls out as having no reaper. Dropping the veto when parked hands
+ *     the decision back to the teardown's own bounded interlock instead.
+ *
+ * Deliberately NOT here: any voltage term, any RPM term, any time cap. The owner's rule is that
+ * an answering ECU means the ignition is on, and with the ignition on the car itself draws amps,
+ * so bounding the dongle's tens of mA would buy nothing. s_gate_open (:320) is a voltage+RPM+CSV
+ * composite and is wrong for this on all three counts. */
+bool poll_log_ecu_answering(void)
+{
+    return s_active && s_ecu_answering && !can_should_park();
+}
+
 /* The RECORDING gate (see the WATCH vs FAST block near the top). Returns true when POLL_LOG is not
  * the active mode, so other modes and any stale read can never suppress logging. */
 bool poll_log_gate_open(void)
