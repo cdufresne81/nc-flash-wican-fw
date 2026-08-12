@@ -93,8 +93,11 @@ bool dev_status_are_bits_set(EventBits_t bits);
 bool dev_status_is_any_bit_set(EventBits_t bits);
 
 // Macros for common operations
-#define dev_status_set_awake()          dev_status_set_bits(DEV_AWAKE_BIT); dev_status_clear_bits(DEV_SLEEP_BIT)
-#define dev_status_set_sleep()          dev_status_set_bits(DEV_SLEEP_BIT); dev_status_clear_bits(DEV_AWAKE_BIT)
+/* do-while(0), NOT two bare statements: without it `if (x) dev_status_set_awake();` compiles but
+ * runs only the first half, unconditionally clearing the other bit. Every current call site
+ * happens to be safe; the first conditional one would not be, and it would fail silently. */
+#define dev_status_set_awake()          do { dev_status_set_bits(DEV_AWAKE_BIT); dev_status_clear_bits(DEV_SLEEP_BIT); } while(0)
+#define dev_status_set_sleep()          do { dev_status_set_bits(DEV_SLEEP_BIT); dev_status_clear_bits(DEV_AWAKE_BIT); } while(0)
 #define dev_status_set_sta_connected()  dev_status_set_bits(DEV_STA_CONNECTED_BIT)
 #define dev_status_set_sta_enabled()    dev_status_set_bits(DEV_STA_ENABLED_BIT)
 #define dev_status_set_ap_enabled()     dev_status_set_bits(DEV_AP_ENABLED_BIT)
