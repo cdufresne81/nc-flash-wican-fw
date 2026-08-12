@@ -3361,6 +3361,7 @@ async function postConfig() {
     obj["ble_status"] = document.getElementById("ble_status").value;
     obj["ble_power"] = document.getElementById("ble_power").value; // BLE TX power (dBm)
     obj["sleep_status"] = document.getElementById("sleep_status").value;
+    obj["can_wake"] = document.getElementById("can_wake").value;
     obj["sleep_disable_agree"] = document.getElementById("sleep_disable_agree").value;
     obj["periodic_wakeup"] = document.getElementById("periodic_wakeup").value;
     obj["sleep_volt"] = document.getElementById("sleep_volt").value;
@@ -3884,6 +3885,12 @@ xhttp.onload = async function() {
         } else if(obj.sleep_status == "disable") {
             document.getElementById("sleep_status").selectedIndex = "1";
         }
+
+        // Wake on CAN (issue #4). Anything that is not an explicit "disable" shows as Enable,
+        // matching config_server_get_can_wake() exactly: a device provisioned before this key
+        // existed has no can_wake field at all, and it must display as ON rather than silently
+        // reading back Disable and then writing that back on the next save.
+        document.getElementById("can_wake").selectedIndex = (obj.can_wake == "disable") ? 1 : 0;
 
         if(obj.sleep_disable_agree == "yes") {
             document.getElementById("sleep_disable_agree").selectedIndex = "1";

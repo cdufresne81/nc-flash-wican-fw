@@ -289,6 +289,8 @@ const char *restart_tracker_planned_reason_to_str(restart_tracker_planned_reason
             return "power_wake";
         case RESTART_TRACKER_PLANNED_REASON_INTERNAL_RECOVERY:
             return "internal_recovery";
+        case RESTART_TRACKER_PLANNED_REASON_CAN_WAKE:
+            return "can_wake";
         default:
             return "invalid";
     }

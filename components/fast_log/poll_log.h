@@ -30,6 +30,12 @@
  */
 void poll_log_init(char *id, uint32_t log_period);
 
+/* True when the RTC crash-guard made poll_log_init() skip bring-up on this boot. Stays true for
+ * the whole uptime. The sleep path ORs this with the other bring-up guards and takes the reboot
+ * fallback instead of resuming in place, so the "retry on the next boot" that the guard promises
+ * still happens on a device that no longer reboots to wake. */
+bool poll_log_bringup_skipped(void);
+
 /*
  * Live poll metrics for GET /poll_status, as a malloc'd JSON string the caller must free().
  * Safe to call in any protocol mode -- returns {"active":false,...} when POLL_LOG isn't running.

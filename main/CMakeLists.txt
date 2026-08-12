@@ -16,6 +16,7 @@ set(srcs
     "wifi_network.c"
     "wc_uart.c"
     "sleep_mode.c"
+    "can_wake.c"
     "expression_parser.c"
     "led.c"
     "led_indicator.c"

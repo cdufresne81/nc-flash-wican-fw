@@ -228,6 +228,12 @@ _Static_assert(POLLLOG_WATCH_SWEEP_MS <= 2000,
 #define POLLLOG_GUARD_ARMED      0x9011106Du
 static RTC_NOINIT_ATTR uint32_t s_polllog_guard;
 
+/* True for the rest of this uptime when the guard above made us skip bring-up. The skip is
+ * one-shot ONLY if another boot follows it; since a wake-on-CAN now resumes in place instead of
+ * rebooting, the sleep path reads this and takes the reboot fallback so the retry still happens.
+ * See sleep_mode_recovery_needed(). */
+static bool s_bringup_skipped = false;
+
 static autopid_config_t *s_cfg = NULL;
 
 /* Static task storage -> .bss -> INTERNAL RAM (no PSRAM on the hot poll path). */
@@ -304,7 +310,12 @@ static volatile float    s_win_sweep_min_ms = 0, s_win_sweep_max_ms = 0;
 static volatile bool    s_engine_running = true;  /* default true: non-poll modes never suppress logging */
 static volatile bool    s_quiesced       = false; /* true == bus currently flipped to LISTEN_ONLY */
 static volatile int64_t s_last_ok_us     = 0;     /* esp_timer stamp of last matched OK reply (real ECU answer) */
-static volatile bool    s_confirmed      = false; /* got an OK in the CURRENT NORMAL session -> engine truly running */
+/* The ECU sent back a matching reply to a request WE transmitted, in the current NORMAL session.
+ * Renamed from s_confirmed, which never said what was confirmed. Read it as "somebody is really
+ * answering us", i.e. THE IGNITION IS ON -- not "the engine is turning": a car at key-on with the
+ * engine off answers every request. Set only on a matched reply (polllog_match), cleared by the
+ * 5 s quiesce and by every probe resume. This is the signal the #4 sleep veto is built on. */
+static volatile bool    s_ecu_answering  = false;
 static volatile int64_t s_norm_start_us  = 0;     /* when the current NORMAL session began (boot/resume) = probe-window ref */
 static volatile int64_t s_last_rx_us     = 0;     /* esp_timer stamp of last received frame (any id) */
 
@@ -451,7 +462,7 @@ static inline void polllog_stamp_rpm(const char *name, float value)
  *
  * "Running" = voltage at or above engine_volt AND (RPM over the threshold, when an RPM channel
  * exists). Opening measures against engine_volt; closing measures against engine_volt minus the
- * hysteresis band and must hold for POLLLOG_GATE_OFF_MS. Opening additionally needs s_confirmed,
+ * hysteresis band and must hold for POLLLOG_GATE_OFF_MS. Opening additionally needs s_ecu_answering,
  * so we never transmit flat out at a bus that has not answered.
  *
  * BOTH signals must agree to stay open, and EITHER one dropping closes the gate. That mirrors the
@@ -517,7 +528,7 @@ static void polllog_eval_gate(int64_t now_us)
 
     if (!s_gate_open)
     {
-        if (s_confirmed && running)
+        if (s_ecu_answering && running)
         {
             s_gate_open  = true;
             low_since_us = 0;
@@ -745,12 +756,12 @@ static bool polllog_poll_one(pid_data_t *pid)
             s_st.ok++;
             s_cum_ok++;
             s_last_ok_us = esp_timer_get_time();   /* engine-running heartbeat for the quiesce gate */
-            if (!s_confirmed)
+            if (!s_ecu_answering)
             {
                 /* First real ECU answer of this NORMAL session => engine confirmed running. A bus frame
                  * alone only PROBES (flips us to NORMAL); the OK is what confirms, so a stray wind-down
                  * frame can never log a false start. Exactly one ENGINE_START per confirmed run. */
-                s_confirmed = true;
+                s_ecu_answering = true;
                 event_log_emit(EVL_ENGINE_START, "engine running (ECU answering)");
             }
             got = true;
@@ -1139,14 +1150,14 @@ static void polllog_rx_task(void *arg)
             /* Decide FAST vs WATCH before the sweep, so pacing and the divisor bypass below
              * both see one consistent answer for this pass. */
             polllog_eval_gate(now);
-            /* WATCH == confirmed-answering but not worth recording. PROBE (!s_confirmed) is
+            /* WATCH == confirmed-answering but not worth recording. PROBE (!s_ecu_answering) is
              * deliberately excluded: it must stay full-rate or resume-in-one-frame breaks. */
-            const bool watch_mode = s_confirmed && !s_gate_open;
+            const bool watch_mode = s_ecu_answering && !s_gate_open;
 
             /* The divisor gate applies only when the ECU is confirmed answering AND an OK is
              * not going stale. Captured once so the whole sweep is consistent even if
-             * s_confirmed flips mid-sweep.
-             *   BYPASS 1 -- PROBING (!s_confirmed): boot and every quiesce-resume run full
+             * s_ecu_answering flips mid-sweep.
+             *   BYPASS 1 -- PROBING (!s_ecu_answering): boot and every quiesce-resume run full
              *     sweeps. Makes the probe path bit-identical to today and removes any risk
              *     that an all-gated table starves POLLLOG_PROBE_MS of poll attempts and
              *     strands the logger in a quiesce loop.
@@ -1160,7 +1171,7 @@ static void polllog_rx_task(void *arg)
              *     leave the gate's own RPM input stale.
              * All three bypasses skip polllog_pid_due() entirely, so counters do NOT tick and
              * phase resumes exactly where it left off. */
-            const bool gate_active = s_confirmed && s_gate_open &&
+            const bool gate_active = s_ecu_answering && s_gate_open &&
                 ((now - s_last_ok_us) < (int64_t)POLLLOG_GATE_STALE_MS * 1000);
             /* "the sweep shape currently in effect is a GATED one". Drives both the EMA rule
              * and the fast-channel multiplier, so the measurement and the multiplier always
@@ -1349,12 +1360,12 @@ static void polllog_rx_task(void *arg)
              *     would otherwise transmit failed requests forever (the old 100k+ txfail spin). No
              *     ENGINE_STOP is logged -- the engine was never confirmed running.
              * The flip MUST bracket can_set_silent() with disable/enable -- it is a no-op while ON_BUS. */
-            bool engine_off = s_confirmed
+            bool engine_off = s_ecu_answering
                 ? ((now - s_last_ok_us)    > (int64_t)POLLLOG_ENGINE_OFF_MS * 1000)
                 : ((now - s_norm_start_us) > (int64_t)POLLLOG_PROBE_MS      * 1000);
             if (engine_off && (now - s_last_flip_us) > (int64_t)POLLLOG_FLIP_MIN_MS * 1000)
             {
-                bool was_confirmed = s_confirmed;
+                bool was_confirmed = s_ecu_answering;
                 can_disable();
                 can_set_silent(1);
                 can_enable();
@@ -1362,7 +1373,7 @@ static void polllog_rx_task(void *arg)
                 {
                     s_quiesced       = true;
                     s_engine_running = false;
-                    s_confirmed      = false;
+                    s_ecu_answering      = false;
                     s_gate_open      = false;  /* ECU gone -> nothing to record; re-decide on resume */
                     s_last_rx_us     = now;   /* arm the idle clock from the flip instant */
                     s_last_flip_us   = now;
@@ -1409,7 +1420,7 @@ static void polllog_rx_task(void *arg)
                 {
                     s_quiesced       = false;
                     s_engine_running = true;
-                    s_confirmed      = false; /* PROBE: a frame woke us, but require a real OK to confirm running */
+                    s_ecu_answering      = false; /* PROBE: a frame woke us, but require a real OK to confirm running */
                     s_norm_start_us  = now;   /* start the probe window (re-quiesce after PROBE_MS if no OK) */
                     s_last_flip_us   = now;
                     ESP_LOGI(TAG, "bus alive (%d frame[s]) -> NORMAL, probing for ECU", got);
@@ -1461,6 +1472,11 @@ static void polllog_rx_task(void *arg)
     }
 }
 
+bool poll_log_bringup_skipped(void)
+{
+    return s_bringup_skipped;
+}
+
 void poll_log_init(char *id, uint32_t log_period)
 {
     (void)id;
@@ -1469,7 +1485,8 @@ void poll_log_init(char *id, uint32_t log_period)
     /* ---- One-shot crash-guard ------------------------------------------- */
     if (s_polllog_guard == POLLLOG_GUARD_ARMED)
     {
-        s_polllog_guard = 0; /* disarm so the next boot retries */
+        s_polllog_guard  = 0; /* disarm so the next boot retries */
+        s_bringup_skipped = true;
         ESP_LOGW(TAG, "crash-guard was armed; skipping POLL_LOG bring-up this boot");
         return;
     }
@@ -1568,7 +1585,7 @@ bool poll_log_engine_running(void)
      * ~2s probe after a boot or a stray-frame resume the ECU hasn't replied yet, so this stays false.
      * That keeps the csv require-engine gate closed during a probe AND makes /poll_status honest -- a
      * boot-with-engine-off now reports engine_running:false instead of the old misleading true. */
-    return s_active ? s_confirmed : true;
+    return s_active ? s_ecu_answering : true;
 }
 
 bool poll_log_quiesced(void)
@@ -1623,7 +1640,7 @@ char *poll_log_get_status_json(void)
      * where the ECU has not answered yet -- still full rate, by design. */
     const char *state = !s_active      ? "inactive"
                       : s_quiesced     ? "quiesced"
-                      : !s_confirmed   ? "probe"
+                      : !s_ecu_answering   ? "probe"
                       : s_gate_open    ? "fast"
                                        : "watch";
 
