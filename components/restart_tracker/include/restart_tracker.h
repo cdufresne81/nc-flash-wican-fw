@@ -40,6 +40,9 @@ typedef enum {
     RESTART_TRACKER_PLANNED_REASON_SAFE_MODE,
     RESTART_TRACKER_PLANNED_REASON_POWER_WAKE,
     RESTART_TRACKER_PLANNED_REASON_INTERNAL_RECOVERY,
+    /* Appended at the END on purpose: stored history holds NUMERIC reason codes, so inserting
+     * anywhere above would relabel every already-recorded restart on existing devices. */
+    RESTART_TRACKER_PLANNED_REASON_CAN_WAKE,
 } restart_tracker_planned_reason_t;
 
 typedef enum {

@@ -181,6 +181,15 @@ static uint32_t csv_pending_drops  = 0;   // records lost while a WIDE session w
 #define CSV_ATTEMPT_MAGIC 0xA11C0DE5u
 RTC_NOINIT_ATTR static uint32_t csv_attempt_inprogress;
 
+// True for the rest of this uptime when the guard above made us skip CSV auto-start. See
+// sleep_mode_recovery_needed(): a wake now resumes in place, so without this the "next boot"
+// the comment above promises never arrives and CSV logging stays off indefinitely.
+static bool csv_bringup_skipped = false;
+
+// Set by the sleep teardown, cleared by the resume. Forces the writer task to close any open
+// session before the CPU halts; see the note where logging_active is computed.
+static volatile bool csv_sleep_requested = false;
+
 static bool csv_time_is_valid(void)
 {
     time_t now = time(NULL);
@@ -625,7 +634,13 @@ static void csv_logger_task(void *pvParameters)
         // The provider returns true when poll_log isn't the active mode, so this auto-degrades to the
         // voltage gate when RPM isn't available. FORCE_ON/FORCE_OFF still win for bench use.
         bool engine_ok = !require_engine || csv_engine_state_fn == NULL || csv_engine_state_fn();
-        bool logging_active = (csv_manual_mode == CSV_MANUAL_ON)  ? true
+        // The sleep request outranks even a manual FORCE_ON. Normally the ignition/engine gate has
+        // already closed the session long before sleep, but with manual mode ON a session would
+        // otherwise stay open across the whole sleep -- and since a wake now resumes in place
+        // rather than rebooting, it would come back to the same open file with its timers seeing a
+        // jump of hours. Closing here means one clean file per awake period.
+        bool logging_active = csv_sleep_requested            ? false
+                            : (csv_manual_mode == CSV_MANUAL_ON)  ? true
                             : (csv_manual_mode == CSV_MANUAL_OFF) ? false
                             : (ignition_on && engine_ok);
 
@@ -1457,15 +1472,34 @@ static void csv_deferred_init_task(void *arg)
     vTaskDelete(NULL);
 }
 
+bool csv_logger_bringup_skipped(void)
+{
+    return csv_bringup_skipped;
+}
+
+void csv_logger_set_sleep_requested(bool sleeping)
+{
+    csv_sleep_requested = sleeping;
+}
+
 void csv_logger_init_deferred(void)
 {
     // One-shot crash guard: if a prior boot armed an attempt and didn't survive long
     // enough to clear it, that attempt crashed -> skip CSV this boot so we can't
-    // boot-loop. Cleared after 15s of stable logging (writer task) or by a cold power
-    // cycle (RTC wiped).
+    // boot-loop. Cleared on the skip below, after 15s of stable logging (writer task),
+    // or by a cold power cycle (RTC wiped).
     if (csv_attempt_inprogress == CSV_ATTEMPT_MAGIC)
     {
+        /* DISARM HERE, exactly as poll_log.c and fast_log.c do. Without this the guard stays
+         * armed forever: the only other thing that clears it is the writer task after 15 s of
+         * stable logging, and on a skip boot that task never starts. One crash inside the 15 s
+         * window would then cost CSV logging permanently -- and, since resume-in-place refuses
+         * to resume while any bring-up was skipped, would also make EVERY wake take the reboot
+         * fallback forever, repairing nothing. RTC memory survives software reboots, so only
+         * physically unplugging the device would clear it. */
+        csv_attempt_inprogress = 0;   /* disarm so the next boot retries */
         ESP_LOGW(TAG, "Prior CSV auto-start attempt did not complete - skipping this boot to avoid a boot-loop");
+        csv_bringup_skipped = true;
         return;
     }
     csv_attempt_inprogress = CSV_ATTEMPT_MAGIC;   // arm the one-shot guard

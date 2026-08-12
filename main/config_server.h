@@ -143,6 +143,7 @@ typedef struct _device_config
 	char ble_status[32];
 	char ble_power[8]; // dBm value as string (e.g., -12, -9, -6, -3, 0, 3, 6, 9)
 	char sleep_status[32];
+	char can_wake[32];   /* #4 wake-on-CAN master switch */
 	char sleep_disable_agree[10];
 	char sleep_volt[10];
 	char engine_volt[10];   // Task #6: dedicated engine-running gate for the CSV logger (separate from sleep_volt)
@@ -207,6 +208,14 @@ char *config_server_get_ap_ssid(void);
 int8_t config_server_protocol(void);
 int config_server_ble_pass(void);
 int8_t config_server_get_sleep_config(void);
+int8_t config_server_get_can_wake(void);
+
+/* True while a firmware OTA upload is in flight. The sleep teardown refuses to sleep while this
+ * is raised: sleeping calls wifi_mgr_deinit(), which tears the network stack out from under the
+ * live upload and crashes the device. Distinct from the #86 ECU-flash interlock, which guards the
+ * CAN bus and does not cover a WiFi firmware update. */
+void config_server_ota_active_set(bool active);
+bool config_server_ota_active(void);
 int8_t config_server_get_ble_power(int8_t *power_dbm); // returns 0 on success
 //void config_server_set_ble_tempfn(char b);
 //char config_server_get_ble_tempfn(void);

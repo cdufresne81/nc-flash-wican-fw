@@ -89,6 +89,7 @@
 #include "csv_logger.h"
 #include "poll_log.h"
 #include "event_log.h"
+#include "esp_timer.h"   /* /wake_probe uptime reporting */
 #include "sd_filemgr.h"
 #include "sdcard.h"
 #include "obd2_standard_pids.h"
@@ -201,7 +202,7 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"st
 										\"drive_ssid\":\"MeatPi\",\"drive_password\":\"TomatoSauce\",\"drive_security\":\"wpa3\",\"drive_protocol\":\"elm327\",\"drive_connection_type\":\"wifi\",\"drive_mode_timeout\":\"60\",\
 										\"can_datarate\":\"500K\",\
 										\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"poll_log\",\"ble_pass\":\"123456\",\
-								\"ble_status\":\"disable\",\"ble_power\":\"9\",\"sleep_status\":\"enable\",\"periodic_wakeup\":\"disable\",\"sleep_volt\":\"13.0\",\"engine_volt\":\"13.0\",\"wakeup_volt\":\"13.5\",\"sleep_time\":\"5\",\"wakeup_interval\":\"90\",\"batt_alert\":\"disable\",\
+								\"ble_status\":\"disable\",\"ble_power\":\"9\",\"sleep_status\":\"enable\",\"can_wake\":\"enable\",\"periodic_wakeup\":\"disable\",\"sleep_volt\":\"13.0\",\"engine_volt\":\"13.0\",\"wakeup_volt\":\"13.5\",\"sleep_time\":\"5\",\"wakeup_interval\":\"90\",\"batt_alert\":\"disable\",\
 										\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\
 										\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\
 								\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\
@@ -1577,6 +1578,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "git_version", GIT_SHA);
 	cJSON_AddStringToObject(root, "protocol", device_config.protocol);
 	cJSON_AddStringToObject(root, "sleep_status", device_config.sleep_status);
+	cJSON_AddStringToObject(root, "can_wake", device_config.can_wake);
 	cJSON_AddStringToObject(root, "sleep_disable_agree", device_config.sleep_disable_agree);
 	cJSON_AddStringToObject(root, "sleep_volt", device_config.sleep_volt);
 	cJSON_AddStringToObject(root, "engine_volt", device_config.engine_volt);
@@ -1650,8 +1652,8 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	char volt[8]= {0};
 	float tmp = 0;
 	sleep_mode_get_voltage(&tmp);
-	/* Two decimals, not one: the reading is no longer rounded to 0.1 V and this endpoint is the
-	 * primary way to observe a crank dip or measure the dip-wake threshold on a real car. */
+	/* Two decimals, not one: the reading is no longer rounded to 0.1 V, and this endpoint is the
+	 * only way to watch the battery on a real car -- there is no serial console on OBD-PRO. */
 	snprintf(volt, sizeof(volt), "%.2fV", tmp);
 	cJSON_AddStringToObject(root, "batt_voltage", volt);
 
@@ -1899,9 +1901,15 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 	multipart_upload_config_t mp_cfg = multipart_upload_default_config();
 	mp_cfg.rx_buf_size = 4096;
 
+	/* Hold sleep off for the whole upload. Without this the sleep countdown can expire mid-transfer
+	 * and run wifi_mgr_deinit() straight through this live HTTP request, which crashed the bench
+	 * device. Raised BEFORE the transfer and lowered on every exit path below. */
+	config_server_ota_active_set(true);
+
 	esp_err_t mp_err = multipart_upload_handle(req, &handlers, &ctx, &mp_cfg);
 	if (mp_err != ESP_OK || ctx.err != ESP_OK || !ctx.started)
 	{
+		config_server_ota_active_set(false);
 		if (ctx.started && ctx.err != ESP_OK)
 		{
 			esp_ota_abort(ctx.update_handle);
@@ -1913,6 +1921,10 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 		return ESP_FAIL;
 	}
 
+	/* Transfer done and the boot partition is already switched. Stay raised until the scheduled
+	 * reboot below actually fires -- there is nothing left to protect, but lowering it here would
+	 * let a sleep slip in during the response + reboot window for no benefit. It is cleared by
+	 * the reboot itself. */
 	total_size = (uint32_t)ctx.total_size;
 	ESP_LOGI(TAG, "OTA upload complete: %lu bytes", (unsigned long)total_size);
 	// Operational event (Task #24): OTA written + boot partition switched; reboot scheduled below.
@@ -2310,6 +2322,62 @@ static const httpd_uri_t poll_status_uri = {
     .uri       = "/poll_status",
     .method    = HTTP_GET,
     .handler   = poll_status_handler,
+    .user_ctx  = NULL
+};
+
+/* ------------------------------------------------------------------------------------------
+ * PERMANENT diagnostic endpoint:  GET /wake_probe
+ *
+ * Kept deliberately. This box has no serial console (the USB-C port is a USB HOST at runtime), so
+ * without this endpoint the sleep/resume path has NO observable surface at all and every future
+ * investigation starts by guessing. It is a read-only GET on an HTTP server that already accepts
+ * /store_config writes and firmware uploads, so gating this one route would be theater -- if auth
+ * ever arrives it should cover the whole server.
+ *
+ * What each field is for:
+ *
+ *   chip        -- elm327_chip_get_status(), a raw read of OBD_READY_PIN. This is the ONLY way
+ *                  to catch the sleep babysitter re-sleeping the interpreter chip right after a
+ *                  resume. In poll_log protocol mode the ELM327 TCP port is not driven, so
+ *                  talking ELM327 over the wire cannot distinguish "asleep" from "not in use".
+ *   uptime_ms   -- proves a wake RESUMED (uptime keeps climbing) rather than rebooted.
+ *   fence       -- the #88 sleep fence; must be false while awake or the producers stay parked.
+ *   can_enabled -- the bus really came back.
+ * ------------------------------------------------------------------------------------------ */
+static esp_err_t wake_probe_handler(httpd_req_t *req)
+{
+    const elm327_chip_status_t chip = elm327_chip_get_status();
+
+    /* Stack headroom of the sleep task, in BYTES remaining at its worst point. This is the number
+     * that matters most: the resume runs the whole WiFi bring-up inside light_sleep_task, work
+     * that used to happen only in app_main because waking always rebooted. If this trends toward
+     * zero across wake cycles, the task is overflowing its static stack -- which corrupts whatever
+     * sits next to it and panics with a jump to a nonsense address. */
+    const TaskHandle_t sleep_task = xTaskGetHandle("sleep_task");   /* the task's real name */
+    const unsigned sleep_hw = sleep_task ? (unsigned)(uxTaskGetStackHighWaterMark(sleep_task) * sizeof(StackType_t))
+                                         : 0u;
+
+    char body[320];
+    snprintf(body, sizeof(body),
+             "{\"uptime_ms\":%lld,\"chip\":\"%s\",\"fence\":%s,\"can_enabled\":%s,"
+             "\"free_heap\":%u,\"largest_block\":%u,\"sleep_task_stack_free\":%u}",
+             esp_timer_get_time() / 1000,
+             (chip == ELM327_READY) ? "ready" : "sleep",
+             can_sleep_fence_active() ? "true" : "false",
+             can_is_enabled() ? "true" : "false",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             sleep_hw);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, body);
+    return ESP_OK;
+}
+
+static const httpd_uri_t wake_probe_uri = {
+    .uri       = "/wake_probe",
+    .method    = HTTP_GET,
+    .handler   = wake_probe_handler,
     .user_ctx  = NULL
 };
 
@@ -3100,6 +3168,22 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 
 	//*****
 	// sleep_disable_agree
+	/* #4 wake-on-CAN. Missing key -> "enable": every device provisioned before this key
+	 * existed must resolve to a valid value, because this same parse runs on the STORED
+	 * config at boot and a rejection factory-restores the device (issue #44). */
+	key = cJSON_GetObjectItem(root,"can_wake");
+	if(key == 0 || key->valuestring == NULL)
+	{
+		strlcpy(dst->can_wake, "enable", sizeof(dst->can_wake));
+	}
+	else
+	{
+		strlcpy(dst->can_wake, key->valuestring, sizeof(dst->can_wake));
+	}
+	ESP_LOGI(TAG, "dst->can_wake: %s", dst->can_wake);
+	//*****
+
+	//*****
 	key = cJSON_GetObjectItem(root,"sleep_disable_agree");
 	if(key == 0 || key->valuestring == NULL)
 	{
@@ -3254,7 +3338,8 @@ static void register_server_uris(void)
 	httpd_register_uri_handler(server, &scan_available_pids_uri);
 	httpd_register_uri_handler(server, &std_pid_info);
 	httpd_register_uri_handler(server, &poll_status_uri);
-	
+	httpd_register_uri_handler(server, &wake_probe_uri);  /* #4 -- permanent sleep/resume diagnostic */
+
 	//Add before this line
 	httpd_register_uri_handler(server, &csv_status_uri);
 	httpd_register_uri_handler(server, &csv_list_uri);
@@ -3486,6 +3571,42 @@ int8_t config_server_get_ble_config(void)
 		return 0;
 	}
 	return -1;
+}
+
+/* #4: enabled unless EXPLICITLY "disable", so an unset/garbled value degrades to the feature
+ * being ON. Every failure mode inside can_wake falls back to today's voltage-only behaviour,
+ * so ON is the safe default. */
+int8_t config_server_get_can_wake(void)
+{
+	if(strcmp(device_config.can_wake, "disable") == 0)
+	{
+		return 0;
+	}
+	return 1;
+}
+
+/* --- Firmware-OTA-in-progress fence -------------------------------------------------------
+ * A firmware upload and the sleep teardown are mutually destructive: the teardown calls
+ * wifi_mgr_deinit(), and doing that underneath a live HTTP upload pulls the network stack out
+ * from under the task still using it. Observed on the bench as a panic at a non-code address
+ * (pc=0x20657079) twelve seconds after a sleep entry, with an upload in flight.
+ *
+ * The #86 ECU-flash interlock did not cover this: FLASH_ACTIVE_BIT means "a flash codec owns the
+ * CAN bus", which a firmware update over WiFi never touches. Same shape of problem, different
+ * resource, so it gets its own flag and shares the same bounded-postpone logic.
+ *
+ * Plain volatile bool: written by the httpd task, read by the sleep task, single machine word,
+ * and a stale read costs at most one extra retry of a decision that is already retried. */
+static volatile bool s_ota_active = false;
+
+void config_server_ota_active_set(bool active)
+{
+	s_ota_active = active;
+}
+
+bool config_server_ota_active(void)
+{
+	return s_ota_active;
 }
 
 int8_t config_server_get_sleep_config(void)

@@ -75,7 +75,14 @@ void can_flash_active_set(void);
 void can_flash_active_clear(void);
 bool can_flash_active(void);
 bool can_datalog_park_active(void);   /* true while a host op=pause is in effect */
-bool can_should_park(void);           /* flash_active OR park OR claim */
+bool can_should_park(void);           /* flash_active OR park OR claim OR sleep fence */
+
+/* Sleep fence (#88): raised by the sleep teardown, lowered by the resume path. Stops
+ * poll_log/AutoPID re-enabling the bus after sleep has disabled it. NOT the same as
+ * can_flash_active_set() -- that one deliberately WAKES main.c's CAN task (main.c:377-383). */
+void can_sleep_fence_set(void);
+void can_sleep_fence_clear(void);   /* resume path only -- unparks the producers */
+bool can_sleep_fence_active(void);
 
 /* === Dead-man's-switch / brick-safe datalog auto-resume ====================
  * Full design + invariants: docs/internal/WICAN_DEADMAN_AUTORESUME.md (host repo).

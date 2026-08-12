@@ -42,7 +42,15 @@
 
 #define OBD_RESET_PIN           (GPIO_NUM_41)
 #define OBD_LED_EN_PIN          (GPIO_NUM_42)
-#define OBD_READY_PIN           (GPIO_NUM_7)    // High = Active, Low = Sleep
+/* HIGH = the OBD/ELM327 chip is ASLEEP, LOW = it is ACTIVE. The comment here used to say the
+ * opposite, which cost real debugging time: it contradicts elm327_chip_get_status(), which returns
+ * the raw level into `enum { ELM327_READY = 0, ELM327_SLEEP = 1 }`, and every reader of that enum.
+ * Measured on the bench 2026-08-06 -- immediately after a successful elm327_sleep() the pin still
+ * reads 0, then settles to 1 once the chip has actually powered down, and the sleep babysitter
+ * (which trips on ELM327_READY) then stays quiet for a whole 300 s sleep. So the ENUM is right and
+ * the old comment was wrong. NOTE the lag: the pin does not track STSLEEP0's "OK" immediately, so
+ * do not sample it right after elm327_sleep() returns and conclude the chip is awake. */
+#define OBD_READY_PIN           (GPIO_NUM_7)
 #define OBD_SLEEP_PIN           (GPIO_NUM_9)
 // #define CONNECTED_LED_GPIO_NUM		41  //NC pin
 // #define ACTIVE_LED_GPIO_NUM			41  //NC pin

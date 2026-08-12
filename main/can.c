@@ -193,17 +193,65 @@ bool can_datalog_park_active(void)
 	return s_park.active;
 }
 
+/* --- Sleep fence (issue #88) -------------------------------------------------------------
+ * Raised by the sleep teardown and lowered by the resume path (can_sleep_fence_clear(), below).
+ * It was originally set-once-never-cleared because waking always rebooted; resuming in place
+ * makes the clear mandatory -- see the note on that function. A plain volatile bool, valid
+ * before can_init and lock-free to read, exactly like the flags above.
+ *
+ * The bug it fixes: poll_log flips the bus at poll_log.c:1358-1360 and :1405-1407, and BOTH
+ * brackets end in can_enable(), which drives the transceiver's standby pin LOW (can.c:438).
+ * Nothing stopped that racing sleep's can_disable(): if poll_log was already past its park check
+ * (poll_log.c:1079) when sleep began, its can_enable() could land AFTER sleep's can_disable() and
+ * leave the transceiver awake and the TWAI driver installed all night.
+ *
+ * Why this is not can_flash_active_set(): FLASH_ACTIVE means "a flash codec owns the bus", and
+ * main.c:377-383 deliberately treats a host session as a cue to WAKE its CAN task so it can
+ * forward frames. Sleep needs the opposite -- everyone parks, permanently. Hence a separate flag.
+ *
+ * It matters far more once wake-on-CAN ships: a stray can_enable() would reinstall TWAI on
+ * RX_GPIO_NUM and destroy the armed wake pin, put the controller back in a mode where it ACKs
+ * frames while the device is supposed to be asleep, and leave RXD following all bus traffic. */
+static volatile bool s_sleep_fence = false;
+
+void can_sleep_fence_set(void)
+{
+	s_sleep_fence = true;
+}
+
+/* Lowered by the RESUME path only. Originally this flag was set-once-never-cleared, because
+ * waking always rebooted and RAM state did not survive to need clearing. Resuming in place
+ * changes that: the producers parked on can_should_park() must be released, and if this stayed
+ * raised the datalogger would never poll again until the next power cycle -- a silently dead
+ * device that still answers HTTP. Clearing is safe because the resume re-enables the bus BEFORE
+ * unparking, so no producer can transmit into a disabled controller. */
+void can_sleep_fence_clear(void)
+{
+	s_sleep_fence = false;
+}
+
+bool can_sleep_fence_active(void)
+{
+	return s_sleep_fence;
+}
+
 /* True while the single TWAI controller is reserved by ANY of: a flash codec
- * (FLASH_ACTIVE_BIT, event group), a host REST datalog-pause (s_park.active), or a host
- * bus-claim over the UDS auth window (s_claim.active). The datalogger poll task and the
- * AutoPID poll task park on THIS so neither injects a stray frame while the bus is reserved.
- * The triple OR is the brick interlock: even if a stray resume cleared the park flag,
- * FLASH_ACTIVE_BIT or the claim flag independently keeps every producer parked. The two
- * flags are lock-free single-byte reads; FLASH_ACTIVE_BIT is read via the event group.
+ * (FLASH_ACTIVE_BIT, event group), a host REST datalog-pause (s_park.active), a host
+ * bus-claim over the UDS auth window (s_claim.active), or sleep teardown (s_sleep_fence).
+ * The datalogger poll task and the AutoPID poll task park on THIS so neither injects a stray
+ * frame while the bus is reserved.
+ * The OR chain is the brick interlock: even if a stray resume cleared the park flag,
+ * FLASH_ACTIVE_BIT or the claim flag independently keeps every producer parked. The flags are
+ * lock-free single-byte reads; FLASH_ACTIVE_BIT is read via the event group.
  * NULL-group-safe (can_flash_active() handles a NULL group; the flags default false). */
+/* LOAD-BEARING for the #4 sleep veto, beyond the parking it was written for: because the sleep
+ * fence is one of the terms here, poll_log_ecu_answering() is structurally FALSE for the entire
+ * time the device is asleep. That is what stops a frozen "the ECU was answering" reading from
+ * surviving across a sleep and wrongly crediting the next wake. Drop s_sleep_fence from this OR
+ * and that protection disappears silently -- the veto would still compile and still look right. */
 bool can_should_park(void)
 {
-	return can_flash_active() || s_park.active || s_claim.active;
+	return can_flash_active() || s_park.active || s_claim.active || s_sleep_fence;
 }
 
 /* --- Dead-man's-switch lease primitives (WICAN_DEADMAN_AUTORESUME.md) ----------------

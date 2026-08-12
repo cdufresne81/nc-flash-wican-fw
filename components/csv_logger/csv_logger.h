@@ -134,6 +134,16 @@ void csv_logger_set_rate_fn(csv_rate_fn_t fn);
  */
 void csv_logger_init_deferred(void);
 
+/* True when the RTC crash-guard made csv_logger_init_deferred() skip CSV auto-start on this boot.
+ * See poll_log_bringup_skipped(). */
+bool csv_logger_bringup_skipped(void);
+
+/* Tell the writer task to close any open session (true) or that it may log again (false).
+ * The sleep teardown sets it and the resume clears it, so a session never spans a sleep: a wake
+ * resumes in place, so an open file would otherwise come back with its timers jumped by hours.
+ * Overrides even a manual FORCE_ON. */
+void csv_logger_set_sleep_requested(bool sleeping);
+
 /**
  * @brief Queue one decoded parameter sample for CSV logging.
  *

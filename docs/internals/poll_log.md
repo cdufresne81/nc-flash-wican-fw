@@ -48,13 +48,13 @@ A NORMAL-mode sweep now runs in one of two speeds:
 
 | State | Sweep | When |
 |---|---|---|
-| PROBE | full rate | `!s_confirmed` — never slowed, resume-in-one-frame depends on it |
+| PROBE | full rate | `!s_ecu_answering` — never slowed, resume-in-one-frame depends on it |
 | WATCH | one full sweep per `POLLLOG_WATCH_SWEEP_MS` (1 s, ~15 req/s on the 19-PID table) | ECU answers but the engine is not running |
 | FAST | full rate, today's path unchanged | the gate is open |
 
 The gate (`polllog_eval_gate`) asks one question — *is the engine running* — from voltage **and** RPM:
 
-- **Open**: `s_confirmed` **and** voltage ≥ `engine_volt` **and** RPM > `POLLLOG_GATE_RPM_ON` (the RPM term drops out when no RPM channel exists). A CSV session already being open forces it too — that is what keeps the web **Start** button and bench work at full rate, since a bench PCM reports RPM 0.
+- **Open**: `s_ecu_answering` **and** voltage ≥ `engine_volt` **and** RPM > `POLLLOG_GATE_RPM_ON` (the RPM term drops out when no RPM channel exists). A CSV session already being open forces it too — that is what keeps the web **Start** button and bench work at full rate, since a bench PCM reports RPM 0.
 - **Close**: the same test against `engine_volt - VEHICLE_IGN_HYSTERESIS_V`, sustained for `CSV_LOGGER_IGN_OFF_DEBOUNCE_MS`. **Either** signal dropping closes it.
 
 Both thresholds and the debounce are **shared constants, not copies** (`vehicle.h`, `csv_logger.h`), because the gate must agree with the CSV writer about when the engine stopped.
@@ -94,7 +94,7 @@ Three bypasses skip the gate completely, and while bypassed the counters do **no
 
 | Bypass | Condition | Why |
 |---|---|---|
-| Probing | `!s_confirmed` | Boot and every quiesce-resume run full sweeps, so an all-gated table can never starve `POLLLOG_PROBE_MS` of attempts and strand the logger in a quiesce loop. |
+| Probing | `!s_ecu_answering` | Boot and every quiesce-resume run full sweeps, so an all-gated table can never starve `POLLLOG_PROBE_MS` of attempts and strand the logger in a quiesce loop. |
 | Stale OK | no OK for `POLLLOG_GATE_STALE_MS` (2.5 s) | A long divisor on the only answering channel could otherwise push `now - s_last_ok_us` past `POLLLOG_ENGINE_OFF_MS` and fire a **false** `ENGINE_STOP`, closing the CSV require-engine gate mid-drive. With the engine genuinely off, un-gated sweeps still yield no OK and still quiesce at 5 s. |
 | Watch | `!s_gate_open` | A watch sweep already runs at a fraction of the divisors' intended rate; applying them on top would starve channels and leave the gate's own RPM input stale. |
 

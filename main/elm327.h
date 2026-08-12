@@ -53,4 +53,7 @@ void elm327_lock(void);
 void elm327_send_cmd(uint8_t* cmd, uint32_t cmd_len);
 esp_err_t elm327_get_protocol_number(uint8_t *protocol_number);
 void elm327_hardreset_chip(void);
+/* Undo elm327_sleep()'s GPIO9 pad hold. Required before the chip can be woken; called
+ * from app_main at boot and from the sleep-resume path. */
+void elm327_release_sleep_hold(void);
 #endif

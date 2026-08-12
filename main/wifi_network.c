@@ -72,14 +72,14 @@ static void wifi_network_set_sta_hostname(wifi_mgr_config_t *wifi_config)
  * Power save: manual modes get WIFI_PS_NONE via wifi_mgr (wifi_mgr.h default).
  * The SmartConnect path below never calls esp_wifi_set_ps(), so it runs on the
  * IDF station default (WIFI_PS_MIN_MODEM) and will benchmark noticeably slower. */
-void wifi_network_init(char* ap_ssid_uid)
+esp_err_t wifi_network_init(char* ap_ssid_uid)
 {
     wifi_mgr_config_t wifi_config;
-    
+
     // Validate input parameter
     if (ap_ssid_uid == NULL || strlen(ap_ssid_uid) == 0) {
         ESP_LOGE(TAG, "Invalid AP SSID UID parameter");
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
 	
     // Determine AP SSID to use (default UID, optional custom override)
@@ -107,7 +107,7 @@ void wifi_network_init(char* ap_ssid_uid)
         } else {
             ESP_LOGI(TAG, "SmartConnect initialized successfully - it will manage WiFi");
         }
-        return; // SmartConnect handles everything, exit here
+        return ret; // SmartConnect handles everything, exit here
     }
     
     // Non-SmartConnect modes: Use WiFi Manager with regular configuration
@@ -243,17 +243,18 @@ void wifi_network_init(char* ap_ssid_uid)
     esp_err_t ret = wifi_mgr_init(&wifi_config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "WiFi Manager initialization failed: %s", esp_err_to_name(ret));
-        return;
+        return ret;
     }
     ESP_LOGI(TAG, "WiFi Manager initialized");
-    
+
     // Enable WiFi
     ret = wifi_mgr_enable();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable WiFi: %s", esp_err_to_name(ret));
-        return;
+        return ret;
     }
     ESP_LOGI(TAG, "WiFi enabled");
+    return ESP_OK;
 }
 
 /**

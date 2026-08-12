@@ -721,15 +721,8 @@ void app_main(void)
 	gpio_pulldown_en(OBD_READY_PIN);
 
 
-	gpio_sleep_set_pull_mode(OBD_SLEEP_PIN, GPIO_FLOATING);
-	gpio_pulldown_en(OBD_SLEEP_PIN);
-	rtc_gpio_pulldown_dis(OBD_SLEEP_PIN);
-	gpio_hold_dis(OBD_SLEEP_PIN);
-	rtc_gpio_deinit(OBD_SLEEP_PIN);
-	gpio_reset_pin(OBD_SLEEP_PIN);
-	gpio_set_direction(OBD_SLEEP_PIN, GPIO_MODE_OUTPUT);
-	gpio_pulldown_en(OBD_SLEEP_PIN);
-	gpio_set_level(OBD_SLEEP_PIN, 1);
+	/* Same body, now shared with the sleep-resume path (elm327.c). */
+	elm327_release_sleep_hold();
 
 
 

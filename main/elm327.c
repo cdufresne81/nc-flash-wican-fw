@@ -1926,35 +1926,59 @@ void elm327_lock(void)
 void elm327_hardreset_chip(void)
 {
     char *rsp_buffer = (char *)heap_caps_malloc(UART_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint32_t rsp_len;
 	ESP_LOGW(TAG, "Performing hard reset of ELM327 chip");
+	if (rsp_buffer == NULL)
+	{
+		ESP_LOGE(TAG, "%s: response buffer alloc failed", __func__);
+		return;
+	}
 	if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
 	{
 		vTaskDelay(pdMS_TO_TICKS(500));
 		uart_flush_input(UART_NUM_1);
 		// xQueueReset(uart1_queue);
-		if(gpio_get_level(OBD_READY_PIN) == 1)
+		/* GPIO7 HIGH means the chip is ASLEEP (see hw_config.h) -- it cannot hear UART, so the
+		 * only way in is the reset line. LOW means it is awake and should answer ATZ. */
+		bool used_reset_line = (gpio_get_level(OBD_READY_PIN) == 1);
+		if(used_reset_line)
 		{
-			ESP_LOGW(TAG, "OBD_READY_PIN is high, performing hardware reset");
+			ESP_LOGW(TAG, "chip asleep (GPIO7 high), performing hardware reset");
 			gpio_set_level(OBD_RESET_PIN, 0);
 			vTaskDelay(pdMS_TO_TICKS(5));
 			gpio_set_level(OBD_RESET_PIN, 1);
 		}
 		else
 		{
-			ESP_LOGI(TAG, "OBD_READY_PIN is low, sending ATZ command instead of hardware reset");
+			ESP_LOGI(TAG, "chip awake (GPIO7 low), sending ATZ instead of a hardware reset");
 			elm327_uart_write_bytes(UART_NUM_1, "ATZ\r", strlen("ATZ\r"));
 		}
 		memset(rsp_buffer, 0, UART_BUFFER_SIZE);
         int len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", UART_TIMEOUT_MS+300);
+
+		/* The ATZ path is taken precisely when the chip is awake -- but if what is BROKEN is the
+		 * UART link itself (a desynced baud rate after a reset, say), then talking to it over
+		 * UART can never fix it, and every retry fails identically. That is a reset path that is
+		 * unrecoverable by construction. So when ATZ gets no answer, fall through to the hardware
+		 * reset line, which needs no working UART at all. */
+		if(len <= 0 && !used_reset_line)
+		{
+			ESP_LOGW(TAG, "ATZ got no reply -- UART may be desynced, falling back to the reset line");
+			gpio_set_level(OBD_RESET_PIN, 0);
+			vTaskDelay(pdMS_TO_TICKS(5));
+			gpio_set_level(OBD_RESET_PIN, 1);
+			memset(rsp_buffer, 0, UART_BUFFER_SIZE);
+			len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", UART_TIMEOUT_MS+300);
+			used_reset_line = true;
+		}
+
 		if(len > 0)
 		{
 			// ESP_LOG_BUFFER_CHAR(TAG, rsp_buffer, len);
-			ESP_LOGW(TAG, "Hardreset OK");
+			ESP_LOGW(TAG, "Hardreset OK (%s)", used_reset_line ? "reset line" : "ATZ");
 		}
 		else
 		{
-			ESP_LOGE(TAG, "Hardreset failed");
+			ESP_LOGE(TAG, "Hardreset failed even via the reset line");
 		}
 		uart_flush_input(UART_NUM_1);
 		if(xuart1_semaphore == NULL)
@@ -1967,6 +1991,11 @@ void elm327_hardreset_chip(void)
 	{
 		ESP_LOGE(TAG, "%s: Failed to take UART semaphore", __func__);
 	}
+
+	/* Was leaked on every single call. Harmless when this ran once per boot; a real drip now that
+	 * a resume calls it on every wake -- ~128 B plus allocator overhead per cycle, which matches
+	 * the per-resume heap decline measured on the bench. */
+	heap_caps_free(rsp_buffer);
 
 	vTaskDelay(pdMS_TO_TICKS(50));
     if (elm327_set_baudrate())
@@ -2141,6 +2170,30 @@ cleanup:
 	}
 	
 	return ret;
+}
+
+/* Release the OBD_SLEEP_PIN (GPIO9) pad hold and put the pin back to a driven, awake state.
+ *
+ * This is the ONE thing that genuinely blocks resuming from sleep without a reboot.
+ * elm327_sleep() latches this pin to hold the MIC/ELM327 chip asleep, and an RTC pad hold
+ * survives a software reboot -- gpio_reset_pin() does NOT clear it (IDF gpio.c) and
+ * rtc_gpio_deinit() only changes the function select. Until this runs, the chip cannot be
+ * woken at all.
+ *
+ * The body was previously inline in app_main only, which is exactly why waking had to reboot:
+ * app_main was the only code that could undo the latch. Extracted here so the boot path and
+ * the resume path share one body and cannot drift. */
+void elm327_release_sleep_hold(void)
+{
+	gpio_sleep_set_pull_mode(OBD_SLEEP_PIN, GPIO_FLOATING);
+	gpio_pulldown_en(OBD_SLEEP_PIN);
+	rtc_gpio_pulldown_dis(OBD_SLEEP_PIN);
+	gpio_hold_dis(OBD_SLEEP_PIN);
+	rtc_gpio_deinit(OBD_SLEEP_PIN);
+	gpio_reset_pin(OBD_SLEEP_PIN);
+	gpio_set_direction(OBD_SLEEP_PIN, GPIO_MODE_OUTPUT);
+	gpio_pulldown_en(OBD_SLEEP_PIN);
+	gpio_set_level(OBD_SLEEP_PIN, 1);
 }
 
 esp_err_t elm327_sleep(void)

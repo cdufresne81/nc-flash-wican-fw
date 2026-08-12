@@ -74,6 +74,10 @@ static const char *TAG = "fast_log";
 #define FASTLOG_GUARD_ARMED        0xFA571A6Du
 static RTC_NOINIT_ATTR uint32_t s_fastlog_guard;
 
+/* True for the rest of this uptime when the guard above made us skip bring-up. See
+ * poll_log_bringup_skipped() for why this exists now that a wake resumes instead of rebooting. */
+static bool s_bringup_skipped = false;
+
 static autopid_config_t *s_cfg = NULL;
 
 /* Static task storage -> .bss -> INTERNAL RAM (no PSRAM on the hot capture path). */
@@ -199,6 +203,11 @@ static void fastlog_rx_task(void *arg)
     }
 }
 
+bool fast_log_bringup_skipped(void)
+{
+    return s_bringup_skipped;
+}
+
 void fast_log_init(char *id, uint32_t log_period)
 {
     (void)id;
@@ -207,7 +216,8 @@ void fast_log_init(char *id, uint32_t log_period)
     /* ---- One-shot crash-guard ------------------------------------------- */
     if (s_fastlog_guard == FASTLOG_GUARD_ARMED)
     {
-        s_fastlog_guard = 0; /* disarm so the next boot retries */
+        s_fastlog_guard   = 0; /* disarm so the next boot retries */
+        s_bringup_skipped = true;
         ESP_LOGW(TAG, "crash-guard was armed; skipping FAST_LOG bring-up this boot");
         return;
     }
