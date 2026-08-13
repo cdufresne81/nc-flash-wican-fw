@@ -397,10 +397,14 @@
 
             var m = d.mem || {}, mg = el('mem');
             mg.textContent = '';
+            // 4096 must stay equal to WD_LOW_BLOCK_BYTES in components/wifi_diag/wifi_diag.c --
+            // the level below which the Wi-Fi driver cannot reliably get a ~1.6 KB transmit
+            // buffer. It was 32768, which no healthy unit could ever reach (they run with ~30 KB
+            // of internal RAM free in total), so this painted red permanently.
             kv(mg, 'Free now', bytes(m.int_free || 0));
-            kv(mg, 'Largest block', bytes(m.int_block || 0), (m.int_block < 32768) ? 'bad' : 'good');
+            kv(mg, 'Largest block', bytes(m.int_block || 0), (m.int_block < 4096) ? 'bad' : 'good');
             kv(mg, 'Lowest block seen', bytes(m.int_block_min || 0),
-                (m.int_block_min && m.int_block_min < 32768) ? 'warn' : '');
+                (m.int_block_min && m.int_block_min < 4096) ? 'warn' : '');
         }
 
         function load() {

@@ -58,7 +58,15 @@ deliberately conservative: a missed diagnosis is recoverable, a confident wrong 
 off for a day.
 
 The rules cover power save, AP/STA channel clash, average RSSI, PHY rate (802.11b-only, no 802.11n),
-a dominant disconnect reason, internal-RAM fragmentation, link-uptime percentage, and slow connects.
+a dominant disconnect reason, internal-RAM headroom, link-uptime percentage, and slow connects.
+
+**A rule that always fires is worse than no rule.** The internal-RAM rule originally triggered below
+a 32 KB largest contiguous block. A healthy unit in the field runs with roughly **30 KB of internal
+RAM free in total**, so that threshold was arithmetically unreachable and the finding appeared on
+every report of every device — which does not warn anyone, it just teaches them to skip the findings
+panel. It is now `WD_LOW_BLOCK_BYTES` (4096), calibrated to what the driver needs (a Wi-Fi TX buffer
+is ~1.6 KB). Retune it against a measured device, never against intuition, and keep the page's red
+threshold equal to it — a host test pins the two together.
 
 Two of them exist because the code already told us where to look:
 
@@ -71,11 +79,19 @@ Two of them exist because the code already told us where to look:
   it time-slices. `wifi_mgr.h` already defines `WIFI_STA_AP_OVERLAP_BIT` for this condition — the
   sampler measures how much of the time it is actually true.
 
-The TCP window (`CONFIG_LWIP_TCP_SND_BUF_DEFAULT`, 5744 bytes = 4×MSS, the IDF default) is reported
-as a **fact in the report's stack-configuration section, not as a finding**. It is not a fault, but
-it is a hard ceiling on single-stream throughput — roughly window ÷ round-trip-time, about 2 Mbit/s
-at 20 ms RTT — and it is the first thing to check when a transfer is slow while signal, channel and
-power save all look healthy. Findings stay observations; this is a constant.
+The TCP window (`CONFIG_LWIP_TCP_SND_BUF_DEFAULT`) is reported as a **fact in the report's
+stack-configuration section, not as a finding**. It is not a fault, but it is a hard ceiling on
+single-stream throughput — roughly window ÷ round-trip-time — and it is worth knowing when a
+transfer is slow while signal, channel and power save all look healthy. Findings stay observations;
+this is a constant.
+
+> **Read the value from the right file.** This build uses the **committed `sdkconfig`**, where the
+> window is **20480** bytes (~8.2 Mbit/s at 20 ms RTT). It is *not* `sdkconfig.esp32s3`, which
+> carries the IDF default of 5744 and is not what the workflow builds — the build step says "uses
+> the committed sdkconfig as-is". An early version of this feature took the number from the wrong
+> file, concluded the window was a likely cause of slow transfers, and printed a hardcoded
+> "about 2 Mbit/s" sentence directly underneath the correct figure. The report now computes that
+> sentence from the macro so the two can never disagree again.
 
 ## Routes
 
@@ -99,6 +115,16 @@ The **JSON does not mask**. It renders on the user's own device showing their ow
 masking there would defeat the most common use — spotting that it joined the wrong SSID.
 
 The pre-shared key is never read by this component on any path, so no route can leak it.
+
+**Masking happens at render, never at emit.** Ring entries keep the SSID and BSSID in their own
+fields on `wd_evt_t`; the formatted text carries no identifier at all, and `wd_evt_render()` applies
+them masked or raw per request. This is structural rather than stylistic: the first version
+formatted identifiers straight into the entry text and the report printed the ring verbatim, so
+every timeline line published the network name and the router's full MAC beneath a header promising
+"masked — safe to paste in public". The failure was invisible at a glance, because the section that
+*is* masked sits fifty lines above the one that was not.
+`tools/webtest/wifi_diag.test.mjs` now fails if any `wd_evt_push()` format string so much as
+mentions an identifier.
 
 ## The page
 
@@ -129,7 +155,10 @@ and an `.html`:
 
 - the page's `rssiClass()` colour boundaries line up with `wd_hist_bucket()`'s histogram edges, so
   the page cannot paint a reading green while the report from the same device calls it weak;
-- the low-memory threshold (32 KB largest free block) is the same number in both places.
+- the low-memory threshold is the same number in both places, and is inside a sane range — a value
+  above the internal RAM a device actually has free would make the finding permanent;
+- no `wd_evt_push()` format string mentions an SSID or BSSID, which is what keeps the masked report
+  honest.
 
 ## Gotchas
 

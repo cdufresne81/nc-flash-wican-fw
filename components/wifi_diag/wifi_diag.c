@@ -66,6 +66,12 @@ static const char *TAG = "wifi_diag";
 // suppressed count is carried on the next line that does get through, so nothing is silently lost.
 #define WD_EVL_REPEAT_MS    60000
 
+// Largest-contiguous-internal-block level below which the Wi-Fi driver starts struggling to get a
+// transmit buffer (~1.6 KB each). Kept next to the other tunables because the UI paints the same
+// threshold red and tools/webtest/wifi_diag.test.mjs pins the two together -- change one and that
+// test fails by name rather than the page and the report quietly disagreeing on a live device.
+#define WD_LOW_BLOCK_BYTES  4096
+
 // RSSI histogram buckets, strongest first. Boundaries are the practical ones for 2.4 GHz:
 // -60 is comfortable, -70 starts costing rate, -80 is where 802.11n gives up.
 #define WD_HIST_N           5
@@ -147,10 +153,20 @@ static uint8_t  s_evl_last_reason;
 static uint32_t s_evl_suppressed;
 
 // Event ring.
+//
+// The SSID and BSSID are stored SEPARATELY from the formatted text, never baked into it. They are
+// the two fields the report masks, and masking can only happen at render time -- the same event has
+// to appear masked in the report (which gets pasted in public) and in full in the JSON (which the
+// owner reads on their own device). An earlier version formatted them straight into `text` and the
+// report dumped the ring verbatim, so every timeline line leaked the network name and the router's
+// full MAC under a header promising the opposite. Keep identifiers out of `text`.
 typedef struct {
     uint32_t seq;                   // 1-based; 0 = never written
     uint32_t up_s;                  // uptime seconds when it happened
-    char     text[WD_EVT_LINE_MAX];
+    char     text[WD_EVT_LINE_MAX]; // the event, WITHOUT any identifier
+    char     ssid[33];              // "" when the event carries none
+    uint8_t  bssid[6];
+    bool     has_bssid;
 } wd_evt_t;
 
 static wd_evt_t s_evt[WD_EVT_RING_N];
@@ -311,7 +327,8 @@ static void wd_mask_bssid(const uint8_t *b, char *out, size_t cap)
 
 // ---- Event ring --------------------------------------------------------------------------------
 
-static void wd_evt_push(const char *fmt, ...)
+// `ssid` may be NULL/empty and `bssid` may be NULL. Neither may appear in `fmt` -- see wd_evt_t.
+static void wd_evt_push(const char *ssid, const uint8_t *bssid, const char *fmt, ...)
 {
     char text[WD_EVT_LINE_MAX];
     va_list ap;
@@ -324,10 +341,51 @@ static void wd_evt_push(const char *fmt, ...)
     portENTER_CRITICAL(&s_lock);
     uint32_t idx = s_evt_head % WD_EVT_RING_N;
     strlcpy(s_evt[idx].text, text, sizeof(s_evt[idx].text));
+    strlcpy(s_evt[idx].ssid, (ssid != NULL) ? ssid : "", sizeof(s_evt[idx].ssid));
+    s_evt[idx].has_bssid = (bssid != NULL);
+    if (bssid != NULL) memcpy(s_evt[idx].bssid, bssid, 6);
     s_evt[idx].up_s = up;
     s_evt_head++;
     s_evt[idx].seq = s_evt_head;
     portEXIT_CRITICAL(&s_lock);
+}
+
+// Render one ring entry as a display line. `raw` shows identifiers in full; otherwise they are
+// masked exactly as the RADIO section masks them, so a report cannot disagree with its own header.
+static void wd_evt_render(const wd_evt_t *e, bool raw, char *out, size_t cap)
+{
+    char id[64] = "";
+    if (e->ssid[0] != '\0')
+    {
+        if (raw)
+        {
+            snprintf(id, sizeof(id), " ssid='%s'", e->ssid);
+        }
+        else
+        {
+            char m[48];
+            wd_mask_ssid(e->ssid, m, sizeof(m));
+            snprintf(id, sizeof(id), " ssid=%s", m);
+        }
+    }
+
+    char bs[32] = "";
+    if (e->has_bssid)
+    {
+        if (raw)
+        {
+            snprintf(bs, sizeof(bs), " bssid=%02X:%02X:%02X:%02X:%02X:%02X",
+                     e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5]);
+        }
+        else
+        {
+            char m[24];
+            wd_mask_bssid(e->bssid, m, sizeof(m));
+            snprintf(bs, sizeof(bs), " bssid=%s", m);
+        }
+    }
+
+    snprintf(out, cap, "%s%s%s", e->text, id, bs);
 }
 
 static void wd_tally_add(uint8_t reason)
@@ -362,7 +420,7 @@ void wifi_diag_note_attempt(const char *ssid)
     s_attempt_start_ms = wd_up_ms();
     portEXIT_CRITICAL(&s_lock);
 
-    wd_evt_push("attempt   ssid='%s'", s);
+    wd_evt_push(s, NULL, "attempt  ");
     // Chatty by nature: a failing device retries every few seconds. Ring-only unless debug is on.
     EVENT_LOG_DEBUG(EVL_WIFI, "attempt ssid='%s'", s);
 }
@@ -370,18 +428,12 @@ void wifi_diag_note_attempt(const char *ssid)
 void wifi_diag_note_connected(const char *ssid, const uint8_t *bssid, uint8_t channel)
 {
     const char *s = (ssid != NULL) ? ssid : "";
-    char bs[20] = "??:??:??:??:??:??";
-    if (bssid != NULL)
-    {
-        snprintf(bs, sizeof(bs), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-    }
 
     portENTER_CRITICAL(&s_lock);
     s_connects++;
     portEXIT_CRITICAL(&s_lock);
 
-    wd_evt_push("associate ssid='%s' bssid=%s ch=%u", s, bs, (unsigned)channel);
+    wd_evt_push(s, bssid, "associate ch=%u", (unsigned)channel);
     event_log_emit(EVL_WIFI, "associated ssid='%s' ch=%u", s, (unsigned)channel);
 }
 
@@ -405,15 +457,18 @@ void wifi_diag_note_got_ip(const char *ip)
     if (ip != NULL) strlcpy(s_ip, ip, sizeof(s_ip));
     portEXIT_CRITICAL(&s_lock);
 
+    // The local IP is not masked anywhere: it is an RFC1918 address handed out by the user's own
+    // router and says nothing about who or where they are, while being one of the more useful
+    // things in a report (a 169.254 address is a whole diagnosis on its own).
     if (ttc != 0)
     {
-        wd_evt_push("got IP    %s after %u ms", (ip != NULL) ? ip : "?", (unsigned)ttc);
+        wd_evt_push(NULL, NULL, "got IP    %s after %u ms", (ip != NULL) ? ip : "?", (unsigned)ttc);
         event_log_emit(EVL_WIFI, "got IP %s (connect took %u ms)",
                        (ip != NULL) ? ip : "?", (unsigned)ttc);
     }
     else
     {
-        wd_evt_push("got IP    %s", (ip != NULL) ? ip : "?");
+        wd_evt_push(NULL, NULL, "got IP    %s", (ip != NULL) ? ip : "?");
         event_log_emit(EVL_WIFI, "got IP %s", (ip != NULL) ? ip : "?");
     }
 }
@@ -468,12 +523,12 @@ void wifi_diag_note_disconnected(const char *ssid, uint8_t reason)
 
     if (link_was_up)
     {
-        wd_evt_push("DROP      reason=%u rssi=%d held=%us ssid='%s'",
-                    (unsigned)reason, (int)rssi_at_drop, (unsigned)held_s, s);
+        wd_evt_push(s, NULL, "DROP      reason=%u rssi=%d held=%us",
+                    (unsigned)reason, (int)rssi_at_drop, (unsigned)held_s);
     }
     else
     {
-        wd_evt_push("DROP      reason=%u (never associated) ssid='%s'", (unsigned)reason, s);
+        wd_evt_push(s, NULL, "DROP      reason=%u (never associated)", (unsigned)reason);
     }
 
     if (emit_evl)
@@ -503,7 +558,7 @@ void wifi_diag_note_ban(const char *ssid, uint32_t ms)
     s_bans++;
     portEXIT_CRITICAL(&s_lock);
 
-    wd_evt_push("BAN       ssid='%s' for %us", s, (unsigned)(ms / 1000));
+    wd_evt_push(s, NULL, "BAN       for %us", (unsigned)(ms / 1000));
     // Always logged: a banned SSID is invisible everywhere else and presents to the user as an
     // unexplained refusal to connect.
     event_log_emit(EVL_WIFI, "SSID '%s' banned for %us after repeated auth failures",
@@ -584,6 +639,14 @@ static void wd_sample_once(void)
         {
             int64_t d = wd_up_ms() - s_session_start_ms;
             s_session_current_s = (d > 0) ? (uint32_t)(d / 1000) : 0;
+            // Keep the maximum live rather than only closing it out on disconnect. Updating it
+            // solely in the disconnect handler meant a device that never dropped reported
+            // "longest 0 s" forever -- which reads as "it never stayed connected", the exact
+            // opposite of what it means.
+            if (s_session_current_s > s_session_longest_s)
+            {
+                s_session_longest_s = s_session_current_s;
+            }
         }
     }
     else
@@ -730,12 +793,21 @@ static int wd_findings(wd_finding_t *out, int max)
         }
     }
 
-    if (block_min != UINT32_MAX && block_min < 32768)
+    // Calibrated against what the Wi-Fi driver actually needs, NOT against a round number. A TX
+    // buffer is ~1.6 KB, so trouble starts when the largest contiguous block can no longer hold a
+    // couple of them; below WD_LOW_BLOCK_BYTES is where that begins to bite.
+    //
+    // This first shipped as "< 32768", which was worse than wrong: a healthy unit in the field runs
+    // with roughly 30 KB of internal RAM free IN TOTAL, so a 32 KB contiguous block is arithmetically
+    // impossible and the rule fired on every device, forever. A finding that always fires carries no
+    // information -- it just teaches people to ignore the findings panel. If this needs retuning
+    // again, tune it against a measured device, not against intuition.
+    if (block_min != UINT32_MAX && block_min < WD_LOW_BLOCK_BYTES)
     {
-        WD_ADD('W', "Largest contiguous internal-RAM block fell to %u bytes. Wi-Fi transmit buffers "
-                    "are allocated from internal RAM on demand, so once this gets low the driver "
-                    "starts failing transmits and throughput collapses in bursts.",
-                    (unsigned)block_min);
+        WD_ADD('W', "Largest contiguous internal-RAM block fell to %u bytes, below the %u needed to "
+                    "reliably hand the Wi-Fi driver transmit buffers. Expect throughput to collapse "
+                    "in bursts rather than degrade smoothly.",
+                    (unsigned)block_min, (unsigned)WD_LOW_BLOCK_BYTES);
     }
 
     if (samples >= 120 && samples_up * 100 / samples < 90)
@@ -870,7 +942,15 @@ static esp_err_t wd_send_report(httpd_req_t *req)
     ttc_last = s_ttc_last_ms;     ttc_sum = s_ttc_sum_ms;         ttc_n = s_ttc_n;
     ifree_min = s_int_free_min;   iblock_min = s_int_block_min;
     rssi_sum = s_rssi_sum;        rssi_min = s_rssi_min;          rssi_max = s_rssi_max;
+    // Add the session still open, for the same reason as s_session_longest_s above: this total is
+    // only banked on disconnect, so without this a device that has never dropped reports having
+    // been connected for zero seconds while it is connected right now.
     connected_total = s_connected_ms_total;
+    if (s_session_start_ms != 0)
+    {
+        int64_t live = wd_up_ms() - s_session_start_ms;
+        if (live > 0) connected_total += live;
+    }
     last_reason = s_last_reason;  last_reason_up = s_last_reason_up_s;  had_disc = s_had_disconnect;
     memcpy(hist, s_rssi_hist, sizeof(hist));
     memcpy(tally, s_tally, sizeof(tally));
@@ -1008,12 +1088,26 @@ static esp_err_t wd_send_report(httpd_req_t *req)
 
     wd_pf(&o, "\nMEMORY (internal RAM -- where Wi-Fi TX buffers come from)\n"
               "--------------------------------------------------------\n");
-    wd_pf(&o, "free now / lowest seen        : %u / %u bytes\n",
-          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-          (ifree_min == UINT32_MAX) ? 0u : (unsigned)ifree_min);
-    wd_pf(&o, "largest block now / lowest    : %u / %u bytes\n",
-          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-          (iblock_min == UINT32_MAX) ? 0u : (unsigned)iblock_min);
+    {
+        // "now" is read while this request is in flight, so it includes the memory httpd and this
+        // handler's own buffer are holding -- which is how the report could print a "lowest seen"
+        // HIGHER than "now" and contradict itself. Fold the live reading into the minimum first:
+        // it is a real observation, it just happens to be one the 1 Hz sampler never sees.
+        uint32_t ifree_now = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        uint32_t iblock_now = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        portENTER_CRITICAL(&s_lock);
+        if (ifree_now < s_int_free_min)   s_int_free_min = ifree_now;
+        if (iblock_now < s_int_block_min) s_int_block_min = iblock_now;
+        ifree_min = s_int_free_min;
+        iblock_min = s_int_block_min;
+        portEXIT_CRITICAL(&s_lock);
+
+        wd_pf(&o, "free now / lowest seen        : %u / %u bytes\n",
+              (unsigned)ifree_now, (unsigned)ifree_min);
+        wd_pf(&o, "largest block now / lowest    : %u / %u bytes\n",
+              (unsigned)iblock_now, (unsigned)iblock_min);
+        wd_pf(&o, "  (measured while serving this report, so it counts this request's own buffers)\n");
+    }
 
     wd_pf(&o, "\nSTACK CONFIGURATION (build-time, same on every unit)\n"
               "---------------------------------------------------\n");
@@ -1024,8 +1118,16 @@ static esp_err_t wd_send_report(httpd_req_t *req)
           (unsigned)CONFIG_LWIP_TCP_SND_BUF_DEFAULT);
     wd_pf(&o, "tcp recv window   : %u bytes (CONFIG_LWIP_TCP_WND_DEFAULT)\n",
           (unsigned)CONFIG_LWIP_TCP_WND_DEFAULT);
-    wd_pf(&o, "  A window this size caps one TCP stream at roughly window/round-trip-time. At 20 ms\n"
-              "  round trip that is about 2 Mbit/s no matter how strong the signal is.\n");
+    {
+        // Computed, never written out as prose. This line used to say a flat "about 2 Mbit/s",
+        // which was derived by hand from sdkconfig.esp32s3 (5744) -- the wrong file. The build
+        // uses the committed sdkconfig, where the window is 20480, so the sentence understated the
+        // real ceiling by more than 3x while sitting directly beneath the correct number.
+        uint32_t bps = (uint32_t)CONFIG_LWIP_TCP_SND_BUF_DEFAULT * 8u * 50u;   /* 20 ms RTT */
+        wd_pf(&o, "  A window this size caps one TCP stream at roughly window/round-trip-time:\n"
+                  "  about %u.%02u Mbit/s at 20 ms round trip, no matter how strong the signal is.\n",
+              (unsigned)(bps / 1000000u), (unsigned)((bps % 1000000u) / 10000u));
+    }
 
     wd_pf(&o, "\nEVENT TIMELINE (most recent last)\n---------------------------------\n");
     {
@@ -1041,19 +1143,18 @@ static esp_err_t wd_send_report(httpd_req_t *req)
         for (uint32_t i = 0; i < count; i++)
         {
             uint32_t s = head - count + i;
-            char line[WD_EVT_LINE_MAX];
-            uint32_t up_s = 0;
+            wd_evt_t e;
             bool valid;
             portENTER_CRITICAL(&s_lock);
             valid = (s_evt[s % WD_EVT_RING_N].seq == s + 1);
-            if (valid)
-            {
-                strlcpy(line, s_evt[s % WD_EVT_RING_N].text, sizeof(line));
-                up_s = s_evt[s % WD_EVT_RING_N].up_s;
-            }
+            if (valid) e = s_evt[s % WD_EVT_RING_N];
             portEXIT_CRITICAL(&s_lock);
             if (!valid) continue;
-            wd_pf(&o, "  [%6us] %s\n", (unsigned)up_s, line);
+            // Masked unless ?raw=1, matching this report's own header. The timeline is the one
+            // place identifiers could sneak past the mask, so it renders through the same helper.
+            char line[WD_EVT_LINE_MAX + 96];
+            wd_evt_render(&e, raw, line, sizeof(line));
+            wd_pf(&o, "  [%6us] %s\n", (unsigned)e.up_s, line);
         }
     }
 
@@ -1238,19 +1339,17 @@ static esp_err_t wd_send_json(httpd_req_t *req)
         for (uint32_t i = 0; i < count; i++)
         {
             uint32_t s = head - count + i;
-            char line[WD_EVT_LINE_MAX];
-            uint32_t up_s = 0;
+            wd_evt_t e;
             bool valid;
             portENTER_CRITICAL(&s_lock);
             valid = (s_evt[s % WD_EVT_RING_N].seq == s + 1);
-            if (valid)
-            {
-                strlcpy(line, s_evt[s % WD_EVT_RING_N].text, sizeof(line));
-                up_s = s_evt[s % WD_EVT_RING_N].up_s;
-            }
+            if (valid) e = s_evt[s % WD_EVT_RING_N];
             portEXIT_CRITICAL(&s_lock);
             if (!valid) continue;
-            wd_pf(&o, "%s{\"up_s\":%u,\"text\":", first ? "" : ",", (unsigned)up_s);
+            // Unmasked here, like the rest of the JSON: it renders on the owner's own device.
+            char line[WD_EVT_LINE_MAX + 96];
+            wd_evt_render(&e, true, line, sizeof(line));
+            wd_pf(&o, "%s{\"up_s\":%u,\"text\":", first ? "" : ",", (unsigned)e.up_s);
             wd_json_str(&o, line);
             wd_pf(&o, "}");
             first = false;

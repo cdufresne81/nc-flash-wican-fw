@@ -124,14 +124,56 @@ test('page and firmware agree on what counts as a weak signal', () => {
     assert.equal(rssiClass(edges[2] - 1), 'bad');
 });
 
-test('the low-memory threshold is the same number in both places', () => {
-    // The page paints "largest block" red below 32 KB; the firmware raises a finding at the same
-    // point. Two different numbers here would mean the page and the report disagree about whether
-    // the device is short of the internal RAM its Wi-Fi transmit buffers come from.
+test('the event timeline cannot leak identifiers into a masked report', () => {
+    // The report's header promises "masked -- safe to paste in public", and the RADIO section keeps
+    // that promise. The EVENT TIMELINE did not: identifiers were formatted into each ring entry at
+    // emit time, and the report printed the ring verbatim, so every timeline line carried the full
+    // SSID and the router's full BSSID under a header saying otherwise.
+    //
+    // The fix is structural -- identifiers live in their own fields on wd_evt_t and are applied by
+    // wd_evt_render(), which masks unless raw. This test pins the structure, because the failure is
+    // silent: the report still looks masked at a glance, since the leak is fifty lines below the
+    // part that is masked correctly.
     const c = readFileSync(IMPL, 'utf8');
-    assert.ok(/block_min != UINT32_MAX && block_min < 32768/.test(c),
-        'the low-memory finding threshold moved in wifi_diag.c; update wifi_diag.html to match');
+
+    const pushes = [...c.matchAll(/wd_evt_push\(([^;]*?)\);/gs)].map(m => m[1]);
+    assert.ok(pushes.length >= 5, `expected the wd_evt_push() call sites, found ${pushes.length}`);
+    for (const args of pushes) {
+        // Everything from the third argument on is the format string and its arguments.
+        const fmt = args.slice(args.indexOf(',', args.indexOf(',') + 1) + 1);
+        assert.ok(!/ssid|bssid/i.test(fmt),
+            `a wd_evt_push() format string mentions an identifier: ${fmt.trim().slice(0, 80)}. ` +
+            `Pass it as the ssid/bssid argument instead, or it will bypass masking.`);
+    }
+
+    assert.ok(/wd_evt_render\(&e, raw,/.test(c),
+        'the report timeline must render through wd_evt_render() with the request\'s raw flag');
+    assert.ok(/wd_evt_render\(&e, true,/.test(c),
+        'the JSON timeline should render unmasked -- it is read on the owner\'s own device');
+});
+
+test('the low-memory threshold is the same number in both places', () => {
+    // The page paints "largest block" red below WD_LOW_BLOCK_BYTES; the firmware raises a finding
+    // at the same point. Two different numbers would mean the page and the report disagree about
+    // whether the device is short of the internal RAM its Wi-Fi transmit buffers come from.
+    //
+    // This threshold was 32768 when the feature first shipped, which no healthy unit could ever
+    // satisfy -- a device in the field runs with ~30 KB of internal RAM free in total, so the
+    // finding fired on every report and the page painted permanently red. Read the value rather
+    // than hardcoding it here, so a future retune only has to touch the two source files.
+    const c = readFileSync(IMPL, 'utf8');
+    const def = c.match(/#define WD_LOW_BLOCK_BYTES\s+(\d+)/);
+    assert.ok(def, 'WD_LOW_BLOCK_BYTES not found in wifi_diag.c -- did it get renamed?');
+    const limit = Number(def[1]);
+
+    assert.ok(limit >= 2048 && limit < 30000,
+        `WD_LOW_BLOCK_BYTES is ${limit}: it must exceed a couple of ~1.6 KB TX buffers, and must ` +
+        `stay well under the ~30 KB of internal RAM a healthy device has free in total -- ` +
+        `otherwise the finding can never stop firing`);
+    assert.ok(new RegExp(`block_min < WD_LOW_BLOCK_BYTES`).test(c),
+        'the low-memory finding no longer compares against WD_LOW_BLOCK_BYTES');
+
     const html = readFileSync(PAGE, 'utf8');
-    assert.ok(/int_block < 32768/.test(html) && /int_block_min < 32768/.test(html),
-        'wifi_diag.html no longer flags a largest-free-block below 32768');
+    assert.ok(html.includes(`int_block < ${limit}`) && html.includes(`int_block_min < ${limit}`),
+        `wifi_diag.html must flag a largest-free-block below ${limit} to match WD_LOW_BLOCK_BYTES`);
 });
