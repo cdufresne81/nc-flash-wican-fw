@@ -128,17 +128,26 @@ typedef float (*csv_rate_fn_t)(void);
 void csv_logger_set_rate_fn(csv_rate_fn_t fn);
 
 /**
- * @brief Start the CSV datalogger AFTER boot settles (deferred ~20s).
+ * @brief Start the CSV datalogger at boot, crash-guard gated.
  *
- * Call this at boot instead of csv_logger_init(); it spawns a small task that waits,
- * then calls csv_logger_init() once. The wait is a modest settle margin (the historical
- * boot crash was a task-publish race in csv_logger_init(), now fixed). A one-shot RTC
- * guard skips CSV for a single boot if a startup attempt ever fails to stabilize, so a
- * CSV-startup fault can never boot-loop the device.
+ * Call this at boot instead of csv_logger_init(). It brings the writer up INLINE -- no
+ * task is spawned on the normal path -- and holds off only the writer's FIRST file open
+ * (CSV_LOGGER_OPEN_HOLDOFF_MS), so the device reports a running datalogger and an honest
+ * countdown from t=0 rather than looking broken while it waits.
+ *
+ * Safe to call from app_main at priority 1 even though the writer runs at 4: the writer
+ * cannot observe a NULL queue because csv_logger_init() publishes the queue BEFORE
+ * creating the task. (That publish race, not any settling requirement, was the historical
+ * "boot crash" -- which is why the priority note on csv_logger_set_manual_override() below
+ * no longer applies here.)
+ *
+ * If the RTC guard shows the previous attempt did not survive its first
+ * CSV_GUARD_STABLE_US, bring-up is skipped, with one delayed retry before it gives up for
+ * the boot -- see csv_bringup_logic.h for the chain and its boot-loop bound.
  */
-void csv_logger_init_deferred(void);
+void csv_logger_start_at_boot(void);
 
-/* True when the RTC crash-guard made csv_logger_init_deferred() skip CSV auto-start on this boot.
+/* True when the RTC crash-guard made csv_logger_start_at_boot() skip CSV auto-start on this boot.
  * See poll_log_bringup_skipped(). */
 bool csv_logger_bringup_skipped(void);
 

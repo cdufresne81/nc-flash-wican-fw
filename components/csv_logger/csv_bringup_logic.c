@@ -23,13 +23,8 @@
 
 #include "csv_bringup_logic.h"
 
-csv_bringup_decision_t csv_bringup_decide(uint32_t *guard, uint32_t *skip_count)
+csv_bringup_decision_t csv_bringup_decide(uint32_t *guard, uint32_t *skip_count, bool *skipped)
 {
-    if (guard == NULL || skip_count == NULL)
-    {
-        return CSV_BRINGUP_SKIP_FINAL;   /* caller bug: fail to the safest answer */
-    }
-
     if (*guard == CSV_ATTEMPT_MAGIC)
     {
         /* The previous attempt armed this and never lived long enough to clear it.
@@ -46,6 +41,7 @@ csv_bringup_decision_t csv_bringup_decide(uint32_t *guard, uint32_t *skip_count)
         n++;
         *skip_count = n;
 
+        *skipped = true;
         return (n < CSV_BRINGUP_MAX_SKIPS) ? CSV_BRINGUP_SKIP_RETRY : CSV_BRINGUP_SKIP_FINAL;
     }
 
@@ -56,22 +52,14 @@ csv_bringup_decision_t csv_bringup_decide(uint32_t *guard, uint32_t *skip_count)
 
 void csv_bringup_arm_retry(uint32_t *guard)
 {
-    if (guard != NULL)
-    {
-        *guard = CSV_ATTEMPT_MAGIC;
-    }
+    *guard = CSV_ATTEMPT_MAGIC;
 }
 
-void csv_bringup_mark_stable(uint32_t *guard, uint32_t *skip_count)
+void csv_bringup_mark_stable(uint32_t *guard, uint32_t *skip_count, bool *skipped)
 {
-    if (guard != NULL)
-    {
-        *guard = 0;
-    }
-    if (skip_count != NULL)
-    {
-        *skip_count = 0;
-    }
+    *guard = 0;
+    *skip_count = 0;
+    *skipped = false;
 }
 
 bool csv_guard_clear_due(int64_t now_us, int64_t task_start_us)
@@ -79,11 +67,9 @@ bool csv_guard_clear_due(int64_t now_us, int64_t task_start_us)
     return (now_us - task_start_us) > CSV_GUARD_STABLE_US;
 }
 
-int8_t csv_manual_mode_next(int8_t mode, bool ign_was_on, bool ign_now_on, bool datalog_parked)
+int8_t csv_manual_mode_next(int8_t mode, bool ignition_on, bool datalog_parked)
 {
-    const bool ignition_off_edge = ign_was_on && !ign_now_on;
-
-    if (mode == CSV_MANUAL_OFF && ignition_off_edge && !datalog_parked)
+    if (mode == CSV_MANUAL_OFF && !ignition_on && !datalog_parked)
     {
         return CSV_MANUAL_AUTO;
     }

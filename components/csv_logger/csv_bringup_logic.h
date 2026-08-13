@@ -36,7 +36,6 @@
  */
 
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 
 /* ---- Manual override modes (web Start/Stop) --------------------------------
@@ -66,7 +65,8 @@ typedef enum
     CSV_BRINGUP_SKIP_FINAL,  /* it died again: no auto-start this uptime, no more retries */
 } csv_bringup_decision_t;
 
-/* The boot-time bring-up decision. Mutates both RTC words in place.
+/* The boot-time bring-up decision. Mutates the two RTC words and the skipped flag in
+ * place -- every transition of this state machine happens in here.
  *
  * BOOT-LOOP BOUND (do not weaken): a deterministic CSV-init crash produces
  * START -> (crash) -> SKIP_RETRY -> (retry crashes) -> SKIP_FINAL, and stops. The device
@@ -79,31 +79,43 @@ typedef enum
  * power-up, since a cold boot cannot find the magic and therefore always takes START.
  * The clamp is belt-and-braces for the astronomically unlikely cold boot whose garbage
  * guard word happens to BE the magic. */
-csv_bringup_decision_t csv_bringup_decide(uint32_t *guard, uint32_t *skip_count);
+csv_bringup_decision_t csv_bringup_decide(uint32_t *guard, uint32_t *skip_count, bool *skipped);
 
 /* Re-arm the guard immediately before the delayed retry attempt. Deliberately does NOT
  * touch the skip count: the count is what bounds the retries, so the retry must not be
  * able to reset its own bound. */
 void csv_bringup_arm_retry(uint32_t *guard);
 
-/* Clear both words after the writer has proven stable. The single place either word is
- * allowed to be cleared outside csv_bringup_decide(). */
-void csv_bringup_mark_stable(uint32_t *guard, uint32_t *skip_count);
+/* Clear the whole chain after the writer has proven stable. The single place any of these
+ * is allowed to be cleared outside csv_bringup_decide().
+ *
+ * `skipped` is the third word of this state machine, not an afterthought: it is what
+ * sleep_mode_recovery_needed() reads to route a wake to the reboot repair channel instead
+ * of resuming in place. It moves with the other two so no edit can clear the RTC pair and
+ * leave a device resuming in place with a dead datalogger -- and so the host tests can
+ * assert on it. */
+void csv_bringup_mark_stable(uint32_t *guard, uint32_t *skip_count, bool *skipped);
 
 /* Has the writer run long enough for the crash guard to be considered proven? */
 bool csv_guard_clear_due(int64_t now_us, int64_t task_start_us);
 
-/* The manual override mode for the next writer pass, given a debounced ignition edge.
+/* The manual override mode for the next writer pass.
  *
  * A manual Stop means "stop this trip", not "disable auto-logging until someone reboots":
- * it is cleared back to AUTO when the ignition goes off, so the next key-on records
- * normally. FORCE_ON is deliberately untouched -- bench work relies on it surviving a
- * voltage that flaps across the ignition threshold.
+ * it clears back to AUTO once the ignition is off, so the next key-on records normally.
+ * FORCE_ON is deliberately untouched -- bench work relies on it surviving a voltage that
+ * flaps across the ignition threshold.
  *
- * datalog_parked is a HARD exclusion: while a host holds the datalog park lease, the
+ * A LEVEL rule, not an edge one, and that distinction is load-bearing: an edge-triggered
+ * clear is consumed by the single ignition-off transition it sees, so if that transition
+ * lands while a host holds the park lease the override never clears and Stop latches until
+ * reboot again -- the original bug, narrowed rather than fixed. As a level, the clear
+ * simply happens on the next pass after the exclusion lifts.
+ *
+ * datalog_parked is a HARD exclusion: while a host holds the datalog park lease the
  * forced-off state belongs to that host session and only datalog_restore_mode() may lift
  * it. An ignition cycle mid-flash must never restart the producer under a host. */
-int8_t csv_manual_mode_next(int8_t mode, bool ign_was_on, bool ign_now_on, bool datalog_parked);
+int8_t csv_manual_mode_next(int8_t mode, bool ignition_on, bool datalog_parked);
 
 /* The logging gate, verbatim. Extracted only so the host tests can pin it: the v1.18
  * investigation cleared this expression, so any change to its truth table is a

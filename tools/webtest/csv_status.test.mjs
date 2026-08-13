@@ -1,10 +1,8 @@
 // The recorder card's auto-start label.
 //
-// Why this is tested at all: a customer's datalogger looked identical in the UI whether it
-// was still starting up (a 20 s boot holdoff), had had its bring-up skipped by the RTC
-// crash guard, or was genuinely broken -- all three read "Idle". He rebooted to fix the
-// "broken" one, which armed the guard, which caused the real failure. The firmware now
-// reports an autostart state; this is the half that has to say it out loud.
+// Three different situations used to render identically as "Idle", and a user acting on
+// that ambiguity caused a real field failure -- see docs/internals/csv_logger.md. The
+// firmware now reports an autostart state; this is the half that says it out loud.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -34,6 +32,15 @@ test('the boot holdoff counts down in whole seconds, rounding up', () => {
     // Missing/!=number countdown must not render NaN.
     assert.deepEqual(plain(csvAutostartLabel({ autostart: 'holdoff' })),
                      { text: 'Starting in 0s', warn: false });
+});
+
+test('a writer that failed to start is distinct from a guard skip', () => {
+    // Different cause, different recovery: "power-cycle to clear the RTC guard" is the
+    // wrong advice for an out-of-memory start failure, so the two must not share a label.
+    const u = csvAutostartLabel({ autostart: 'unavailable' });
+    assert.equal(u.warn, true);
+    assert.match(u.text, /did not start/);
+    assert.notEqual(u.text, csvAutostartLabel({ autostart: 'skipped' }).text);
 });
 
 test('a skipped bring-up is a warning, and says whether it will retry', () => {

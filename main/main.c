@@ -896,17 +896,12 @@ void app_main(void)
 		// #if HARDWARE_VER != WICAN_PRO
 		// can_enable();
 		// #endif
-		// CSV datalogger: start the writer here when enabled. It comes up immediately;
-		// only its FIRST file open is held off (CSV_LOGGER_OPEN_HOLDOFF_MS), so records
-		// queue from t=0 and /csv_status reports an honest countdown instead of looking
-		// broken for 20 s -- which is what this used to do, and what cost a customer his
-		// logging. An RTC guard skips bring-up if a previous attempt did not survive its
-		// first 15 s, with one delayed retry before it gives up for the boot; it can never
-		// boot-loop. Explicit '== 1' so a garbage csv_log value can NEVER enable the
-		// logger via bool coercion.
+		// CSV datalogger: brings the writer up inline and holds off only its first file
+		// open -- see CSV_LOGGER_OPEN_HOLDOFF_MS and csv_bringup_logic.h. Explicit '== 1'
+		// so a garbage csv_log value can NEVER enable the logger via bool coercion.
 		if(config_server_get_csv_log() == 1)
 		{
-			csv_logger_init_deferred();
+			csv_logger_start_at_boot();
 		}
 		autopid_init((char*)&uid[0]);
 	}
@@ -924,7 +919,7 @@ void app_main(void)
 		}
 		if(config_server_get_csv_log() == 1)
 		{
-			csv_logger_init_deferred();
+			csv_logger_start_at_boot();
 		}
 		fast_log_init((char*)&uid[0], log_period);
 	}
@@ -941,7 +936,7 @@ void app_main(void)
 		}
 		if(config_server_get_csv_log() == 1)
 		{
-			csv_logger_init_deferred();
+			csv_logger_start_at_boot();
 		}
 		poll_log_init((char*)&uid[0], log_period);
 	}

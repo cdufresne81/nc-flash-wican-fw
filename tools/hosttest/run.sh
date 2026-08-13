@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and run the C host tests.
 #
-# These cover the decision logic that used to be unreachable from any test: the CSV
+# Covers the decision logic that used to be unreachable from any test: the CSV
 # datalogger's RTC crash-guard bring-up chain, the manual-override lifetime and the
 # logging gate. Everything under test lives in components/csv_logger/csv_bringup_logic.c,
 # which is deliberately free of ESP-IDF includes so a stock compiler can build it.

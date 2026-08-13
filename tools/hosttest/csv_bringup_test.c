@@ -63,8 +63,9 @@ static void t1_reboot_inside_guard_window(void)
      * this boot starts normally and launders both words. */
     uint32_t guard = 0xDEADBEEFu;
     uint32_t skips = 0x5A5A5A5Au;
+    bool skipped = false;
 
-    CHECK(csv_bringup_decide(&guard, &skips) == CSV_BRINGUP_START,
+    CHECK(csv_bringup_decide(&guard, &skips, &skipped) == CSV_BRINGUP_START,
           "a cold boot brings CSV up");
     CHECK(guard == CSV_ATTEMPT_MAGIC, "the attempt arms the guard");
     CHECK(skips == 0, "a normal start launders the cold-boot skip count");
@@ -78,11 +79,14 @@ static void t1_reboot_inside_guard_window(void)
     /* The next boot finds it armed. Skipping this boot's auto-start is correct -- the
      * previous attempt genuinely did not survive. Losing the ENTIRE uptime is not: this
      * is the assertion that fails before the fix, because there was no retry at all. */
-    const csv_bringup_decision_t d = csv_bringup_decide(&guard, &skips);
+    const csv_bringup_decision_t d = csv_bringup_decide(&guard, &skips, &skipped);
     CHECK(d == CSV_BRINGUP_SKIP_RETRY,
           "a first skip schedules a retry instead of forfeiting the uptime");
     CHECK(skips == 1, "the skip is counted");
     CHECK(guard == 0, "the skip disarms the guard so the next boot is clean");
+    /* sleep_mode_recovery_needed() reads this: while it is set, every wake takes the
+     * reboot repair path rather than resuming in place with a dead datalogger. */
+    CHECK(skipped == true, "the skip is visible to the sleep resume path");
 
     /* The delayed retry re-arms and this time the writer survives: both words clear and
      * the device is back to normal without a power cycle -- the whole point. */
@@ -90,8 +94,9 @@ static void t1_reboot_inside_guard_window(void)
     CHECK(guard == CSV_ATTEMPT_MAGIC, "the retry re-arms the guard before attempting");
     CHECK(csv_guard_clear_due(16 * 1000000LL, 0) == true,
           "16 s of writer uptime proves stability");
-    csv_bringup_mark_stable(&guard, &skips);
-    CHECK(guard == 0 && skips == 0, "a proven writer clears the whole chain");
+    csv_bringup_mark_stable(&guard, &skips, &skipped);
+    CHECK(guard == 0 && skips == 0 && skipped == false,
+          "a proven writer clears the whole chain, sleep flag included");
 }
 
 /* ---------------------------------------------------------------------------
@@ -103,27 +108,29 @@ static void t2_boot_loop_is_still_bounded(void)
 
     uint32_t guard = 0;
     uint32_t skips = 0;
+    bool skipped = false;
 
-    CHECK(csv_bringup_decide(&guard, &skips) == CSV_BRINGUP_START, "first attempt runs");
+    CHECK(csv_bringup_decide(&guard, &skips, &skipped) == CSV_BRINGUP_START,
+          "first attempt runs");
 
     /* It crashes before proving stable, so the guard stays armed. */
-    CHECK(csv_bringup_decide(&guard, &skips) == CSV_BRINGUP_SKIP_RETRY,
+    CHECK(csv_bringup_decide(&guard, &skips, &skipped) == CSV_BRINGUP_SKIP_RETRY,
           "the first crash earns one retry");
 
     /* The retry crashes too. */
     csv_bringup_arm_retry(&guard);
-    CHECK(csv_bringup_decide(&guard, &skips) == CSV_BRINGUP_SKIP_FINAL,
+    CHECK(csv_bringup_decide(&guard, &skips, &skipped) == CSV_BRINGUP_SKIP_FINAL,
           "the second crash ends the chain for this uptime");
     CHECK(skips == CSV_BRINGUP_MAX_SKIPS, "the bound is the skip count, not a timer");
 
     /* And it stays ended -- no third attempt. */
     csv_bringup_arm_retry(&guard);
-    CHECK(csv_bringup_decide(&guard, &skips) == CSV_BRINGUP_SKIP_FINAL,
+    CHECK(csv_bringup_decide(&guard, &skips, &skipped) == CSV_BRINGUP_SKIP_FINAL,
           "no third attempt");
 
     /* One stable run resets the chain, so a device that recovers is not punished. */
-    csv_bringup_mark_stable(&guard, &skips);
-    CHECK(csv_bringup_decide(&guard, &skips) == CSV_BRINGUP_START,
+    csv_bringup_mark_stable(&guard, &skips, &skipped);
+    CHECK(csv_bringup_decide(&guard, &skips, &skipped) == CSV_BRINGUP_START,
           "a proven-stable run restores normal bring-up");
 }
 
@@ -136,24 +143,32 @@ static void t3_manual_stop_is_per_trip(void)
 {
     banner("T3: manual Stop ends the trip, it does not disable auto-logging");
 
-    /* The ignition goes off after a manual Stop -> the override clears itself. */
-    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, true, false, false) == CSV_MANUAL_AUTO,
+    /* Ignition off after a manual Stop -> the override clears itself. */
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, false, false) == CSV_MANUAL_AUTO,
           "ignition-off clears a manual Stop");
 
     /* ...so the next key-on records, which is what did not happen at 12:44:20. */
     CHECK(csv_logging_active(false, CSV_MANUAL_AUTO, true, true) == true,
           "the next trip records normally");
 
-    /* Guards that must hold before and after the fix. */
-    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, true, true, false) == CSV_MANUAL_OFF,
-          "Stop holds for the rest of the trip it stopped");
-    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, false, false, false) == CSV_MANUAL_OFF,
-          "no ignition edge changes nothing");
-    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, true, false, true) == CSV_MANUAL_OFF,
-          "a host-parked datalog is never un-parked by an ignition cycle");
-    CHECK(csv_manual_mode_next(CSV_MANUAL_ON, true, false, false) == CSV_MANUAL_ON,
+    /* Stop must still hold for the trip it stopped. */
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, true, false) == CSV_MANUAL_OFF,
+          "Stop holds while the ignition is still on");
+
+    /* A host session owns the forced-off state; only datalog_restore_mode() lifts it. */
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, false, true) == CSV_MANUAL_OFF,
+          "a host-parked datalog is never un-parked by the ignition");
+
+    /* The reason this is a LEVEL rule and not an edge one: if the park happens to cover
+     * the ignition-off transition, an edge-triggered clear would consume the only edge it
+     * was ever going to see and Stop would latch until reboot -- the original bug. As a
+     * level, the very next pass after the park lifts still clears it. */
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, false, false) == CSV_MANUAL_AUTO,
+          "and clears on the next pass once the park lifts, with no edge left to catch");
+
+    CHECK(csv_manual_mode_next(CSV_MANUAL_ON, false, false) == CSV_MANUAL_ON,
           "bench FORCE_ON survives an ignition cycle");
-    CHECK(csv_manual_mode_next(CSV_MANUAL_AUTO, true, false, false) == CSV_MANUAL_AUTO,
+    CHECK(csv_manual_mode_next(CSV_MANUAL_AUTO, false, false) == CSV_MANUAL_AUTO,
           "AUTO is unchanged");
 }
 

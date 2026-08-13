@@ -316,7 +316,7 @@ shipping (`poll_log`) configuration the ones that matter are:
 | 5 | `polllog_rx` | `poll_log.c:1292` | 8 KB **internal RAM** | the poll sweep; **sole TWAI consumer** |
 | 5 | `can_rx_task` / `can_tx_task` / `obd_rx_task` | `main.c:1104-1108` | shared | legacy front-end paths |
 | 4 | `csv_logger` | `csv_logger.c:1433` | 6 KB | drains the record queue, writes SD |
-| 3 | `sync_sys_time`, `csv_defer` | | | deferred startup |
+| 3 | `sync_sys_time`, `csv_retry` | | | deferred startup (`csv_retry` exists only after a skipped CSV bring-up) |
 | 2 | `led_ind_task`, `datalog_reaper` | | | housekeeping |
 
 `POLLLOG_RX_TASK_PRIO` is 5 with the comment *"== can_rx_task; sole TWAI
