@@ -235,7 +235,7 @@ carry comments saying why — do not reorder casually.
    with the *remaining* init code. **Any reasoning of the form "init X finishes
    before task Y starts" is unsound** unless X is upstream of Y's create call.
    `csv_logger.c:1418-1430` documents having been burned by exactly this.
-2. **`app_main` returns** (`main.c:1189`) — there is no trailing `while(1)`. IDF
+2. **`app_main` returns** (`main.c:1187`) — there is no trailing `while(1)`. IDF
    deletes the main task, so after boot nothing owns "the boot", and there is
    nowhere to add post-boot supervision without creating a task.
 3. **Nothing is pinned to a core.** No project code calls
