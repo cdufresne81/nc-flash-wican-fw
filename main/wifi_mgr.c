@@ -39,6 +39,7 @@
 #include <cJSON.h>
 #include "wifi_mgr.h"
 #include "dev_status.h"
+#include "wifi_diag.h"   // #105: link diagnostics -- every note_*() below is non-blocking
 
 static const char *TAG = "WiFi_Manager";
 static esp_netif_t* ap_netif = NULL;
@@ -184,18 +185,47 @@ static void wifi_mgr_fs_on_auth_failure(const char* ssid) {
         st->auth_fail_count = 0;
         st->banned_until = xTaskGetTickCount() + pdMS_TO_TICKS(WIFI_MGR_BAN_DURATION_MS);
         ESP_LOGW(TAG, "Banning SSID '%s' for %d ms due to repeated auth failures", ssid, WIFI_MGR_BAN_DURATION_MS);
+        /* #105: a ban is invisible from the UI and presents to the user as an unexplained refusal
+         * to connect for the next 10 minutes, so it goes in the permanent record, not just a log
+         * level nobody can read on this hardware. */
+        wifi_diag_note_ban(ssid, WIFI_MGR_BAN_DURATION_MS);
     } else {
         ESP_LOGW(TAG, "Auth failure %u/%u for SSID '%s'", st->auth_fail_count, WIFI_MGR_AUTH_FAIL_THRESHOLD, ssid);
+    }
+}
+
+/* #105: records the SSID a connect is about to be attempted against, and starts the diagnostic's
+ * connection stopwatch (attempt -> got IP). Four sites used to open-code the same snprintf.
+ * An empty SSID is recorded but not reported as an attempt: those callers deliberately do NOT
+ * connect. Where the SSID is not known up front, go through wifi_mgr_connect_current_config()
+ * below rather than calling esp_wifi_connect() bare. */
+static void wifi_mgr_set_attempted_ssid(const char* ssid) {
+    snprintf(wifi_status.last_attempted_ssid, sizeof(wifi_status.last_attempted_ssid), "%s",
+             ssid ? ssid : "");
+    if (wifi_status.last_attempted_ssid[0]) {
+        wifi_diag_note_attempt(wifi_status.last_attempted_ssid);
     }
 }
 
 static void wifi_mgr_update_last_attempted_from_current_config(void) {
     wifi_config_t cur = {0};
     if (esp_wifi_get_config(WIFI_IF_STA, &cur) == ESP_OK) {
-        snprintf(wifi_status.last_attempted_ssid, sizeof(wifi_status.last_attempted_ssid), "%s", (char*)cur.sta.ssid);
+        wifi_mgr_set_attempted_ssid((char*)cur.sta.ssid);
     } else {
         wifi_status.last_attempted_ssid[0] = '\0';
     }
+}
+
+/* #105: connect using whatever STA config is currently loaded, recording the attempt first.
+ * Several branches of wifi_mgr_scan_select_and_connect() give up on choosing an SSID (wrong mode,
+ * nothing configured, scan found nothing, scan failed, out of memory) and fall through to a bare
+ * connect. Those are still connection attempts, and one sibling branch already remembered to call
+ * wifi_mgr_update_last_attempted_from_current_config() first while the others did not -- so the
+ * stopwatch silently never started on those paths and a later STA_CONNECTED was attributed to a
+ * stale SSID. Routing them through one function is what makes the choke point actually hold. */
+static esp_err_t wifi_mgr_connect_current_config(void) {
+    wifi_mgr_update_last_attempted_from_current_config();
+    return esp_wifi_connect();
 }
 
 static bool wifi_mgr_reason_is_auth_related(uint8_t reason) {
@@ -240,13 +270,13 @@ static bool wifi_mgr_ssid_present(const wifi_ap_record_t* ap_records, uint16_t a
 static void wifi_mgr_scan_select_and_connect(void) {
     // Only relevant when STA is part of the current mode
     if (!(wifi_config.mode == WIFI_MGR_MODE_STA || wifi_config.mode == WIFI_MGR_MODE_APSTA)) {
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
     // If nothing to choose from (no primary and no fallbacks), just connect
     if ((wifi_config.sta_ssid[0] == '\0') && (wifi_config.fallback_count == 0)) {
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
@@ -329,7 +359,7 @@ static void wifi_mgr_scan_select_and_connect(void) {
                 if (wifi_mgr_apply_sta_runtime_config(chosen_ssid, chosen_pass ? chosen_pass : "", chosen_auth) != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to set STA config for sequential connect; using current");
                 }
-                snprintf(wifi_status.last_attempted_ssid, sizeof(wifi_status.last_attempted_ssid), "%s", chosen_ssid);
+                wifi_mgr_set_attempted_ssid(chosen_ssid);
                 esp_wifi_connect();
                 return;
             }
@@ -357,7 +387,7 @@ static void wifi_mgr_scan_select_and_connect(void) {
                 if (wifi_mgr_apply_sta_runtime_config(chosen_ssid, chosen_pass ? chosen_pass : "", chosen_auth) != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to set STA config for sequential connect; using current");
                 }
-                snprintf(wifi_status.last_attempted_ssid, sizeof(wifi_status.last_attempted_ssid), "%s", chosen_ssid);
+                wifi_mgr_set_attempted_ssid(chosen_ssid);
                 esp_wifi_connect();
                 return;
             }
@@ -374,7 +404,7 @@ static void wifi_mgr_scan_select_and_connect(void) {
             esp_wifi_set_mode(WIFI_MODE_AP);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
@@ -385,7 +415,7 @@ static void wifi_mgr_scan_select_and_connect(void) {
             esp_wifi_set_mode(WIFI_MODE_AP);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
@@ -397,7 +427,7 @@ static void wifi_mgr_scan_select_and_connect(void) {
             esp_wifi_set_mode(WIFI_MODE_AP);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
@@ -457,7 +487,7 @@ static void wifi_mgr_scan_select_and_connect(void) {
             wifi_mgr_update_last_attempted_from_current_config();
             esp_wifi_connect();
         } else {
-            snprintf(wifi_status.last_attempted_ssid, sizeof(wifi_status.last_attempted_ssid), "%s", chosen_ssid);
+            wifi_mgr_set_attempted_ssid(chosen_ssid);
             esp_wifi_connect();
         }
     } else {
@@ -1350,7 +1380,17 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                 
             case WIFI_EVENT_STA_CONNECTED:
                 ESP_LOGI(TAG, "STA connected");
-                
+                /* #105: which AP we actually landed on, and on which channel. With several APs
+                 * sharing an SSID (a mesh or an extender) the BSSID is the only way to tell a
+                 * genuine roam from a fault, and the channel is what the AP/STA clash check needs. */
+                if (event_data) {
+                    wifi_event_sta_connected_t* c = (wifi_event_sta_connected_t*)event_data;
+                    char ssid_z[33];
+                    size_t n = (c->ssid_len < sizeof(ssid_z)) ? c->ssid_len : (sizeof(ssid_z) - 1);
+                    memcpy(ssid_z, c->ssid, n);
+                    ssid_z[n] = '\0';
+                    wifi_diag_note_connected(ssid_z, c->bssid, c->channel);
+                }
                 break;
                 
             case WIFI_EVENT_STA_DISCONNECTED:
@@ -1366,6 +1406,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                 if (event_data) {
                     wifi_event_sta_disconnected_t* e = (wifi_event_sta_disconnected_t*)event_data;
                     ESP_LOGW(TAG, "Disconnect reason: %d, last SSID: '%s'", e->reason, wifi_status.last_attempted_ssid);
+                    /* #105: this reason code is the single most useful fact about a dropped link
+                     * and, before this call, it lived only in the ESP_LOGW above -- compiled out at
+                     * CONFIG_LOG_MAXIMUM_LEVEL=INFO and unreadable anyway on a board whose USB-C
+                     * port is a host at runtime. Record it before anything else in this case can
+                     * fail or return early. */
+                    wifi_diag_note_disconnected(wifi_status.last_attempted_ssid, e->reason);
                     if (wifi_status.last_attempted_ssid[0] && wifi_mgr_reason_is_auth_related(e->reason)) {
                         wifi_mgr_fs_on_auth_failure(wifi_status.last_attempted_ssid);
                     }
@@ -1447,6 +1493,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         wifi_status.sta_connected = true;
         wifi_status.sta_retry_count = 0;
         snprintf(wifi_status.sta_ip, sizeof(wifi_status.sta_ip), IPSTR, IP2STR(&event->ip_info.ip));
+        /* #105: stops the connection stopwatch started by wifi_mgr_set_attempted_ssid(). The lease,
+         * not the association, is when the link is actually usable -- a DHCP server that takes ten
+         * seconds looks exactly like "slow WiFi" to a user, and this is what separates the two. */
+        wifi_diag_note_got_ip(wifi_status.sta_ip);
         // Update queue
         if (sta_ip_queue) xQueueOverwrite(sta_ip_queue, wifi_status.sta_ip);
         // Clear failure/bans for the successful SSID

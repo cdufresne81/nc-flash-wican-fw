@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<!--
+  Standalone Wi-Fi diagnostic page (issue #105).
+
+  Embedded verbatim (main/CMakeLists.txt EMBED_FILES) and served at /wifi_diag/page. It is NOT part
+  of the build_web.py minify pipeline and NOT scanned by lint_web.py -- both of those own only the
+  single-page app (homepage_full.html + src/main.js). Edit this file directly; there is no generated
+  counterpart to keep in step.
+
+  A separate page rather than a modal inside the app, for three reasons that all matter here: the
+  browser's own reload button works, the URL can be bookmarked or opened on a second device while
+  someone else drives, and a page that must stay readable while the Wi-Fi link is failing should not
+  depend on the rest of the app having loaded.
+
+  Everything is inline. A device with a struggling link must not need a second round trip to render
+  its own diagnostic, and this page has to work when the SD card is absent and the app is not loaded.
+-->
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WiCAN Wi-Fi diagnostics</title>
+    <style>
+        :root {
+            --primary: #24478f;
+            --primary-dark: #1a3266;
+            --bg: #f0f2f5;
+            --white: #fff;
+            --gray-200: #e9ecef;
+            --gray-300: #dee2e6;
+            --gray-600: #6c757d;
+            --gray-700: #495057;
+            --ok: #059669;
+            --warn-bg: #fef9c3;
+            --warn-border: #eab308;
+            --warn-fg: #854d0e;
+            --err-bg: #fee2e2;
+            --err-border: #ef4444;
+            --err-fg: #991b1b;
+            --info-bg: #eff6ff;
+            --info-border: #60a5fa;
+            --info-fg: #1e40af;
+            --shadow: 0 1px 3px #0000001f
+        }
+
+        * { box-sizing: border-box }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--gray-700);
+            font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Ubuntu, sans-serif;
+            line-height: 1.5
+        }
+
+        header {
+            background: var(--primary);
+            color: #fff;
+            padding: 14px 20px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            justify-content: space-between
+        }
+
+        header h1 { font-size: 17px; margin: 0; font-weight: 600 }
+        header .sub { font-size: 12px; opacity: .85 }
+        .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center }
+
+        button, a.btn {
+            font: inherit;
+            font-size: 13px;
+            padding: 7px 13px;
+            border-radius: 6px;
+            border: 1px solid #ffffff59;
+            background: #ffffff1f;
+            color: #fff;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block
+        }
+
+        button:hover, a.btn:hover { background: #ffffff33 }
+        button:disabled { opacity: .5; cursor: default }
+        label.auto { font-size: 12px; display: flex; align-items: center; gap: 5px; cursor: pointer }
+
+        main { padding: 18px; max-width: 1000px; margin: 0 auto }
+
+        .status-line {
+            font-size: 12px;
+            color: var(--gray-600);
+            margin-bottom: 14px;
+            display: flex;
+            gap: 8px;
+            align-items: center
+        }
+
+        .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--gray-300); flex: none }
+        .dot.up { background: var(--ok) }
+        .dot.down { background: var(--err-border) }
+
+        .offline {
+            background: var(--err-bg);
+            border: 1px solid var(--err-border);
+            color: var(--err-fg);
+            padding: 10px 14px;
+            border-radius: 8px;
+            margin-bottom: 14px;
+            font-size: 13px
+        }
+
+        .card {
+            background: var(--white);
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+            padding: 16px 18px;
+            margin-bottom: 14px
+        }
+
+        .card h2 {
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+            color: var(--gray-600);
+            margin: 0 0 12px
+        }
+
+        .finding {
+            border-radius: 8px;
+            padding: 10px 13px;
+            margin-bottom: 9px;
+            font-size: 13.5px;
+            border: 1px solid
+        }
+
+        .finding:last-child { margin-bottom: 0 }
+        .finding.E { background: var(--err-bg); border-color: var(--err-border); color: var(--err-fg) }
+        .finding.W { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-fg) }
+        .finding.I { background: var(--info-bg); border-color: var(--info-border); color: var(--info-fg) }
+        .finding b { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 3px; opacity: .8 }
+
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px }
+
+        .kv { font-size: 13px }
+        .kv .k { color: var(--gray-600); font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em }
+        .kv .v { font-weight: 600; word-break: break-word }
+        .kv .v.bad { color: var(--err-fg) }
+        .kv .v.warn { color: var(--warn-fg) }
+        .kv .v.good { color: var(--ok) }
+
+        table { width: 100%; border-collapse: collapse; font-size: 13px }
+        th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--gray-200); vertical-align: top }
+        th { color: var(--gray-600); font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600 }
+        td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; width: 1% }
+
+        .scroll { overflow-x: auto }
+
+        pre.timeline {
+            margin: 0;
+            font-size: 12.5px;
+            line-height: 1.65;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 320px;
+            overflow-y: auto
+        }
+
+        .spark { width: 100%; height: 70px; display: block }
+        .spark-cap { font-size: 11.5px; color: var(--gray-600); display: flex; justify-content: space-between; margin-top: 4px }
+
+        .empty { color: var(--gray-600); font-size: 13px; font-style: italic }
+        footer { font-size: 12px; color: var(--gray-600); padding: 4px 2px 24px; max-width: 1000px; margin: 0 auto }
+        footer a { color: var(--primary-dark) }
+    </style>
+</head>
+
+<body>
+    <header>
+        <div>
+            <h1>Wi-Fi diagnostics</h1>
+            <div class="sub" id="sub">WiCAN &mdash; connection troubleshooting</div>
+        </div>
+        <div class="actions">
+            <button id="refresh" type="button">Refresh</button>
+            <label class="auto"><input type="checkbox" id="auto"> auto every 5s</label>
+            <a class="btn" id="report" href="/wifi_diag/report">Download report</a>
+            <a class="btn" href="/event_log">Event log</a>
+        </div>
+    </header>
+
+    <main>
+        <div class="status-line"><span class="dot" id="dot"></span><span id="stamp">loading&hellip;</span></div>
+        <div id="offline" class="offline" style="display:none"></div>
+
+        <div class="card">
+            <h2>What this looks like</h2>
+            <div id="findings"><div class="empty">Loading&hellip;</div></div>
+        </div>
+
+        <div class="card">
+            <h2>Radio</h2>
+            <div class="grid" id="radio"></div>
+        </div>
+
+        <div class="card">
+            <h2>Signal</h2>
+            <svg class="spark" id="spark" viewBox="0 0 600 70" preserveAspectRatio="none" aria-hidden="true"></svg>
+            <div class="spark-cap"><span id="spark_left"></span><span id="spark_right"></span></div>
+            <div class="grid" id="signal" style="margin-top:12px"></div>
+        </div>
+
+        <div class="card">
+            <h2>Link stability</h2>
+            <div class="grid" id="link"></div>
+            <div class="scroll" style="margin-top:14px">
+                <table id="reasons_tbl" style="display:none">
+                    <thead>
+                        <tr><th class="num">Count</th><th class="num">Reason</th><th>What it means</th></tr>
+                    </thead>
+                    <tbody id="reasons"></tbody>
+                </table>
+            </div>
+            <div class="empty" id="reasons_empty">The link has not dropped since boot.</div>
+        </div>
+
+        <div class="card">
+            <h2>Recent link events</h2>
+            <pre class="timeline" id="events"></pre>
+        </div>
+
+        <div class="card">
+            <h2>Memory (internal RAM &mdash; where Wi-Fi transmit buffers come from)</h2>
+            <div class="grid" id="mem"></div>
+        </div>
+    </main>
+
+    <footer>
+        This page covers the current uptime only. The record that survives reboots &mdash; and covers
+        unattended driving, when nobody is holding a browser open &mdash; is in the
+        <a href="/event_log">event log</a>: look for <code>WIFI</code> lines.
+        The downloadable report masks your network name so it is safe to paste into a public issue
+        (<a href="/wifi_diag/report?raw=1">unmasked version</a>).
+    </footer>
+
+    <script>
+        var timer = null, lastOk = null;
+
+        function el(id) { return document.getElementById(id); }
+
+        // textContent everywhere, never innerHTML, for anything carrying device data: the SSID and
+        // the BSSID are arbitrary bytes received over the air and are not ours to trust.
+        function kv(parent, key, value, cls) {
+            var d = document.createElement('div');
+            d.className = 'kv';
+            var k = document.createElement('div');
+            k.className = 'k';
+            k.textContent = key;
+            var v = document.createElement('div');
+            v.className = 'v' + (cls ? ' ' + cls : '');
+            v.textContent = value;
+            d.appendChild(k);
+            d.appendChild(v);
+            parent.appendChild(d);
+        }
+
+        function secs(s) {
+            s = Math.max(0, s | 0);
+            if (s < 60) return s + 's';
+            if (s < 3600) return ((s / 60) | 0) + 'm ' + (s % 60) + 's';
+            return ((s / 3600) | 0) + 'h ' + (((s / 60) | 0) % 60) + 'm';
+        }
+
+        function bytes(n) {
+            if (n >= 1024 * 1024) return (n / 1048576).toFixed(1) + ' MB';
+            if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+            return n + ' B';
+        }
+
+        // -60 dBm and stronger is comfortable; -75 is where rate starts collapsing. Same boundaries
+        // the firmware's histogram and findings use, so the page never disagrees with the report.
+        function rssiClass(v) { return v >= -65 ? 'good' : (v >= -75 ? 'warn' : 'bad'); }
+
+        function drawSpark(hist) {
+            var svg = el('spark');
+            while (svg.firstChild) svg.removeChild(svg.firstChild);
+            if (!hist || hist.length < 2) {
+                el('spark_left').textContent = 'Not enough signal history yet.';
+                el('spark_right').textContent = '';
+                return;
+            }
+            var W = 600, H = 70, lo = -95, hi = -35;
+            function y(v) { return H - ((Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo)) * H; }
+
+            // Reference line at -75 dBm: the level below which slow transfers stop being surprising.
+            var ref = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+            ref.setAttribute('x1', 0); ref.setAttribute('x2', W);
+            ref.setAttribute('y1', y(-75)); ref.setAttribute('y2', y(-75));
+            ref.setAttribute('stroke', '#dee2e6');
+            ref.setAttribute('stroke-dasharray', '4 4');
+            svg.appendChild(ref);
+
+            var pts = hist.map(function (v, i) {
+                return (i * W / (hist.length - 1)).toFixed(1) + ',' + y(v).toFixed(1);
+            }).join(' ');
+            var line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+            line.setAttribute('points', pts);
+            line.setAttribute('fill', 'none');
+            line.setAttribute('stroke', '#24478f');
+            line.setAttribute('stroke-width', '2');
+            line.setAttribute('vector-effect', 'non-scaling-stroke');
+            svg.appendChild(line);
+
+            el('spark_left').textContent = hist.length + ' seconds of history (dashed line = -75 dBm)';
+            el('spark_right').textContent = 'now ' + hist[hist.length - 1] + ' dBm';
+        }
+
+        function render(d) {
+            el('sub').textContent = 'WiCAN ' + (d.fw || '?') + ' — up ' + secs(d.uptime_s);
+
+            var f = el('findings');
+            f.textContent = '';
+            (d.findings || []).forEach(function (x) {
+                var box = document.createElement('div');
+                box.className = 'finding ' + (x.sev === 'E' ? 'E' : x.sev === 'W' ? 'W' : 'I');
+                var tag = document.createElement('b');
+                tag.textContent = x.sev === 'E' ? 'Problem' : x.sev === 'W' ? 'Worth checking' : 'Note';
+                box.appendChild(tag);
+                box.appendChild(document.createTextNode(x.text));
+                f.appendChild(box);
+            });
+
+            var r = d.radio || {}, g = el('radio');
+            g.textContent = '';
+            kv(g, 'Station', r.sta_up ? 'associated' : 'not associated', r.sta_up ? 'good' : 'bad');
+            kv(g, 'Network', r.ssid || '(none)');
+            kv(g, 'IP address', r.ip || '-');
+            kv(g, 'Access point', r.bssid || '-');
+            kv(g, 'Security', r.auth || '-');
+            kv(g, 'Mode', '802.11' + (r.phy || '?'), (r.phy && r.phy.indexOf('n') < 0) ? 'warn' : '');
+            kv(g, 'Power save', r.ps_str || '-', r.ps ? 'warn' : 'good');
+            kv(g, 'Radio mode', r.mode || '-');
+            kv(g, 'Station channel', r.channel || '-');
+            kv(g, 'Device AP channel', r.ap_up ? (r.ap_channel || '-') : 'off',
+                r.overlap ? 'bad' : '');
+            if (r.overlap) kv(g, 'Channel clash', 'yes — see above', 'bad');
+
+            var s = d.signal || {}, sg = el('signal');
+            sg.textContent = '';
+            if (s.samples > 0) {
+                kv(sg, 'Now', s.now + ' dBm', rssiClass(s.now));
+                kv(sg, 'Average', s.avg + ' dBm', rssiClass(s.avg));
+                kv(sg, 'Best', s.max + ' dBm', rssiClass(s.max));
+                kv(sg, 'Worst', s.min + ' dBm', rssiClass(s.min));
+                kv(sg, 'Samples', s.samples + ' s');
+            } else {
+                kv(sg, 'Signal', 'never associated');
+            }
+            drawSpark(s.history);
+
+            var k = d.link || {}, lg = el('link');
+            lg.textContent = '';
+            kv(lg, 'Linked', k.uptime_pct + '% of ' + secs(k.samples),
+                k.uptime_pct >= 95 ? 'good' : (k.uptime_pct >= 80 ? 'warn' : 'bad'));
+            kv(lg, 'Current session', secs(k.session_s));
+            kv(lg, 'Longest session', secs(k.longest_s));
+            kv(lg, 'Associations', k.connects);
+            kv(lg, 'Disconnects', k.disconnects, k.disconnects > 0 ? 'warn' : 'good');
+            kv(lg, 'Connect time', k.ttc_avg_ms ? (k.ttc_avg_ms + ' ms avg') : '-');
+            if (k.bans) kv(lg, 'SSID bans', k.bans, 'bad');
+            if (k.last_reason >= 0) kv(lg, 'Last drop', 'reason ' + k.last_reason, 'warn');
+
+            var tb = el('reasons');
+            tb.textContent = '';
+            var list = k.reasons || [];
+            el('reasons_tbl').style.display = list.length ? '' : 'none';
+            el('reasons_empty').style.display = list.length ? 'none' : '';
+            list.sort(function (a, b) { return b.count - a.count; }).forEach(function (x) {
+                var tr = document.createElement('tr');
+                [String(x.count) + '×', String(x.reason), x.text].forEach(function (t, i) {
+                    var td = document.createElement('td');
+                    if (i < 2) td.className = 'num';
+                    td.textContent = t;
+                    tr.appendChild(td);
+                });
+                tb.appendChild(tr);
+            });
+
+            var ev = d.events || [];
+            el('events').textContent = ev.length
+                ? ev.map(function (e) {
+                    return '[' + String(secs(e.up_s)).padStart(8) + ']  ' + e.text;
+                }).join('\n')
+                : 'No link events recorded yet.';
+
+            var m = d.mem || {}, mg = el('mem');
+            mg.textContent = '';
+            // 4096 must stay equal to WD_LOW_BLOCK_BYTES in components/wifi_diag/wifi_diag.c --
+            // the level below which the Wi-Fi driver cannot reliably get a ~1.6 KB transmit
+            // buffer. It was 32768, which no healthy unit could ever reach (they run with ~30 KB
+            // of internal RAM free in total), so this painted red permanently.
+            kv(mg, 'Free now', bytes(m.int_free || 0));
+            kv(mg, 'Largest block', bytes(m.int_block || 0), (m.int_block < 4096) ? 'bad' : 'good');
+            kv(mg, 'Lowest block seen', bytes(m.int_block_min || 0),
+                (m.int_block_min && m.int_block_min < 4096) ? 'warn' : '');
+        }
+
+        function load() {
+            var btn = el('refresh');
+            btn.disabled = true;
+            // Cache-buster: this page is most useful over a link that is misbehaving, and a proxy or
+            // a browser serving a stale snapshot would quietly show numbers that are minutes old.
+            fetch('/wifi_diag?t=' + Date.now(), { cache: 'no-store' })
+                .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+                .then(function (d) {
+                    lastOk = new Date();
+                    el('offline').style.display = 'none';
+                    el('dot').className = 'dot up';
+                    el('stamp').textContent = 'Updated ' + lastOk.toLocaleTimeString();
+                    render(d);
+                })
+                .catch(function (e) {
+                    // Expected, not exceptional: the thing being diagnosed is a link that drops. Keep
+                    // the last good numbers on screen and say plainly that they are frozen -- a
+                    // blanked page at the moment of failure would destroy the evidence.
+                    el('dot').className = 'dot down';
+                    var o = el('offline');
+                    o.style.display = '';
+                    o.textContent = 'Cannot reach the device (' + e.message + '). '
+                        + (lastOk
+                            ? 'The values below are frozen as of ' + lastOk.toLocaleTimeString()
+                              + '. A failure to load right now is itself a data point.'
+                            : 'Check that you are still connected to it, then press Refresh.');
+                })
+                .then(function () { btn.disabled = false; });
+        }
+
+        el('refresh').addEventListener('click', load);
+        el('auto').addEventListener('change', function () {
+            if (timer) { clearInterval(timer); timer = null; }
+            if (this.checked) timer = setInterval(load, 5000);
+        });
+        load();
+    </script>
+</body>
+
+</html>

@@ -80,6 +80,11 @@ typedef enum {
     EVL_DATALOG_RESUME,  // datalogger resumed after a host session (POST /datalog?op=resume)
     EVL_REAPER_RESUME,   // dead-man reaper auto-resumed datalog (host vanished) -- highest-value line
     EVL_CAN_WAKE,        // wake-on-CAN: verdicts, RXD faults, cooldown (#4)
+    // #105: Wi-Fi link milestones from wifi_diag -- association, IP lease, and every disconnect
+    // with its reason code. Sparse by design and rate-limited at the source (WD_EVL_REPEAT_MS), so
+    // a device stuck in a reconnect loop cannot rotate the rest of this log away. The 1 Hz radio
+    // samples wifi_diag also collects are NOT written here; they live only in its RAM aggregates.
+    EVL_WIFI,
     EVL_WARN,            // something is degrading but still working (e.g. stack headroom shrinking)
     EVL_INFO,            // generic informational note
     EVL_CODE_MAX
