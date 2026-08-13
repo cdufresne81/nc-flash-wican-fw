@@ -62,10 +62,14 @@ esp_err_t csv_logger_init(void);
  *   (csv_logger_init()) if csv_log was disabled at boot. MUST be called from a task at
  *   priority > 4 (the httpd handler at prio 5 qualifies) so the on-demand init cannot hit
  *   the boot publish-race. Returns the csv_logger_init() error on a failed start (e.g. OOM),
- *   leaving the mode OFF. Note: a session only opens once a record arrives, so logging is
- *   effective only while AutoPID records are flowing.
- * enable=false: force logging OFF even if ignition reads on; the writer closes the session
- *   on its next pass and stays alive (never deleted). Stays off until the next START/reboot.
+ *   leaving the mode OFF. Also cancels any boot open-holdoff, so an operator pressing Start
+ *   during the countdown gets a file now. Note: a session only opens once a record arrives,
+ *   so logging is effective only while AutoPID records are flowing.
+ * enable=false: force logging OFF for the rest of THIS TRIP even if ignition reads on; the
+ *   writer closes the session on its next pass and stays alive (never deleted). Cleared back
+ *   to AUTO on the next ignition-off edge, so the following key-on records normally -- Stop
+ *   is per-trip, not "disable auto-logging until someone reboots". FORCE_ON is NOT cleared
+ *   that way: bench work needs it to survive a voltage flapping across the threshold.
  *
  * @return ESP_OK, or the csv_logger_init() error on a failed on-demand start.
  */

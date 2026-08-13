@@ -896,13 +896,14 @@ void app_main(void)
 		// #if HARDWARE_VER != WICAN_PRO
 		// can_enable();
 		// #endif
-		// CSV datalogger: DEFERRED start when enabled. The historical boot crash was a
-		// task-publish race in csv_logger_init() (csv_queue published after the higher-
-		// priority writer task was created), now fixed. The deferred start is kept as a
-		// modest settle margin: csv_logger_init_deferred() waits ~20s, then starts the
-		// logger. A one-shot RTC guard skips CSV for one boot if a startup attempt ever
-		// fails to stabilize, so it can never boot-loop. Explicit '== 1' so a garbage
-		// csv_log value can NEVER enable the logger via bool coercion.
+		// CSV datalogger: start the writer here when enabled. It comes up immediately;
+		// only its FIRST file open is held off (CSV_LOGGER_OPEN_HOLDOFF_MS), so records
+		// queue from t=0 and /csv_status reports an honest countdown instead of looking
+		// broken for 20 s -- which is what this used to do, and what cost a customer his
+		// logging. An RTC guard skips bring-up if a previous attempt did not survive its
+		// first 15 s, with one delayed retry before it gives up for the boot; it can never
+		// boot-loop. Explicit '== 1' so a garbage csv_log value can NEVER enable the
+		// logger via bool coercion.
 		if(config_server_get_csv_log() == 1)
 		{
 			csv_logger_init_deferred();
