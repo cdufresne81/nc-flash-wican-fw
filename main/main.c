@@ -1117,6 +1117,11 @@ void app_main(void)
 	config_mode_init();
 	wc_mdns_init((char*)uid, hardware_version, firmware_version);
 	
+	/* #98: the same stored "debug" flag also gates the event log's detail-only lines. Push it into
+	 * the event_log component -- that component is a leaf and must not reach back into
+	 * config_server. Anything emitted before this point is treated as gated-off. */
+	event_log_set_debug(config_server_is_debug_enabled());
+
 	if(!config_server_is_debug_enabled())
 	{
 		esp_log_level_set("*", ESP_LOG_NONE);

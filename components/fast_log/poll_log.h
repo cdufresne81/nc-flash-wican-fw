@@ -53,19 +53,43 @@ char *poll_log_get_status_json(void);
  */
 float poll_log_sweep_hz(void);
 
+/* ==============================================================================================
+ * DO NOT MERGE poll_log_ignition_on() WITH poll_log_ecu_answering().
+ *
+ * They read the same underlying fact ("did the ECU answer a request we sent") but they FAIL IN
+ * OPPOSITE DIRECTIONS when POLL_LOG is not the running mode:
+ *
+ *   poll_log_ignition_on()   -> TRUE  when inactive (fails OPEN).  Feeds the LOGGING gates.
+ *                               Fail it closed and every non-POLL_LOG mode kills the CSV logger.
+ *   poll_log_ecu_answering() -> FALSE when inactive (fails CLOSED). Feeds the SLEEP VETO.
+ *                               Fail it open and the device NEVER SLEEPS and FLATTENS THE CAR
+ *                               BATTERY in the driveway over a few days.
+ *
+ * One failure direction costs you your logs; the other costs you your battery. Any "cleanup"
+ * that funnels both questions through a single function will do one or the other, and a bench
+ * running POLL_LOG cannot reveal either -- both predicates agree while POLL_LOG is active.
+ * The names differ on purpose. Keep them two functions.
+ * ============================================================================================== */
+
 /*
- * Engine/quiesce state, derived purely from whether the ECU is answering polls (Stage 1).
+ * Ignition/quiesce state, derived purely from whether the ECU is answering polls (Stage 1).
  * Safe to call in any protocol mode: when POLL_LOG is not the active mode they report
- * "engine running / bus not idle" so other modes and stale reads never suppress logging.
- *  - poll_log_engine_running(): true while the ECU is answering (or POLL_LOG inactive).
- *  - poll_log_quiesced():       true while the bus is flipped to LISTEN_ONLY (engine off).
+ * "ignition on / bus not idle" so other modes and stale reads never suppress logging.
+ *  - poll_log_ignition_on(): true while the ECU is answering (or POLL_LOG inactive).
+ *  - poll_log_quiesced():       true while the bus is flipped to LISTEN_ONLY (ignition off).
  *  - poll_log_bus_idle_ms():    ms since the last received frame while quiesced; UINT32_MAX
  *                               while actively polling / outside POLL_LOG (Route-B sleep sensor).
+ *
+ * NAME (#98): "ignition on", not "engine running". The ECU answers whenever the key is on, even
+ * with the engine not turning, so this can never tell you the crank is spinning. If you want
+ * "the engine is actually running", that is poll_log_gate_open() (voltage + RPM).
  */
-bool     poll_log_engine_running(void);
+/* POLARITY: fails OPEN (true when POLL_LOG is inactive). LOGGING ONLY -- never sleep decisions.
+ * See the DO-NOT-MERGE banner above. */
+bool     poll_log_ignition_on(void);
 bool     poll_log_quiesced(void);
 /* The RECORDING gate: true while the conditions to log are met and the sweep runs at full rate.
- * Different question from poll_log_engine_running() -- the ECU answers at key-on with the engine
+ * Different question from poll_log_ignition_on() -- the ECU answers at key-on with the engine
  * off. This is what the CSV logger gates on. True when POLL_LOG is not the active mode. */
 bool     poll_log_gate_open(void);
 uint32_t poll_log_bus_idle_ms(void);
@@ -76,13 +100,11 @@ uint32_t poll_log_bus_idle_ms(void);
  * continue) its countdown while this is true -- the ECU can only answer with the ignition ON,
  * so this is "the car is in use", measured on traffic and never on voltage or RPM.
  *
- * READ THE POLARITY NOTE BEFORE USING ANYTHING ELSE HERE. Every other predicate in this header
- * fails OPEN ("true when POLL_LOG is inactive") so that other modes never suppress logging. A
- * veto needs the OPPOSITE default: unknown must mean "sleep is allowed", or the device simply
- * never sleeps again and flattens the car battery. That is why this is a separate function and
- * why poll_log_engine_running() MUST NOT be used for sleep decisions -- it returns true when
- * POLL_LOG is not running at all.
+ * The full polarity argument -- why this one fails CLOSED while every other predicate here fails
+ * OPEN, and what each wrong direction costs -- is in the DO-NOT-MERGE banner at the top of this
+ * header. It is deliberately stated once; do not restate it here, or the two copies will drift.
  */
+/* POLARITY: fails CLOSED (false when POLL_LOG is inactive). This one guards the car battery. */
 bool     poll_log_ecu_answering(void);
 
 /*

@@ -650,10 +650,18 @@ static void csv_logger_task(void *pvParameters)
             // Accurate close cause for post-hoc forensics: distinguish a voltage ignition-off from the
             // "require engine running" gate going false (engine quiesced while the bench/voltage still
             // reads ON). ignition_on / engine_ok are already computed above for logging_active.
+            //
+            // #98 asked for the old engine-gate reason string to be renamed to "ignition_off" -- DO NOT
+            // DO THAT HERE. These two reasons are already distinct, and "ignition_off" is already taken
+            // by the one right above:
+            //   "ignition_off" -> our local ignition_on (VOLTAGE) went false: the key is off.
+            //   "engine_off"   -> engine_ok (poll_log_gate_open: voltage + RPM) went false: the key may
+            //                     still be on, but the engine is not turning.
+            // Merging them would destroy the one distinction this expression exists to record.
             const char *why = !sdcard_is_mounted()             ? "sd_removed"
                             : (csv_manual_mode == CSV_MANUAL_OFF) ? "manual_stop"
                             : (!ignition_on)                      ? "ignition_off"
-                                                                  : "engine_stopped";
+                                                                  : "engine_off";
             size_t closed_bytes = csv_file_bytes;   // csv_close_file zeroes this; capture first
             csv_close_file();
             csv_session_active = false;

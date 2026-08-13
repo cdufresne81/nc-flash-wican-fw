@@ -3813,7 +3813,11 @@ var loadedPassthrough = {
     imu_threshold: "8",     // IMU only feeds the removed SmartConnect logic
     log_period: "10",       // datalog period (no UI element after the trim)
 };
-var PASSTHROUGH_KEYS = ["can_datarate", "can_mode", "imu_threshold", "log_period",
+// "debug" (#98): has no UI element, so without it here every Submit rewrote config.json without
+// the key and silently turned debug logging back off. That was invisible while the flag only
+// controlled serial output nobody can read on this device; it now also gates the event log's
+// detail-only lines, so a Submit mid-debugging-session would quietly end the session.
+var PASSTHROUGH_KEYS = ["can_datarate", "can_mode", "imu_threshold", "log_period", "debug",
     "home_ssid", "home_password", "home_security", "home_protocol",
     "drive_ssid", "drive_password", "drive_security", "drive_protocol",
     "drive_connection_type", "drive_mode_timeout"];
@@ -3992,7 +3996,11 @@ xhttp.onload = async function() {
 
     // Initialize AP SSID input state
     try { toggleApSsid(); } catch(_) {}
-    
+
+    // Sleep-countdown banner (#85). Started once here and never stopped: it must keep watching
+    // whichever tab the user is on, because the warning matters most away from the Console.
+    try { sleep_status_poll_start(); } catch(_) {}
+
     // Initialize lucide icons
     if (typeof lucide !== 'undefined' && lucide.createIcons) {
         lucide.createIcons();
@@ -4026,6 +4034,160 @@ function csv_status_poll_start() {
 }
 function csv_status_poll_stop() {
     if (window._csvStatusTimer) { clearInterval(window._csvStatusTimer); window._csvStatusTimer = null; }
+}
+
+// ---- Sleep-countdown banner (issue #85) ------------------------------------------------------
+// Warns that the device has started counting down to sleep, and shows how long is left. When the
+// countdown ends the device powers down its radio and drops off the network, so someone could be
+// seconds from losing the connection mid trip-download or mid config-change with no warning.
+//
+// Deliberately NOT tied to the Console tab: the csv_status poll stops on every tab switch, and the
+// people who most need this warning are the ones on the Settings tab. This poll runs everywhere,
+// for the whole life of the page.
+//
+// It also does NOT reuse showNotification(): that is a single-slot toast with one global auto-hide
+// timer, so a banner redrawing itself every second would wipe out every "settings saved" message,
+// and every message would wipe out the banner. #sleep_banner is its own element in the same stack.
+// Two cadences (see sleep_status_cadence). Idle is the steady state and is where ~all of the
+// requests go, so it is the slow one; the fast one only runs while a countdown is actually live,
+// where it has to be ~2 s to catch the brief window between "sleeping" and the radio going down.
+var SLEEP_POLL_IDLE_MS = 5000;
+var SLEEP_POLL_FAST_MS = 2000;
+// Don't show the banner until the countdown has been running this long. Every boot starts a
+// countdown ~1.2 s in and cancels it ~2 s later once the ECU is detected; without this the banner
+// would flash on screen on every single boot. Measured as (secs_total - secs_left) rather than by
+// counting in the browser, so a page opened in the MIDDLE of a real countdown still shows the
+// banner on its very first poll instead of waiting 5 s to catch up.
+// KEEP IN STEP with SLEEP_COUNTDOWN_REAL_MS in main/sleep_mode.c -- the same threshold in two
+// languages, so a countdown too short to be worth a log line is also too short to warn anyone about.
+var SLEEP_BANNER_MIN_ELAPSED_S = 5;
+// Consecutive failed polls before we conclude the device slept. Three at 2 s covers a reload or a
+// brief WiFi hiccup without crying wolf.
+var SLEEP_LOST_POLLS = 3;
+
+function sleep_banner_el() { return document.getElementById('sleep_banner'); }
+
+// _sleepDeadline is the single "is a countdown being shown" flag: non-null means the 1 Hz renderer
+// owns the banner text, null means it must not touch it. A separate boolean would be a second thing
+// to keep in step, and if the two ever disagreed the renderer would either freeze the countdown or
+// overwrite a terminal message.
+function sleep_banner_hide() {
+    var el = sleep_banner_el();
+    if (el) { el.classList.remove('show'); el.classList.remove('lost'); }
+    window._sleepDeadline = null;
+}
+
+function sleep_banner_mmss(secs) {
+    if (secs < 0) secs = 0;
+    var m = Math.floor(secs / 60);
+    var s = secs % 60;
+    return m + ':' + (s < 10 ? '0' + s : String(s));
+}
+
+// Redraws once a second off a local deadline, so the number ticks smoothly between polls.
+// Cheap-exit first: with no countdown showing this must not even touch the DOM, because it runs
+// every second for the whole life of the page.
+function sleep_banner_render() {
+    if (window._sleepDeadline == null) return;
+    var el = sleep_banner_el();
+    if (!el) return;
+    var left = Math.max(0, Math.round((window._sleepDeadline - Date.now()) / 1000));
+    var volts = (typeof window._sleepVolts === 'number' && window._sleepVolts > 0)
+              ? (' — battery low (' + window._sleepVolts.toFixed(2) + ' V).')
+              : '.';
+    // "Ignition on", not "start the car" (#98): what actually cancels the countdown is the ECU
+    // answering, and it answers at key-on with the engine not turning. Telling someone to start
+    // the engine would repeat the very naming mistake #98 set out to fix.
+    el.textContent = 'Device will sleep in ' + sleep_banner_mmss(left) + volts +
+                     ' Turn the ignition on to cancel it.';
+}
+
+// Terminal state: the device is going, or already gone. Freeze the clock (null deadline) so the
+// 1 Hz renderer stops overwriting the message, and colour it as the bad case.
+function sleep_banner_final(msg) {
+    var el = sleep_banner_el();
+    if (!el) return;
+    el.classList.add('lost');
+    el.classList.add('show');
+    el.textContent = msg;
+    window._sleepDeadline = null;
+}
+
+// Re-arm the poll at the cadence the current state deserves. Idle needs no urgency (the banner
+// cannot appear until 5 s of countdown has passed anyway, and a countdown lasts minutes), but once
+// one is running we need the fast cadence: the firmware stays reachable for only ~2 s after it
+// publishes "sleeping", and missing that window costs the goodbye message.
+function sleep_status_cadence(ms) {
+    if (window._sleepPollMs === ms) return;
+    window._sleepPollMs = ms;
+    if (window._sleepStatusTimer) clearInterval(window._sleepStatusTimer);
+    window._sleepStatusTimer = setInterval(sleep_status_tick, ms);
+}
+
+function sleep_status_tick() {
+    if (window._sleepStatusInFlight) return;
+    window._sleepStatusInFlight = true;
+    fetch('/sleep_status').then(function(r) { return r.json(); }).then(function(j) {
+        window._sleepFails = 0;
+        var el = sleep_banner_el();
+        if (!el) return;
+        var counting = !!(j && j.state === 'countdown');
+        sleep_status_cadence(counting ? SLEEP_POLL_FAST_MS : SLEEP_POLL_IDLE_MS);
+
+        // The teardown has begun and the network is about to go. Say goodbye while we still can.
+        // MUST come before the hide branch: the firmware publishes "sleeping" at the START of its
+        // teardown and stays reachable ~2 s longer, so a poll usually lands here. Falling through to
+        // hide() would clear the deadline and the connection-lost path would then never fire -- the
+        // banner would just vanish at about 0:03.
+        if (j && j.state === 'sleeping') {
+            sleep_banner_final('Device is going to sleep now and will drop off the network. ' +
+                               'It wakes when the ignition comes on.');
+            return;
+        }
+
+        el.classList.remove('lost');
+
+        if (!counting) {
+            // Includes "off" (sleep disabled), "normal", and "waking" (coming back, so no warning
+            // is wanted). The grace delay applies only to SHOWING the banner -- a cancelled
+            // countdown clears it immediately.
+            sleep_banner_hide();
+            return;
+        }
+
+        var left = Number(j.secs_left) || 0;
+        var total = Number(j.secs_total) || 0;
+        if (Math.max(0, total - left) < SLEEP_BANNER_MIN_ELAPSED_S) {
+            sleep_banner_hide();
+            return;
+        }
+
+        // Re-anchor every poll. This is also what makes a countdown that JUMPS BACK UP correct for
+        // free: leaving the low-voltage state abandons the countdown and re-entering re-arms the
+        // full time, so we just render whatever the device now says.
+        window._sleepVolts = Number(j.voltage) || 0;
+        window._sleepDeadline = Date.now() + left * 1000;
+        el.classList.add('show');
+        sleep_banner_render();
+    }).catch(function() {
+        window._sleepFails = (window._sleepFails || 0) + 1;
+        // Only a banner that was already counting may turn into "probably slept". Otherwise a reboot
+        // or a dropped WiFi link would conjure a sleep warning out of nothing.
+        if (window._sleepDeadline != null && window._sleepFails >= SLEEP_LOST_POLLS) {
+            sleep_banner_final('Connection lost — the device has probably gone to sleep. ' +
+                               'It wakes when the car wakes.');
+        }
+    }).finally(function() { window._sleepStatusInFlight = false; });
+}
+
+// Started once from Load() and deliberately NEVER stopped -- unlike csv_status_poll_stop(), there is
+// no matching stop, because the whole point is to warn someone who is on a different tab.
+function sleep_status_poll_start() {
+    if (window._sleepStatusTimer) return;
+    window._sleepFails = 0;
+    sleep_status_tick();
+    sleep_status_cadence(SLEEP_POLL_IDLE_MS);
+    setInterval(sleep_banner_render, 1000);   // handle not kept: nothing ever cancels it
 }
 function isNameUnique(name) {
     return canData.every((item) => item["Name"] !== name);
@@ -4294,7 +4456,7 @@ function consoleRefresh() {
 
 function consoleEvtSeverity(code) {
     if (code.indexOf('FAIL') !== -1) return 'er';
-    if (code === 'REAPER_RESUME' || code === 'ENGINE_STOP' ||
+    if (code === 'REAPER_RESUME' || code === 'IGNITION_OFF' || code === 'WARN' ||
         code === 'OTA_START' || code === 'DATALOG_PARK') return 'wn';
     return 'ok';
 }

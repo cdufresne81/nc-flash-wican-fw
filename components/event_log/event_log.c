@@ -100,8 +100,8 @@ static const char *evl_code_str(event_log_code_t code)
     switch (code)
     {
         case EVL_BOOT:          return "BOOT";
-        case EVL_ENGINE_START:  return "ENGINE_START";
-        case EVL_ENGINE_STOP:   return "ENGINE_STOP";
+        case EVL_IGNITION_ON:   return "IGNITION_ON";
+        case EVL_IGNITION_OFF:  return "IGNITION_OFF";
         case EVL_DATALOG_OPEN:  return "DATALOG_OPEN";
         case EVL_DATALOG_CLOSE: return "DATALOG_CLOSE";
         case EVL_OTA_START:     return "OTA_START";
@@ -118,21 +118,35 @@ static const char *evl_code_str(event_log_code_t code)
         case EVL_DATALOG_RESUME:return "DATALOG_RESUME";
         case EVL_REAPER_RESUME: return "REAPER_RESUME";
         case EVL_CAN_WAKE:      return "CAN_WAKE";
+        case EVL_WARN:          return "WARN";
         case EVL_INFO:          return "INFO";
         case EVL_CODE_MAX:      break;
     }
     return "EVENT";
 }
 
-void event_log_emit(event_log_code_t code, const char *fmt, ...)
+// Debug-detail gate (#98). Mirrors the stored "debug" config flag, pushed in by main (the
+// event_log component must not depend on config_server -- main depends on components, not the
+// reverse). volatile + single 32-bit-atomic writer: main at boot, cmd_debug at runtime.
+static volatile bool s_debug_events = false;
+
+void event_log_set_debug(bool on)
+{
+    s_debug_events = on;
+}
+
+bool event_log_debug_enabled(void)
+{
+    return s_debug_events;
+}
+
+// Shared core for both public emit entries, so the ring critical section exists in one place.
+static void evl_vemit(event_log_code_t code, const char *fmt, va_list ap)
 {
     char detail[EVENT_LOG_DETAIL_MAX];
     if (fmt != NULL)
     {
-        va_list ap;
-        va_start(ap, fmt);
         vsnprintf(detail, sizeof(detail), fmt, ap);
-        va_end(ap);
     }
     else
     {
@@ -169,6 +183,14 @@ void event_log_emit(event_log_code_t code, const char *fmt, ...)
     }
 
     ESP_LOGI(TAG, "%s", line);    // also visible on the console
+}
+
+void event_log_emit(event_log_code_t code, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    evl_vemit(code, fmt, ap);
+    va_end(ap);
 }
 
 // ---- SD writer ----
@@ -508,11 +530,14 @@ static esp_err_t evl_send_status(httpd_req_t *req)
     char body[256];
     snprintf(body, sizeof(body),
              "{\"sd_ready\":%s,\"sd_ok\":%s,\"file_bytes\":%u,\"rotations\":%u,"
-             "\"events_total\":%u,\"ring_count\":%u,\"dropped\":%u}",
+             "\"events_total\":%u,\"ring_count\":%u,\"dropped\":%u,\"debug\":%s}",
              evl_sd_ready() ? "true" : "false",
              s_sd_ok ? "true" : "false",
              (unsigned)s_file_bytes, (unsigned)s_rotations,
-             (unsigned)head, (unsigned)ring_count, (unsigned)s_dropped);
+             (unsigned)head, (unsigned)ring_count, (unsigned)s_dropped,
+             /* #98: the ONLY way to confirm the debug-detail gate over WiFi on a device with no
+              * readable serial console. */
+             s_debug_events ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, body);

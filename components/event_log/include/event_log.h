@@ -57,8 +57,10 @@ extern "C" {
 // Event categories. Keep the set small and debugging-focused.
 typedef enum {
     EVL_BOOT = 0,        // power-on / reset (reason + firmware version)
-    EVL_ENGINE_START,    // poll_log: ECU answering again (bus resume)
-    EVL_ENGINE_STOP,     // poll_log: ECU silent -> LISTEN_ONLY quiesce
+    // #98: "ignition", not "engine". The evidence is that the ECU answers, and it answers at
+    // key-on with the engine not turning too -- so these can never mean "the crank is spinning".
+    EVL_IGNITION_ON,     // poll_log: ECU answering again (bus resume)
+    EVL_IGNITION_OFF,    // poll_log: ECU silent -> LISTEN_ONLY quiesce
     EVL_DATALOG_OPEN,    // csv_logger: a logging session/file opened
     EVL_DATALOG_CLOSE,   // csv_logger: a logging session/file closed
     EVL_OTA_START,       // firmware OTA upload began
@@ -78,6 +80,7 @@ typedef enum {
     EVL_DATALOG_RESUME,  // datalogger resumed after a host session (POST /datalog?op=resume)
     EVL_REAPER_RESUME,   // dead-man reaper auto-resumed datalog (host vanished) -- highest-value line
     EVL_CAN_WAKE,        // wake-on-CAN: verdicts, RXD faults, cooldown (#4)
+    EVL_WARN,            // something is degrading but still working (e.g. stack headroom shrinking)
     EVL_INFO,            // generic informational note
     EVL_CODE_MAX
 } event_log_code_t;
@@ -102,6 +105,34 @@ bool event_log_bringup_skipped(void);
 // Events are fsync'd to SD by the writer task within ~1s of emission, so a reboot a couple of seconds
 // later (the planned-restart timer) keeps them; no synchronous flush is needed on the reset path.
 void event_log_emit(event_log_code_t code, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+// ---- Debug-detail gate (#98) -----------------------------------------------------------------
+// This event log has no severity levels: everything emitted lands in the ring, on the SD card and
+// in the web UI's Event Log card. A few lines are pure diagnostics that a normal user should not
+// have to read, so they go through EVENT_LOG_DEBUG(), which records ONLY while the stored "debug"
+// config flag is on. Gated off it records NOTHING ANYWHERE -- there is deliberately no serial
+// fallback, because this build compiles ESP_LOGD out (CONFIG_LOG_MAXIMUM_LEVEL=INFO) and the board
+// has no serial console a PC can read anyway (its USB-C port is a USB host at runtime).
+//
+// !! NEVER route a safety or forensic line through EVENT_LOG_DEBUG(). A gated-off line is gone for
+// !! good, and turning debug on later cannot recover what already happened. "entering sleep",
+// !! "resume FAILED", the sleep postpones, and the OTA/flash lifecycle are the only post-hoc
+// !! evidence this device has after a bad night in a car. They stay always-visible.
+// Use it for detail that is merely nice to have, and prefer splitting a line (plain always,
+// numbers on debug) over hiding the event itself.
+//
+// A MACRO, not a function, on purpose: it must not EVALUATE its arguments when the gate is shut.
+// The one call site passes heap_caps_get_largest_free_block(), which walks the heap free lists
+// under the heap lock -- a function call would pay for that on every wake forever.
+// Forwards to event_log_emit(), so printf format checking still applies.
+//
+// The flag is pushed in from main rather than read from config_server: this component is a leaf
+// and main depends on components, not the reverse. Reported by GET /event_log/status as "debug".
+void event_log_set_debug(bool on);
+bool event_log_debug_enabled(void);
+
+#define EVENT_LOG_DEBUG(code, ...) \
+    do { if (event_log_debug_enabled()) event_log_emit((code), __VA_ARGS__); } while (0)
 
 // Register the GET /event_log* retrieval endpoint on the running httpd server. Idempotent. Must be
 // called before the catch-all wildcard handler. Routes:

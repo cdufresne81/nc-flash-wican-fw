@@ -667,8 +667,20 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 static uint8_t s_elm327_sleep_nudges  = 0;
 static uint8_t s_elm327_settle_passes = 0;
 
+/* One "resume stack low" warning per boot -- see the emit site for why boot scope is correct here
+ * (the watermark it reports is itself a historic minimum that cannot recover within an uptime). */
+static bool s_resume_stack_warned = false;
+
 /* Shortest gap between two "sleep countdown started" event lines. Not a per-episode latch: every
- * entry into STATE_LOW_VOLTAGE really is a fresh countdown, so each line is true. This only stops
+ * entry into STATE_LOW_VOLTAGE really is a fresh countdown, so each line is true.
+ *
+ * #98: this budget is now only ever spent by countdowns that SURVIVED SLEEP_COUNTDOWN_REAL_MS.
+ * Before that, the throwaway countdown every boot arms and cancels claimed the budget first, and a
+ * REAL countdown starting within the next minute was silently swallowed -- the device then slept
+ * with nothing in the log saying a countdown had begun. Do not move the announcement back to
+ * arming time without re-breaking that.
+ *
+ * This only stops
  * a battery parked exactly on sleep_volt from writing one every few seconds all night. */
 #define SLEEP_COUNTDOWN_LOG_MIN_GAP_US  (60LL * 1000000LL)
 
@@ -676,6 +688,44 @@ static uint8_t s_elm327_settle_passes = 0;
  * restart_tracker_restart() marks and then calls esp_restart() immediately, so any line emitted
  * just beforehand is lost without this. */
 #define SLEEP_EVENT_LOG_FLUSH_MS 1500
+
+/* How long a countdown must SURVIVE before it counts as real (#98). Below this it gets no event
+ * line at all -- neither "started" nor "cancelled".
+ *
+ * Found on the bench, not in review: EVERY boot arms a countdown ~1.2 s in (the ECU has not
+ * answered yet, and the battery sits below sleep_volt whenever the engine is not turning) and
+ * cancels it ~2 s later the moment the ECU replies. That throwaway countdown was writing the exact
+ * two-lines-that-say-one-thing pair this work set out to delete:
+ *     sleep countdown started -- 1 min at 12.03V
+ *     IGNITION_ON  ignition on -- ECU answering
+ *     sleep countdown cancelled -- ECU answering at 12.00V
+ * A countdown that lived two seconds was never news. One that ran a while and then got called off
+ * IS news -- it is the only proof in the log that the #4/#97 ECU veto stopped this device sleeping
+ * mid-drive.
+ *
+ * Deliberately the same 5 s the UI banner uses to decide whether to appear, so the log and the
+ * screen tell the same story: a countdown too short to be worth showing anyone is too short to be
+ * worth a line either. */
+#define SLEEP_COUNTDOWN_REAL_MS  5000
+
+/* Stack headroom below which a resume emits an ALWAYS-VISIBLE warning (#98).
+ *
+ * ABSOLUTE BYTES ON PURPOSE, not a fraction of the stack. What this guards against is a change
+ * that pushes the resume path's peak usage deeper, and the margin that decides whether that
+ * overflows is the distance to ZERO -- which does not scale with how big the stack happens to be.
+ * A percentage would also interact BACKWARDS with issue #96 (trim the sleep task's stack): a 25%
+ * floor would shrink exactly when the real margin got thinner, while 25% of today's oversized
+ * 10 KB stack would fire after a perfectly healthy trim.
+ *
+ * COUPLING TO #96 -- READ THIS BEFORE TRIMMING light_sleep_task_stack: the measured free in the
+ * resume path is 6036-6740 B out of 10240, so the worst observed peak is ~4.2 KB. It is LESS
+ * deterministic than it first looked: an early reading of 6516-6740 B was revised down by a later
+ * 6036 B sample on the same bench, which is itself an argument against trimming aggressively. Any
+ * trim must keep (stack size - worst peak) >= this floor + 1 KB of slack, so DO NOT TRIM BELOW
+ * 8192: at 8192 the expected free is ~4.0 KB and this stays quiet, while #96's 6144 option would
+ * leave ~1.9 KB -- BELOW the floor, i.e. screaming from day one.
+ * This floor cannot go dead with age -- it IS the margin any future trim has to preserve. */
+#define SLEEP_RESUME_STACK_WARN_MIN_FREE 2048
 
 /* Was BLE actually up when we tore down? The resume must restore exactly what was taken
  * down, never more -- see the note at the assignment site. */
@@ -1063,6 +1113,7 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
     // Update immediately to prevent elm327 wakeup
     state_info->state = STATE_SLEEPING;
     state_info->voltage = battery_voltage;
+    state_info->timer = 0;   /* countdown is over, not paused -- never leave a stale value here */
     xQueueOverwrite(sleep_state_queue, state_info);
     led_indicator_suspend();
     led_set_level(0,0,0);
@@ -1221,6 +1272,7 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
      *    after every wake is silently dropped. */
     state_info->state   = STATE_NORMAL;
     state_info->voltage = battery_voltage;
+    state_info->timer   = 0;   /* awake again: no countdown until the state machine arms a new one */
     xQueueOverwrite(sleep_state_queue, state_info);
     dev_status_set_awake();
 
@@ -1228,12 +1280,35 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
      * cycles: how close this task came to overflowing its stack during the WiFi bring-up, and
      * whether the heap is fragmenting. Both are silent failures otherwise -- the stack one
      * announces itself as a panic at a nonsense address, and the heap one as a resume that
-     * quietly comes back with no network. */
-    event_log_emit(EVL_INFO,
-                   "resumed in place (stack free %u B, heap %u B, largest %u B)",
-                   (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
-                   (unsigned)esp_get_free_heap_size(),
-                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+     * quietly comes back with no network.
+     *
+     * #98 hid the routine numbers behind the debug gate (they are noise on a healthy device, and
+     * GET /wake_probe reports the same three figures live at any time, debug on or off). What
+     * must NEVER be hidden is the bad case, so the floor check below stays always-visible: an
+     * overflow here has no fallback and no serial console to confess on. */
+    const unsigned stack_free =
+        (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
+
+    /* Latched once per boot, and that is exact rather than lazy: uxTaskGetStackHighWaterMark is a
+     * HISTORIC MINIMUM, so within one uptime this condition can never clear and re-emitting on
+     * every wake would just repeat the same number forever. The latched thing is itself
+     * boot-scoped, so the usual "boot-scoped state breaks now that wake resumes in place" trap
+     * does not apply here. It re-arms on any reboot, and a device in real stack trouble reboots
+     * eventually -- by panicking. */
+    if (stack_free < SLEEP_RESUME_STACK_WARN_MIN_FREE && !s_resume_stack_warned)
+    {
+        s_resume_stack_warned = true;
+        event_log_emit(EVL_WARN, "resume stack low: %u B free (floor %u B)",
+                       stack_free, (unsigned)SLEEP_RESUME_STACK_WARN_MIN_FREE);
+    }
+
+    /* Macro, so with debug off we do not even CALL heap_caps_get_largest_free_block() -- it walks
+     * the heap free lists under the heap lock, and this is the resume path. */
+    EVENT_LOG_DEBUG(EVL_INFO,
+                    "resumed in place (stack free %u B, heap %u B, largest %u B)",
+                    stack_free,
+                    (unsigned)esp_get_free_heap_size(),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return true;
 }
 
@@ -1288,13 +1363,28 @@ static system_state_t sleep_mode_wake_now(sleep_state_info_t *state_info, float 
     return STATE_SLEEPING;   /* not reached -- esp_restart() does not return */
 }
 
-/* One event line per veto EPISODE, never per pass (issue #4).
+/* One line per veto EPISODE, never per pass (issue #4).
  *
  * This is called from the 500 ms sampling loop, so an unlatched line would write two entries a
  * second for the whole of every drive and bury everything else in the log -- the same per-CYCLE
  * mistake the wake-on-CAN work already had to fix once. The caller clears the latch as soon as
  * the ECU stops answering, so each continuous "held awake" period costs exactly one line.
- * Same shape as postpone_logged in the teardown. */
+ * Same shape as postpone_logged in the teardown.
+ *
+ * #98: this helper no longer emits any EVENT line at all -- it is the shared serial line plus the
+ * shared latch, and nothing else. The event line that used to live here ("held awake -- ECU
+ * answering") said almost nothing new: IGNITION_ON lands within ~2 s of it on every boot, the
+ * voltage is already on /check_status, and "below the threshold but not counting down" is exactly
+ * what GET /sleep_status now reports continuously as state:"normal".
+ *
+ * The countdown-cancelled event line lives at the STATE_LOW_VOLTAGE call site instead, next to the
+ * countdown state it talks about. Keeping it out of here is what makes it one-shot BY CONSTRUCTION
+ * (it is gated on cd.armed_us, which that site zeroes immediately) rather than by an
+ * argument about this latch -- so a future change to the latch cannot silently cost us the only
+ * evidence in the log that the #4/#97 ECU veto ever stopped a sleep mid-drive.
+ *
+ * The latch stays SHARED between the two call sites on purpose: without it this serial line would
+ * print twice a second for the whole of every drive. */
 static void sleep_log_ecu_veto(float volts, bool *logged)
 {
     if (*logged) return;
@@ -1302,8 +1392,6 @@ static void sleep_log_ecu_veto(float volts, bool *logged)
 
     ESP_LOGI(TAG, "ECU answering at %.2fV -- holding off the sleep countdown (ignition is on)",
              (double)volts);
-    event_log_emit(EVL_INFO, "staying awake -- ECU answering at %.2fV (ignition on)",
-                   (double)volts);
 }
 
 void light_sleep_task(void *pvParameters)
@@ -1321,10 +1409,12 @@ void light_sleep_task(void *pvParameters)
 	static int8_t periodic_wakeup;
 	static uint32_t wakeup_interval;
 	static wc_timer_t periodic_wakeup_timer;
-	/* #4: latch for the "staying awake -- ECU answering" event line. Cleared every pass the ECU
-	 * is NOT answering, so it is scoped to a veto episode and not to a boot -- this device
+	/* #4: latch for the ECU-veto lines (serial at both sites, plus the "sleep countdown cancelled"
+	 * event line at the STATE_LOW_VOLTAGE site -- see sleep_log_ecu_veto). Cleared every pass the
+	 * ECU is NOT answering, so it is scoped to a veto episode and not to a boot -- this device
 	 * resumes in place instead of rebooting, and boot-scoped state has already broken this file
-	 * five separate times. */
+	 * five separate times. That clearing is also what guarantees the cancel line can never be
+	 * swallowed; the proof is at the call site. */
 	static bool ecu_veto_logged = false;
 	/* Rate limit for the "sleep countdown started" line. Entering LOW_VOLTAGE is a genuinely new
 	 * countdown every time, so a per-episode latch would be wrong -- but a battery sitting exactly
@@ -1332,6 +1422,30 @@ void light_sleep_task(void *pvParameters)
 	 * write hundreds of truthful-but-useless lines an hour to the SD card. One per minute is plenty
 	 * to reconstruct what happened. Seeded negative so the first countdown always logs. */
 	static int64_t countdown_logged_us = -SLEEP_COUNTDOWN_LOG_MIN_GAP_US;
+	/* The CURRENT countdown, as one object so it cannot half-reset. Three loose variables with one
+	 * shared validity condition is the shape that rots: the next person to add an exit path from
+	 * STATE_LOW_VOLTAGE would clear one of three and leave the others stale. Clearing armed_us is
+	 * the single "no countdown running" signal; arming assigns the whole struct at once.
+	 *
+	 *   armed_us      -- when this countdown was armed, 0 while none is running. Distinct from
+	 *                    countdown_logged_us, which is a rate limit spanning MANY countdowns; this
+	 *                    is per-countdown and decides whether this one is real enough to log.
+	 *                    Deliberately an explicit stamp and NOT derived from (sleep_time -
+	 *                    remaining): the #86 flash retry re-arms sleep_timer to SLEEP_FLASH_RETRY_MS
+	 *                    rather than sleep_time, so the derived form would report a wrong age
+	 *                    exactly when a flash overlaps a countdown -- the case nobody bench-tests.
+	 *   volts         -- the reading that ARMED it. Kept because the "countdown started" line is
+	 *                    emitted a few seconds later and must report what started it, not what the
+	 *                    battery happens to read by then.
+	 *   announce_done -- this countdown has been through the announce decision already. Note it is
+	 *                    set even when the rate limit swallows the line, so it means "considered",
+	 *                    not "printed" -- that is what keeps at most one announcement per countdown.
+	 */
+	static struct {
+		int64_t armed_us;
+		float   volts;
+		bool    announce_done;
+	} cd = {0};
 
     // Initialize configuration
     sleep_en = config_server_get_sleep_config();
@@ -1532,31 +1646,23 @@ void light_sleep_task(void *pvParameters)
                          * nothing. */
                         if (ecu_answering)
                         {
+                            /* Serial only (#98): nothing started, so there is nothing to report
+                             * that IGNITION_ON and /sleep_status do not already say. */
                             sleep_log_ecu_veto(battery_voltage, &ecu_veto_logged);
                         }
                         else
                         {
                             ESP_LOGW(TAG, "Battery voltage low (%.2fV), starting low voltage timer", battery_voltage);
-                            /* Say WHEN, not just THAT. The quiesce line upstream is emitted by
-                             * poll_log, which cannot know whether a countdown followed -- with the
-                             * alternator up the ECU can fall silent and nothing starts at all. This
-                             * is the only place that knows both the voltage and the configured
-                             * sleep_time, so this is where the answer to "when does it sleep?"
-                             * belongs. Rate limited: see countdown_logged_us. */
-                            {
-                                const int64_t now_us = esp_timer_get_time();
-                                if ((now_us - countdown_logged_us) >= SLEEP_COUNTDOWN_LOG_MIN_GAP_US)
-                                {
-                                    countdown_logged_us = now_us;
-                                    event_log_emit(EVL_INFO,
-                                                   "sleep countdown started -- %lu min at %.2fV (below %.2fV)",
-                                                   (unsigned long)(sleep_time / 60000UL),
-                                                   (double)battery_voltage, (double)sleep_voltage);
-                                }
-                            }
                             current_state = STATE_LOW_VOLTAGE;
                             volt_recover_count = 0;
                             wc_timer_set(&sleep_timer, sleep_time);
+                            /* Stamp WHEN this countdown was armed. Both countdown event lines are
+                             * deferred and keyed off this: see the SURVIVED-5s emit in
+                             * STATE_LOW_VOLTAGE below, and sleep_log_ecu_veto for the cancel. */
+                            /* One assignment, so no field can be left over from the last countdown. */
+                            cd.armed_us      = esp_timer_get_time();
+                            cd.volts         = battery_voltage;
+                            cd.announce_done = false;
                         }
                     }
                     break;
@@ -1569,9 +1675,70 @@ void light_sleep_task(void *pvParameters)
                     if (ecu_answering)
                     {
                         sleep_log_ecu_veto(battery_voltage, &ecu_veto_logged);
+
+                        /* An ARMED countdown is being thrown away -- worth an event line (#98).
+                         * This is the counterpart of "sleep countdown started" and the only proof
+                         * in the log that the #4/#97 ECU veto stopped a sleep mid-drive.
+                         *
+                         * One-shot BY CONSTRUCTION, not by argument: the only guard is cd.armed_us,
+                         * and it is zeroed three lines below, before any other pass can run. A
+                         * countdown too short to matter earns nothing -- see SLEEP_COUNTDOWN_REAL_MS
+                         * for the per-boot noise that suppresses. */
+                        if (cd.armed_us != 0 &&
+                            (esp_timer_get_time() - cd.armed_us) >=
+                                ((int64_t)SLEEP_COUNTDOWN_REAL_MS * 1000))
+                        {
+                            event_log_emit(EVL_INFO,
+                                           "sleep countdown cancelled -- ECU answering at %.2fV (ignition on)",
+                                           (double)battery_voltage);
+                        }
                         current_state      = STATE_NORMAL;
                         volt_recover_count = 0;
+                        cd.armed_us        = 0;   /* no countdown is running any more */
                         break;
+                    }
+
+                    /* Announce the countdown once it has SURVIVED long enough to be real (#98).
+                     *
+                     * This line used to be emitted the instant the countdown was armed, which broke
+                     * in two ways at once. Every boot arms a countdown ~1.2 s in (the ECU has not
+                     * answered yet and the battery is below sleep_volt whenever the engine is not
+                     * turning) and cancels it ~2 s later -- so the log always opened with a
+                     * countdown that never meant anything. Worse, that throwaway line ATE THE
+                     * 60-SECOND RATE LIMIT below, so a REAL countdown starting within a minute of
+                     * boot was silently swallowed and the device then slept with nothing in the log
+                     * to say a countdown had ever started. That is visible in real bench logs:
+                     * "countdown started" at up=1.2s, quiesce at up=22s, then "entering sleep" at
+                     * up=83s with no second countdown line.
+                     *
+                     * Deferring the announcement fixes both: the boot countdown is gone before it
+                     * qualifies, so it costs no line AND no rate-limit budget, and the rate limit
+                     * now only ever applies between countdowns that were actually real.
+                     *
+                     * Reports the voltage the countdown was ARMED at, not the current one, so the
+                     * line still answers "what reading started this?".
+                     *
+                     * The rate limit itself stays: a battery parked exactly on sleep_volt can still
+                     * cross the threshold repeatedly, and each crossing really is a fresh countdown,
+                     * so this needs a rate limit rather than a latch.
+                     *
+                     * Do NOT flatten these two ifs into one && chain: announce_done is set BEFORE
+                     * the rate-limit test on purpose, so a countdown the limit swallows is done with
+                     * for good. Flattened, it would retry every pass and fire the line a minute into
+                     * the countdown carrying a minute-stale arming voltage. */
+                    const int64_t now_us = esp_timer_get_time();
+                    if (!cd.announce_done && cd.armed_us != 0 &&
+                        (now_us - cd.armed_us) >= ((int64_t)SLEEP_COUNTDOWN_REAL_MS * 1000))
+                    {
+                        cd.announce_done = true;
+                        if ((now_us - countdown_logged_us) >= SLEEP_COUNTDOWN_LOG_MIN_GAP_US)
+                        {
+                            countdown_logged_us = now_us;
+                            event_log_emit(EVL_INFO,
+                                           "sleep countdown started -- %lu min at %.2fV (below %.2fV)",
+                                           (unsigned long)(sleep_time / 60000UL),
+                                           (double)cd.volts, (double)sleep_voltage);
+                        }
                     }
 
                     /* Leaving LOW_VOLTAGE ABANDONS the sleep countdown, and re-entering re-arms
@@ -1592,6 +1759,7 @@ void light_sleep_task(void *pvParameters)
                         ESP_LOGI(TAG, "Battery voltage recovered (%.2fV)", battery_voltage);
                         current_state = STATE_NORMAL;
                         volt_recover_count = 0;
+                        cd.armed_us = 0;   /* abandoned by voltage recovery */
                     }
                     else if (wc_timer_is_expired(&sleep_timer))
 					{
@@ -1599,6 +1767,7 @@ void light_sleep_task(void *pvParameters)
                         if(sleep_mode_teardown(&state_info, battery_voltage, false))
                         {
                             current_state = STATE_SLEEPING;
+                            cd.armed_us = 0;   /* it ran out; nothing left to cancel */
                             vTaskDelay(pdMS_TO_TICKS(1000));
                             if(periodic_wakeup)
                             {
@@ -1646,9 +1815,26 @@ void light_sleep_task(void *pvParameters)
                     break;
             }
 
+            /* Milliseconds left before this device sleeps, for GET /sleep_status and the UI's
+             * countdown banner (#85/#98). Computed HERE because sleep_timer is a local of this
+             * task and nothing else can see it.
+             *
+             * Publishing it through the existing 1-deep queue rather than exposing the deadline is
+             * deliberate: a wc_timer_t is an int64_t, and a 64-bit read from the httpd task would
+             * TEAR on this 32-bit core. xQueueOverwrite/xQueuePeek copy the whole struct under the
+             * kernel's critical section, so a reader always sees `state` and `timer` that agree
+             * with each other.
+             *
+             * Only LOW_VOLTAGE has a live countdown. Every other state reports 0, which is what
+             * makes "not counting down" unambiguous on the wire. */
+            const uint32_t remain_ms = (current_state == STATE_LOW_VOLTAGE)
+                                     ? wc_timer_remaining_ms(&sleep_timer) : 0;
+
             // Update state info and send to queue
             state_info.state = current_state;
             state_info.voltage = battery_voltage;
+            state_info.timer    = remain_ms;
+            state_info.total_ms = sleep_time;   /* what this task actually armed, not a re-read */
             xQueueOverwrite(sleep_state_queue, &state_info);
 
             // Log current status
@@ -1973,7 +2159,8 @@ void sleep_mode_init(void)
          * IT overflows, the device may stop sleeping or stop waking, and it fails as a panic at
          * a nonsense address, possibly while unreachable in a car. A couple of KB of static RAM
          * buys the question outright. /wake_probe reports the live headroom as
-         * sleep_task_stack_free, and every resume logs it. */
+         * sleep_task_stack_free, and every resume checks it against
+         * SLEEP_RESUME_STACK_WARN_MIN_FREE. */
         static StackType_t light_sleep_task_stack[10240];
         static StaticTask_t light_sleep_task_buffer;
 
