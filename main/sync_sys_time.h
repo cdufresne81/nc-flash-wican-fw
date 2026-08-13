@@ -21,24 +21,51 @@
 #ifndef SYNC_SYS_TIME_H
 #define SYNC_SYS_TIME_H
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * Firmware-wide local timezone (POSIX TZ with DST rule), issue #32.
+ * Fallback local timezone (POSIX TZ with DST rule), issues #32 and #91.
  * The system epoch and the RX8130 RTC always hold UTC -- TZ only affects how
- * localtime_r() renders it (trip filenames, CSV datetime column, event log).
- * Hardcoded for the single-owner NC fork; promote to a config key if the
- * device ever needs to travel time zones.
+ * localtime_r() renders it (trip filenames, CSV datetime column, event log,
+ * and the FAT mtimes stamped by the IDF's get_fattime()).
+ * The live zone comes from the "timezone" key in config.json; this define is
+ * only what we fall back to when that key is missing or invalid, and it keeps
+ * the historical Eastern behaviour for a device that never sets one.
  */
-#define SYNC_SYS_TIME_LOCAL_TZ "EST5EDT,M3.2.0,M11.1.0"
+#define SYNC_SYS_TIME_DEFAULT_TZ "EST5EDT,M3.2.0,M11.1.0"
+
+/** Buffer size for a stored POSIX TZ string, including the NUL. */
+#define SYNC_SYS_TIME_TZ_MAX 64
 
 /**
- * @brief Apply SYNC_SYS_TIME_LOCAL_TZ to the C library (setenv TZ + tzset)
+ * @brief Sanity-check a POSIX TZ string before it reaches setenv()
  *
- * Must run before anything renders wall-clock time: the RTC restore
- * (rtcm_sync_system_time_from_rtc), event_log_init and the CSV logger.
+ * newlib never rejects a TZ string: garbage silently renders as UTC and a
+ * half-parseable string renders at a plausible but wrong offset. So the check
+ * has to happen before we apply it, not after. This is a character-class
+ * sanity gate, not a full POSIX parser -- newlib remains the parser.
+ *
+ * @param tz candidate string (may be NULL)
+ * @return true when the string is safe to apply
+ */
+bool sync_sys_time_tz_is_valid(const char *tz);
+
+/**
+ * @brief Apply the configured timezone to the C library (setenv TZ + tzset)
+ *
+ * Reads the "timezone" key straight out of config.json -- the config server
+ * has not started this early -- and falls back to SYNC_SYS_TIME_DEFAULT_TZ if
+ * the file, the key or the value is unusable. Strictly read-only: repairing a
+ * broken config.json stays config_server_load_cfg()'s job.
+ *
+ * The caller must have mounted the internal filesystem (filesystem_init())
+ * first. Must run before anything renders wall-clock time: the RTC restore
+ * (rtcm_sync_system_time_from_rtc), event_log_init and the CSV logger -- and
+ * before any task exists, since tzset() races a concurrent localtime_r().
  */
 void sync_sys_time_apply_tz(void);
 

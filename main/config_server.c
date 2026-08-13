@@ -85,6 +85,7 @@
 #include "elm327.h"
 #include "hw_config.h"
 #include "rtcm.h"
+#include "sync_sys_time.h"   /* SYNC_SYS_TIME_DEFAULT_TZ + the TZ validator (issue #91) */
 #include "esp_littlefs.h"
 #include "csv_logger.h"
 #include "poll_log.h"
@@ -207,7 +208,7 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"st
 										\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\
 										\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\
 								\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\
-										\"csv_log\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"csv_grid_hz\":\"auto\",\"csv_require_engine\":\"enable\",\"led_blink\":\"enable\"}";
+										\"csv_log\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"csv_grid_hz\":\"auto\",\"csv_require_engine\":\"enable\",\"led_blink\":\"enable\",\"timezone\":\"EST5EDT,M3.2.0,M11.1.0\"}";
 
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"periodic_wakeup\":\"disable\",\"wakeup_interval\":\"5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
@@ -1611,6 +1612,7 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "sd_status", sdcard_status_str());
 	cJSON_AddStringToObject(root, "imu_threshold", device_config.imu_threshold);
 	cJSON_AddStringToObject(root, "led_blink", device_config.led_blink);
+	cJSON_AddStringToObject(root, "timezone", device_config.timezone);
 	if(gpio_get_level(OBD_READY_PIN) == 1)
 	{
 		cJSON_AddStringToObject(root, "obd_chip_status", "Sleep");
@@ -3158,6 +3160,25 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 		strlcpy(dst->led_blink, "enable", sizeof(dst->led_blink));
 	}
 	ESP_LOGI(TAG, "dst->led_blink: %s", dst->led_blink);
+	//*****
+
+	//***** Local timezone (issue #91): POSIX TZ string with its DST rule, e.g.
+	//      "PST8PDT,M3.2.0,M11.1.0". An absent key (upgrade from a firmware that
+	//      had the zone compiled in) or an unusable value keeps the historical
+	//      Eastern default, so timestamps can never end up silently in UTC.
+	//      NOTE: this copy is for /check_status parity only. The zone that is
+	//      actually applied is read straight from config.json at boot by
+	//      sync_sys_time_apply_tz(), long before the config server starts.
+	key = cJSON_GetObjectItem(root,"timezone");
+	if(key == 0 || key->valuestring == NULL || !sync_sys_time_tz_is_valid(key->valuestring))
+	{
+		strlcpy(dst->timezone, SYNC_SYS_TIME_DEFAULT_TZ, sizeof(dst->timezone));
+	}
+	else
+	{
+		strlcpy(dst->timezone, key->valuestring, sizeof(dst->timezone));
+	}
+	ESP_LOGI(TAG, "dst->timezone: %s", dst->timezone);
 	//*****
 
 	//***** Wide CSV (Task #11): csv_grid_hz. Garbage coerces to a safe default so a bad NVS

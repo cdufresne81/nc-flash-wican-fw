@@ -573,8 +573,13 @@ void app_main(void)
 {
 	void* internal_buf = NULL;
 	// internal_buf = heap_caps_malloc(75 * 1024, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-	// Local wall-clock rendering (issue #32) -- must precede the RTC restore
+	// Local wall-clock rendering (issues #32, #91) -- must precede the RTC restore
 	// (rtcm_sync_system_time_from_rtc), event_log_init and the CSV logger.
+	// The zone lives in config.json, so mount the internal FS first; both calls
+	// are idempotent, so the later ones in safe_mode_check/config_server_init
+	// become no-ops. This also has to stay ahead of every task we create:
+	// tzset() mutates shared newlib state that localtime_r() reads.
+	filesystem_init();
 	sync_sys_time_apply_tz();
 	dev_status_init();
 	dev_status_set_bits(DEV_AWAKE_BIT);
