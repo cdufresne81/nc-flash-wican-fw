@@ -4015,6 +4015,31 @@ xhttp.onload = async function() {
 function csv_notify(m, c) {
     if (typeof showNotification === 'function') showNotification(m, c); else console.log(m);
 }
+// What the recorder card says while nothing is recording. "Idle" is only honest once the
+// datalogger is actually armed; before this existed, a device that was still starting up,
+// one whose crash guard had skipped bring-up, and one that was genuinely broken all read
+// "Idle" -- which is how a 20 s startup delay turned into a support case. Returns null when
+// there is nothing special to say and the normal Idle/Armed/Recording labels apply.
+// Pure and exported for tools/webtest/csv_status.test.mjs.
+function csvAutostartLabel(j) {
+    if (!j) return null;
+    switch (j.autostart) {
+        case 'holdoff': {
+            var ms = Number(j.autostart_in_ms) || 0;
+            return { text: 'Starting in ' + Math.ceil(ms / 1000) + 's', warn: false };
+        }
+        case 'skipped_retry': {
+            var r = Number(j.autostart_in_ms) || 0;
+            return { text: 'Auto-start skipped — retrying in ' + Math.ceil(r / 1000) + 's',
+                     warn: true };
+        }
+        case 'skipped':
+            return { text: 'Auto-start disabled this boot — press Start, or power-cycle the dongle',
+                     warn: true };
+        default:
+            return null;
+    }
+}
 function csv_status_render(j) {
     var on = !!(j && (j.manual_mode === 'on' || j.session_active));
     console_status_render(j, on);
@@ -4329,8 +4354,11 @@ function console_status_render(j, on) {
     if (!dot || !state || !btn) return;
     var live = !!(j && j.session_active);
     var armed = !!(j && j.manual_mode === 'on' && !live);
+    // Auto-start state only speaks when nothing is recording -- a live trip is its own answer.
+    var auto = (live || armed) ? null : csvAutostartLabel(j);
     dot.className = 'rec-dot' + (live ? ' live' : (armed ? ' armed' : ''));
-    state.textContent = live ? 'Recording' : (armed ? 'Armed' : 'Idle');
+    state.textContent = live ? 'Recording' : (armed ? 'Armed' : (auto ? auto.text : 'Idle'));
+    if (state.style) state.style.color = (auto && auto.warn) ? '#c77700' : '';
     if (file) file.textContent = live ? (j.file || '') : (armed ? 'waiting for data\u2026' : '\u00a0');
     btn.textContent = on ? 'Stop Trip' : 'Start Trip';
     btn.className = 'console-rec-btn' + (on ? ' stop' : '');
