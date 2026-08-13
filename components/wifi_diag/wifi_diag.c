@@ -45,8 +45,17 @@ static const char *TAG = "wifi_diag";
 #define WD_EVT_RING_N       24      // last N link events (associations, drops, bans)
 #define WD_EVT_LINE_MAX     128
 #define WD_TALLY_N          10      // distinct disconnect reasons tracked
-#define WD_FINDING_MAX      224     // one finding, incl. its "what to do about it"
-#define WD_FINDINGS_N       10
+// One finding, including its "what to do about it" sentence. Sized to the LONGEST rule text in
+// wd_findings() at its worst-case argument widths -- the build enforces this rather than trusting
+// it: -Werror=format-truncation= fails the compile if any snprintf into this buffer could truncate.
+// If a new rule does not fit, prefer tightening its wording to raising this; these read better
+// short, and every finding is copied N times onto the HTTP handler's stack (see WD_FINDINGS_N).
+#define WD_FINDING_MAX      288
+// The exact number of rules in wd_findings() that can fire simultaneously (power save, channel
+// clash, weak signal, PHY rate, dominant reason, memory, link uptime, slow connect). The
+// "nothing suspicious" line only fires when none of them did, so it needs no slot of its own.
+// Not a round number on purpose: a rule added without widening this would be silently dropped.
+#define WD_FINDINGS_N       8
 #define WD_TASK_PRIO        2       // below csv writer (4) and poll_log (5): never steals hot cycles
 #define WD_TASK_STACK       3584
 
@@ -659,19 +668,22 @@ static int wd_findings(wd_finding_t *out, int max)
     if (snap.ps != WIFI_PS_NONE)
     {
         WD_ADD('W', "Power save is %s. The radio sleeps between beacons, which costs throughput and "
-                    "adds latency spikes. Manual Wi-Fi setup turns this off; the SmartConnect path "
-                    "never calls esp_wifi_set_ps() and so runs on the IDF default (MIN_MODEM).",
+                    "adds latency spikes. Manual Wi-Fi setup disables it; the SmartConnect path "
+                    "never calls esp_wifi_set_ps(), so it runs on the IDF default.",
                     wd_ps_str(snap.ps));
     }
 
     if (samples > 0 && overlap * 2 > samples)
     {
+        // A percentage is 0..100 by construction, but the compiler cannot know that from a uint32
+        // division and must budget ten digits for it. Narrowing to uint8_t hands it the real range,
+        // which is what keeps this line inside WD_FINDING_MAX instead of 13 characters over it.
+        uint8_t pct = (uint8_t)(overlap * 100 / samples);
         WD_ADD('W', "The SoftAP is on channel %u while the station is on channel %u, for %u%% of the "
-                    "time sampled. One radio cannot hold two channels at once -- it time-slices "
-                    "between them, which can cost more than half the available throughput. Turning "
-                    "the access point off once the station connects removes this entirely.",
-                    (unsigned)snap.ap_channel, (unsigned)snap.channel,
-                    (unsigned)(overlap * 100 / samples));
+                    "time sampled. One radio cannot hold two channels: it time-slices between them, "
+                    "which can cost more than half the throughput. Turning the access point off once "
+                    "the station connects removes this.",
+                    (unsigned)snap.ap_channel, (unsigned)snap.channel, (unsigned)pct);
     }
 
     if (samples_up >= 30)
