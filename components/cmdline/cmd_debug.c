@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include "hw_config.h"
 #include "cJSON.h"
+#include "event_log.h"
 
 static const char *TAG = "cmd_debug";
 
@@ -95,6 +96,11 @@ static void apply_runtime_logging(bool enable)
 {
     // Set default log level
     esp_log_level_set("*", enable ? ESP_LOG_DEBUG : ESP_LOG_WARN);
+    // #98: keep the event log's detail gate in step with this command, so the gated event lines
+    // appear whichever way debug was turned on (here, or the stored flag read at boot in main.c).
+    // Note the SERIAL halves still differ and this does not change that: "off" is ESP_LOG_WARN here
+    // but ESP_LOG_NONE on the boot path. Only the event-log gate is consistent across the two.
+    event_log_set_debug(enable);
 }
 
 static int cmd_debug(int argc, char **argv)

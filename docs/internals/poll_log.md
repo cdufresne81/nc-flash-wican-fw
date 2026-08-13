@@ -38,11 +38,11 @@ stateDiagram-v2
     QUIESCED --> PROBING : any RX frame, or POLLLOG_MAX_QUIESCE_MS (10 min) self-heal
 ```
 
-While QUIESCED the task never transmits, drains RX non-blocking on a ~20 ms cadence, and `s_engine_running=false` suppresses CSV logging (csv_logger asks via the registered `poll_log_gate_open` callback — see [csv_logger.md](csv_logger.md)). The 10-minute self-heal (`POLLLOG_MAX_QUIESCE_MS`) guarantees a stuck detector can never permanently strand the logger. State transitions emit `EVL_ENGINE_STOP`/start events to event_log.
+While QUIESCED the task never transmits, drains RX non-blocking on a ~20 ms cadence, and `s_ignition_on=false` suppresses CSV logging (csv_logger asks via the registered `poll_log_gate_open` callback — see [csv_logger.md](csv_logger.md)). The 10-minute self-heal (`POLLLOG_MAX_QUIESCE_MS`) guarantees a stuck detector can never permanently strand the logger. State transitions emit `EVL_IGNITION_OFF`/start events to event_log.
 
 ### The recording gate: WATCH vs FAST
 
-`s_engine_running` means **the ECU answers**, not **the engine turns** — a parked car at key-on answers every request. On its own it therefore kept the sweep at full rate (~430 req/s) whenever the key was on, whether or not anything was being recorded.
+`s_ignition_on` means **the ECU answers**, not **the engine turns** — a parked car at key-on answers every request. On its own it therefore kept the sweep at full rate (~430 req/s) whenever the key was on, whether or not anything was being recorded.
 
 A NORMAL-mode sweep now runs in one of two speeds:
 
@@ -95,7 +95,7 @@ Three bypasses skip the gate completely, and while bypassed the counters do **no
 | Bypass | Condition | Why |
 |---|---|---|
 | Probing | `!s_ecu_answering` | Boot and every quiesce-resume run full sweeps, so an all-gated table can never starve `POLLLOG_PROBE_MS` of attempts and strand the logger in a quiesce loop. |
-| Stale OK | no OK for `POLLLOG_GATE_STALE_MS` (2.5 s) | A long divisor on the only answering channel could otherwise push `now - s_last_ok_us` past `POLLLOG_ENGINE_OFF_MS` and fire a **false** `ENGINE_STOP`, closing the CSV require-engine gate mid-drive. With the engine genuinely off, un-gated sweeps still yield no OK and still quiesce at 5 s. |
+| Stale OK | no OK for `POLLLOG_GATE_STALE_MS` (2.5 s) | A long divisor on the only answering channel could otherwise push `now - s_last_ok_us` past `POLLLOG_ENGINE_OFF_MS` and fire a **false** `IGNITION_OFF`, closing the CSV require-engine gate mid-drive. With the engine genuinely off, un-gated sweeps still yield no OK and still quiesce at 5 s. |
 | Watch | `!s_gate_open` | A watch sweep already runs at a fraction of the divisors' intended rate; applying them on top would starve channels and leave the gate's own RPM input stale. |
 
 `can_should_park()` and the QUIESCED branch both `continue` *above* the gate, so a 10 s flash session can't burn every PID's skip budget and then fire them all at once on the first unparked sweep.
@@ -174,7 +174,7 @@ The Auto (fastest) logging rate is a **measurement, not an estimate** — this i
  "pace_sweeps":0,"min_sweep_ms":10,
  "sweep_min_ms":38.2,"sweep_max_ms":52.7,"fast_ms":49.6,"fast_hz":20.15,
  "win_ok":1197,"win_timeout":0,"win_txfail":0,
- "engine_running":true,"quiesced":false,"bus_idle_ms":4294967295,
+ "ignition_on":true,"quiesced":false,"bus_idle_ms":4294967295,
  "reload_ok":true,"reload_pending":false,
  "state":"fast","gate_open":true,
  "gate_volt":13.2,"rpm_known":true,"rpm":2150}

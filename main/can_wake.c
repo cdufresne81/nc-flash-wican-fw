@@ -464,8 +464,19 @@ bool can_wake_handle(can_wake_verdict_t v, uint32_t edges, uint32_t rises, uint3
             s_cooldown_logged = false;   /* a wake got through: re-arm the log for the next episode */
             ESP_LOGW(TAG, "bus alive: %u edges (%u rise) in %u ms -> wake",
                      (unsigned)edges, (unsigned)rises, (unsigned)elapsed_ms);
-            event_log_emit(EVL_CAN_WAKE, "confirmed: %u edges (%u rise) in %u ms -> wake",
-                           (unsigned)edges, (unsigned)rises, (unsigned)elapsed_ms);
+            /* #98: the WAKE is news and always gets a line; the edge counts are diagnostics and do
+             * not. One line either way -- the detailed form already says everything the plain form
+             * does, and the RAM ring is only 64 lines deep, so a debugging session that wakes the
+             * device repeatedly should not spend two slots per wake on one fact. */
+            if (event_log_debug_enabled())
+            {
+                event_log_emit(EVL_CAN_WAKE, "confirmed: %u edges (%u rise) in %u ms -> wake",
+                               (unsigned)edges, (unsigned)rises, (unsigned)elapsed_ms);
+            }
+            else
+            {
+                event_log_emit(EVL_CAN_WAKE, "woken by CAN bus activity");
+            }
             return true;
 
         case CAN_WAKE_STUCK_LOW:

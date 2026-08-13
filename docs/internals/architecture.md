@@ -782,7 +782,7 @@ inherited code often does not.
 
 - **Module prefix on every public symbol**: `poll_log_*`, `csv_logger_*`,
   `event_log_*`, `config_server_*`. File-locals are `static` with an `s_` prefix
-  (`s_sweep_ms`, `s_engine_running`, `s_park`).
+  (`s_sweep_ms`, `s_ignition_on`, `s_park`).
 - **One `TAG` per file** for `ESP_LOG*`. Level discipline matters on the hot
   path: a per-sweep warning firing 45x/second on the prio-5 task was demoted to
   `DEBUG` in #51.
@@ -857,7 +857,7 @@ A real example of the whole chain working, from the bench right after an OTA:
 
 ```
 2026-07-25 15:13:42 up=160ms  BOOT         reason=software planned=ota_apply src=web_ui fw=v1.17.0 sd=mounted
-2026-07-25 15:13:44 up=3108ms ENGINE_START engine running (ECU answering)
+2026-07-25 15:13:44 up=3108ms IGNITION_ON  ignition on -- ECU answering
 ```
 
 The boot line carries the *previous* boot's reason, which is what makes an
@@ -880,7 +880,7 @@ it as *addressed*, not *proven fixed*.
 > coredump-to-flash as the prerequisite. Both are stale post-#59 and
 > post-`crash_report`; fix them when you next touch that file.
 
-**Polling fine but nothing logging?** Check `/event_log` for `ENGINE_STOP`
+**Polling fine but nothing logging?** Check `/event_log` for `IGNITION_OFF`
 before assuming a fault. CSV logging is deliberately suppressed while the engine
 is off (engine-off quiesce — see [poll_log.md](poll_log.md)), and that is by far
 the most common benign explanation.

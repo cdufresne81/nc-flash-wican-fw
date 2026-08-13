@@ -32,3 +32,13 @@ bool wc_timer_is_expired(wc_timer_t *timer)
 {
     return (*timer <= esp_timer_get_time()) ? true : false;
 }
+
+/* Milliseconds left before this timer expires, clamped at 0 once it has. Exists so callers that
+ * need to REPORT a countdown (rather than just test it) do not have to know that a wc_timer_t is an
+ * absolute microsecond deadline -- reaching inside the type spreads that assumption around and a
+ * future change to the representation would then break silently instead of failing to compile. */
+uint32_t wc_timer_remaining_ms(wc_timer_t *timer)
+{
+    const int64_t d_us = *timer - esp_timer_get_time();
+    return (d_us > 0) ? (uint32_t)(d_us / 1000) : 0;
+}

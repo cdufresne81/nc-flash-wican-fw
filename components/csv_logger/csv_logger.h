@@ -104,7 +104,7 @@ void csv_logger_set_column_provider(csv_column_provider_t provider);
  *
  * Returns true while logging is warranted. poll_log registers poll_log_gate_open() here so the
  * logger can stop on engine-off without a circular component dependency (poll_log already depends
- * on csv_logger). NOT poll_log_engine_running(): that one means "the ECU answers", which is also
+ * on csv_logger). NOT poll_log_ignition_on(): that one means "the ECU answers", which is also
  * true of a parked car at key-on. Registered once at boot; when no provider is set the gate
  * degrades to the voltage ignition gate only. Must be cheap and lock-free (called from the writer
  * task).

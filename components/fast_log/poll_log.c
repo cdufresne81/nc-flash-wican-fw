@@ -141,16 +141,23 @@ static inline uint16_t polllog_rmba_size(const uint8_t *req)
 /* Divisor-gate staleness bypass (issue #29). Half the engine-off budget. If no OK has
  * landed for this long, poll EVERYTHING regardless of divisors, so a long divisor on the
  * only answering channel can never let (now - s_last_ok_us) reach POLLLOG_ENGINE_OFF_MS
- * and fire a FALSE ENGINE_STOP. Costs nothing on a healthy config (an OK lands every
+ * and fire a FALSE IGNITION_OFF. Costs nothing on a healthy config (an OK lands every
  * min_n sweeps, i.e. tens of ms) and does not weaken the real detector: with the engine
  * genuinely off, un-gated full sweeps still yield no OK and we still quiesce at 5 s. */
 #define POLLLOG_GATE_STALE_MS    (POLLLOG_ENGINE_OFF_MS / 2)
 
 /* ---- Recording gate: WATCH vs FAST ------------------------------------- */
-/* s_engine_running means "the ECU answers", NOT "the engine turns" -- a car sitting at key-on
- * with the engine off answers every request, so the sweep used to run at the full ~430 req/s
- * whenever the key was on and whether or not anything was being recorded. That is ECU diag-task
- * load, bus utilisation and power spent on samples nobody keeps.
+/* THREE facts here read almost alike, so name them precisely (#98):
+ *   s_bus_normal     -- we are NOT quiesced, i.e. transmitting. Goes true on ANY bus frame, so it
+ *                       does NOT mean the ECU replied. Exact complement of s_quiesced.
+ *   s_ecu_answering  -- the ECU replied to a request WE sent, this session. This is the real
+ *                       "the ignition is on" evidence, and what poll_log_ignition_on() reports.
+ *   s_gate_open      -- the RECORDING gate: voltage + RPM say the ENGINE is actually turning.
+ *
+ * An answering ECU still does not mean the engine turns -- a car sitting at key-on with the engine
+ * off answers every request, so the sweep used to run at the full ~430 req/s whenever the key was
+ * on and whether or not anything was being recorded. That is ECU diag-task load, bus utilisation
+ * and power spent on samples nobody keeps.
  *
  * WATCH is the same full sweep held to one pass per POLLLOG_WATCH_SWEEP_MS (~16-19 req/s on a
  * 19-PID table). Deliberately the SAME sweep and not an RPM-only probe: every channel stays warm,
@@ -307,7 +314,7 @@ static volatile float    s_win_sweep_min_ms = 0, s_win_sweep_max_ms = 0;
 
 /* Engine-off quiesce state (Stage 1). Single-writer (the poll task) aligned fields, same no-mutex
  * contract as the status snapshot above; the getters below do plain reads. */
-static volatile bool    s_engine_running = true;  /* default true: non-poll modes never suppress logging */
+static volatile bool    s_bus_normal     = true;  /* default true: non-poll modes never suppress logging */
 static volatile bool    s_quiesced       = false; /* true == bus currently flipped to LISTEN_ONLY */
 static volatile int64_t s_last_ok_us     = 0;     /* esp_timer stamp of last matched OK reply (real ECU answer) */
 /* The ECU sent back a matching reply to a request WE transmitted, in the current NORMAL session.
@@ -320,8 +327,8 @@ static volatile int64_t s_norm_start_us  = 0;     /* when the current NORMAL ses
 static volatile int64_t s_last_rx_us     = 0;     /* esp_timer stamp of last received frame (any id) */
 
 /* Recording gate (WATCH vs FAST). Same single-writer/no-mutex contract as the fields above.
- * s_gate_open is what the CSV logger now gates on; s_engine_running keeps its old meaning
- * ("the ECU answers") so /poll_status stays honest about the two being different things. */
+ * s_gate_open is what the CSV logger now gates on; s_bus_normal means only "not quiesced", and
+ * /poll_status reports s_ecu_answering, so all three stay separate questions. */
 static volatile bool     s_gate_open = false;
 static float             s_gate_volt_on = POLLLOG_GATE_VOLT_DEF;  /* engine_volt, read once at init */
 /* Last RPM seen on EITHER path (polled or broadcast). 32-bit on purpose: a 64-bit volatile is
@@ -758,11 +765,13 @@ static bool polllog_poll_one(pid_data_t *pid)
             s_last_ok_us = esp_timer_get_time();   /* engine-running heartbeat for the quiesce gate */
             if (!s_ecu_answering)
             {
-                /* First real ECU answer of this NORMAL session => engine confirmed running. A bus frame
-                 * alone only PROBES (flips us to NORMAL); the OK is what confirms, so a stray wind-down
-                 * frame can never log a false start. Exactly one ENGINE_START per confirmed run. */
+                /* First real ECU answer of this NORMAL session => the ignition is confirmed on. A bus
+                 * frame alone only PROBES (flips us to NORMAL); the OK is what confirms, so a stray
+                 * wind-down frame can never log a false start. Exactly one IGNITION_ON per key-on.
+                 * The message states the EVIDENCE ("ECU answering") because that is all we know: a
+                 * car at key-on with the engine not turning answers every request too (#98). */
                 s_ecu_answering = true;
-                event_log_emit(EVL_ENGINE_START, "engine running (ECU answering)");
+                event_log_emit(EVL_IGNITION_ON, "ignition on -- ECU answering");
             }
             got = true;
             break;
@@ -912,7 +921,7 @@ static void polllog_execute_test(const autopid_live_test_req_t *req, autopid_liv
     {
         /* A PID test must transmit; if the bus is quiesced (engine/key off -> LISTEN_ONLY) we
          * cannot send. Report engine-off rather than flip the bus (anti-thrash). */
-        if (s_quiesced || !s_engine_running)
+        if (s_quiesced || !s_bus_normal)
         {
             res->status = AUTOPID_TEST_ENGINE_OFF;
             return;
@@ -1142,7 +1151,7 @@ static void polllog_rx_task(void *arg)
 
         const int64_t now = esp_timer_get_time();
 
-        if (s_engine_running)
+        if (s_bus_normal)
         {
             const uint32_t sweep_ok_before = s_cum_ok;
             const int64_t  sweep_t0 = now;
@@ -1165,7 +1174,7 @@ static void polllog_rx_task(void *arg)
              *     poll everything. Without this, a sweep inflated by un-gated PIDs that
              *     always TIME OUT (30 ms each) combined with a high divisor on the only
              *     answering channel can push (now - s_last_ok_us) past POLLLOG_ENGINE_OFF_MS
-             *     and fire a FALSE ENGINE_STOP, closing the csv require-engine gate mid-drive.
+             *     and fire a FALSE IGNITION_OFF, closing the csv require-engine gate mid-drive.
              *   BYPASS 3 -- WATCH (!s_gate_open): the slow sweep already runs at a fraction of
              *     the divisors' intended rate, so applying them on top would starve channels and
              *     leave the gate's own RPM input stale.
@@ -1353,12 +1362,12 @@ static void polllog_rx_task(void *arg)
 
             /* Quiesce decision -> flip the bus to LISTEN_ONLY so we stop holding it awake. Two cases,
              * so we never spin-transmit onto a dead bus:
-             *   - CONFIRMED running (had an OK this session): quiesce when the ECU is silent for
-             *     ENGINE_OFF_MS -> log ENGINE_STOP.
+             *   - CONFIRMED answering (had an OK this session): quiesce when the ECU is silent for
+             *     ENGINE_OFF_MS -> log IGNITION_OFF.
              *   - PROBING (booted, or resumed on a bus frame, but no OK yet): re-quiesce after the short
-             *     PROBE_MS window. This kills a boot-with-engine-off (or a stray wind-down frame) that
+             *     PROBE_MS window. This kills a boot with the key off (or a stray wind-down frame) that
              *     would otherwise transmit failed requests forever (the old 100k+ txfail spin). No
-             *     ENGINE_STOP is logged -- the engine was never confirmed running.
+             *     IGNITION_OFF is logged -- the ignition was never confirmed on.
              * The flip MUST bracket can_set_silent() with disable/enable -- it is a no-op while ON_BUS. */
             bool engine_off = s_ecu_answering
                 ? ((now - s_last_ok_us)    > (int64_t)POLLLOG_ENGINE_OFF_MS * 1000)
@@ -1372,8 +1381,8 @@ static void polllog_rx_task(void *arg)
                 if (can_is_enabled())
                 {
                     s_quiesced       = true;
-                    s_engine_running = false;
-                    s_ecu_answering      = false;
+                    s_bus_normal     = false;
+                    s_ecu_answering  = false;
                     s_gate_open      = false;  /* ECU gone -> nothing to record; re-decide on resume */
                     s_last_rx_us     = now;   /* arm the idle clock from the flip instant */
                     s_last_flip_us   = now;
@@ -1381,9 +1390,13 @@ static void polllog_rx_task(void *arg)
                     {
                         ESP_LOGI(TAG, "ECU silent %dms -> LISTEN_ONLY quiesce (stop holding bus awake)",
                                  POLLLOG_ENGINE_OFF_MS);
-                        /* Operational event (Task #24): once per confirmed running->off transition. */
-                        event_log_emit(EVL_ENGINE_STOP, "ECU silent %dms -> quiesce (LISTEN_ONLY)",
-                                       POLLLOG_ENGINE_OFF_MS);
+                        /* Operational event (Task #24): once per confirmed on->off transition.
+                         * Plain words, not internals: "5000ms -> quiesce (LISTEN_ONLY)" means nothing
+                         * to someone reading their own event log (#98). The seconds come from the
+                         * constant so the text and the timeout can never drift apart. */
+                        event_log_emit(EVL_IGNITION_OFF,
+                                       "ignition off -- no ECU reply for %ds, stopped sending requests",
+                                       POLLLOG_ENGINE_OFF_MS / 1000);
                     }
                     else
                     {
@@ -1419,12 +1432,12 @@ static void polllog_rx_task(void *arg)
                 if (can_is_enabled())
                 {
                     s_quiesced       = false;
-                    s_engine_running = true;
-                    s_ecu_answering      = false; /* PROBE: a frame woke us, but require a real OK to confirm running */
+                    s_bus_normal     = true;
+                    s_ecu_answering  = false; /* PROBE: a frame woke us, but require a real OK to confirm running */
                     s_norm_start_us  = now;   /* start the probe window (re-quiesce after PROBE_MS if no OK) */
                     s_last_flip_us   = now;
                     ESP_LOGI(TAG, "bus alive (%d frame[s]) -> NORMAL, probing for ECU", got);
-                    /* ENGINE_START is emitted on the first OK (polllog_poll_one), NOT here: a stray
+                    /* IGNITION_ON is emitted on the first OK (polllog_poll_one), NOT here: a stray
                      * wind-down frame that yields no OK is a false alarm and must not log a start. */
                 }
             }
@@ -1548,7 +1561,7 @@ void poll_log_init(char *id, uint32_t log_period)
 
     /* Let the CSV logger gate on engine-running via our CAN-derived signal. Registration (not a
      * direct include) avoids a circular component dependency: poll_log already depends on
-     * csv_logger, not the reverse. Registers the RECORDING gate, not poll_log_engine_running --
+     * csv_logger, not the reverse. Registers the RECORDING gate, not poll_log_ignition_on --
      * see the WATCH vs FAST block near the top for why those are different questions. */
     csv_logger_set_engine_state_fn(poll_log_gate_open);
 
@@ -1575,16 +1588,20 @@ void poll_log_init(char *id, uint32_t log_period)
              (unsigned long)s_cfg->pid_count);
 }
 
-/* Engine/quiesce state for the CSV logging gate, the Route-B sleep sensor, and /poll_status.
+/* Ignition/quiesce state for the CSV logging gate, the Route-B sleep sensor, and /poll_status.
  * Plain reads of the poll task's aligned fields (no mutex, same contract as the status snapshot).
- * When POLL_LOG is not the active mode these report "running / not idle" so other modes (FAST_LOG,
- * bench) and any stale read never suppress logging or wrongly trigger sleep. */
-bool poll_log_engine_running(void)
+ * When POLL_LOG is not the active mode these report "ignition on / not idle" so other modes
+ * (FAST_LOG, bench) and any stale read never suppress logging or wrongly trigger sleep.
+ *
+ * DO NOT MERGE THIS WITH poll_log_ecu_answering() BELOW -- opposite failure directions, and one of
+ * them guards the car battery. Read the DO-NOT-MERGE banner in poll_log.h first. */
+bool poll_log_ignition_on(void)
 {
-    /* "confirmed running" (the ECU answered a poll this session), NOT merely in NORMAL mode: during the
-     * ~2s probe after a boot or a stray-frame resume the ECU hasn't replied yet, so this stays false.
-     * That keeps the csv require-engine gate closed during a probe AND makes /poll_status honest -- a
-     * boot-with-engine-off now reports engine_running:false instead of the old misleading true. */
+    /* "confirmed answering" (the ECU replied to a poll this session), NOT merely in NORMAL mode:
+     * during the ~2s probe after a boot or a stray-frame resume the ECU hasn't replied yet, so this
+     * stays false. That keeps the csv require-engine gate closed during a probe AND makes
+     * /poll_status honest -- a boot with the key off now reports ignition_on:false instead of the
+     * old misleading true. */
     return s_active ? s_ecu_answering : true;
 }
 
@@ -1593,7 +1610,10 @@ bool poll_log_quiesced(void)
     return s_active ? s_quiesced : false;
 }
 
-/* Sleep veto (issue #4). TRUE only while ALL THREE hold:
+/* DO NOT MERGE THIS WITH poll_log_ignition_on() ABOVE. Since #98 the two names read alike; the
+ * behaviour is still opposite. Read the DO-NOT-MERGE banner in poll_log.h first.
+ *
+ * Sleep veto (issue #4). TRUE only while ALL THREE hold:
  *   s_active           -- the poll task is running THIS uptime, so somebody maintains the rest,
  *   s_ecu_answering        -- the ECU answered one of OUR requests in the current session,
  *   !can_should_park() -- the poller is actually free to keep s_ecu_answering fresh.
@@ -1602,9 +1622,9 @@ bool poll_log_quiesced(void)
  * logging predicates above and is the whole reason this is not a wrapper around one of them:
  *   - a veto that reads true when nothing maintains it means the device NEVER SLEEPS. In
  *     ELM327/FAST_LOG mode, before the task starts, with a 0-PID table, or after the crash guard
- *     skipped bring-up, poll_log_engine_running() returns TRUE (:1583). Using it here would
+ *     skipped bring-up, poll_log_ignition_on() returns TRUE (defined just above). Using it here would
  *     silently flatten the car battery, and a bench running POLL_LOG would never reveal it.
- *   - s_ecu_answering rather than s_engine_running: s_engine_running also goes true for up to ~2 s on
+ *   - s_ecu_answering rather than s_bus_normal: s_bus_normal also goes true for up to ~2 s on
  *     ANY stray frame during a probe (:1417), so a chattering module that never answers a poll
  *     could hold the veto up indefinitely. s_ecu_answering cannot rise without a matched reply to a
  *     frame we transmitted (:715 -> :759).
@@ -1644,7 +1664,7 @@ float poll_log_sweep_hz(void)
 
 uint32_t poll_log_bus_idle_ms(void)
 {
-    if (!s_active || s_engine_running)
+    if (!s_active || s_bus_normal)
         return UINT32_MAX;   /* not idle while actively polling or outside POLL_LOG */
     int64_t d = (esp_timer_get_time() - s_last_rx_us) / 1000;
     if (d < 0) d = 0;
@@ -1683,7 +1703,7 @@ char *poll_log_get_status_json(void)
              "\"pace_sweeps\":%u,\"min_sweep_ms\":%u,"
              "\"sweep_min_ms\":%.1f,\"sweep_max_ms\":%.1f,\"fast_ms\":%.1f,\"fast_hz\":%.2f,"
              "\"win_ok\":%u,\"win_timeout\":%u,\"win_txfail\":%u,"
-             "\"engine_running\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s,"
+             "\"ignition_on\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s,"
              "\"reload_pending\":%s,"
              "\"state\":\"%s\",\"gate_open\":%s,"
              "\"gate_volt\":%.1f,\"rpm_known\":%s,\"rpm\":%.0f}",
@@ -1701,7 +1721,7 @@ char *poll_log_get_status_json(void)
              (double)s_win_sweep_min_ms, (double)s_win_sweep_max_ms,
              (double)s_fast_ms, (double)s_fast_hz,
              (unsigned)s_win_ok, (unsigned)s_win_timeout, (unsigned)s_win_txfail,
-             poll_log_engine_running() ? "true" : "false",
+             poll_log_ignition_on() ? "true" : "false",
              s_quiesced ? "true" : "false",
              (unsigned)poll_log_bus_idle_ms(),
              s_last_reload_ok ? "true" : "false",

@@ -23,6 +23,19 @@
             --primary-dark: #1a3266;
             --success-color: #059669;
             --danger-color: #dc2626;
+            /* --warning-color was USED (the Mark Event button) but never defined, so that one use
+               only ever worked through its var() fallback. Defined here now. */
+            --warning-color: #d97706;
+            /* Banner palette. These six were duplicated as raw hex in BOTH the .sleep-banner CSS
+               and showNotification()'s inline styles in main.js; named here so a colour change is
+               one edit. Kept as their own tokens rather than reusing --danger-color, which is a
+               different red (#dc2626) and is not the border/text pair these banners want. */
+            --banner-warn-bg: #fef9c3;
+            --banner-warn-border: #eab308;
+            --banner-warn-fg: #854d0e;
+            --banner-error-bg: #fee2e2;
+            --banner-error-border: #ef4444;
+            --banner-error-fg: #991b1b;
             --background-color: #f0f2f5;
             --white: #fff;
             --gray-100: #f7f7f7;
@@ -374,20 +387,47 @@
             margin-right: .5rem
         }
 
-        .notification-container {
+        /* Banner stack (#85). Holds the sleep-countdown banner ABOVE the one-slot toast. The
+           toast used to own this fixed positioning itself; it is now a plain flow child so the
+           two stack by document order with no offset arithmetic, and neither can hide the
+           other. The toast keeps its own show/hide and its own auto-hide timer. */
+        .banner-stack {
             z-index: 1000;
-            padding: 1rem;
-            font-weight: 500;
-            transition: all .3s;
-            display: none;
             position: fixed;
             top: 0;
             left: 240px;
             right: 0
         }
 
-        .notification-container.show {
+        /* Shared box shape for both banners in the stack. The toast still gets its COLOURS from
+           inline styles set by showNotification(); the sleep banner takes its from the tokens
+           above. */
+        .notification-container,
+        .sleep-banner {
+            padding: 1rem;
+            font-weight: 500;
+            transition: all .3s;
+            display: none
+        }
+
+        .notification-container.show,
+        .sleep-banner.show {
             display: block
+        }
+
+        /* Persistent (never auto-hides) countdown banner. Same look as the toast's yellow variant
+           so it reads as part of the same system. */
+        .sleep-banner {
+            background-color: var(--banner-warn-bg);
+            border-color: var(--banner-warn-border);
+            color: var(--banner-warn-fg)
+        }
+
+        /* The device is going, or has gone, off the network. */
+        .sleep-banner.lost {
+            background-color: var(--banner-error-bg);
+            border-color: var(--banner-error-border);
+            color: var(--banner-error-fg)
         }
 
         .form-input::placeholder {
@@ -458,7 +498,9 @@
         }
 
         @media (max-width:768px) {
-            .notification-container {
+            /* The sidebar is hidden at this width, so the stack spans the full page. Moved from
+               .notification-container to .banner-stack, which now owns the positioning. */
+            .banner-stack {
                 left: 0
             }
         }
@@ -1088,7 +1130,10 @@
         <div style="color:#24478f;text-align:center;background:#faa3a3;border:1px solid #fde68a;border-radius:8px;margin:2rem 1rem 1rem;padding:.75rem;font-size:.95rem;display:none" id="firmware-update-notice"><span style="font-weight:600">New firmware available!</span><br><a href="https://github.com/cdufresne81/nc-flash-wican-fw/releases" id="firmware-update-link" style="color:#2563eb;text-decoration:underline" target="_blank">Download</a></div>
     </div>
     <div class="content">
-        <div class="notification-container" id="notification"></div>
+        <div class="banner-stack">
+            <div class="sleep-banner" id="sleep_banner"></div>
+            <div class="notification-container" id="notification"></div>
+        </div>
         <div id="sleep_warning_div" style="display:none">
             <div class="divider"></div>
             <div class="section-title" style="color:#dc2626">⚠️ Sleep Mode Disabled Warning</div>

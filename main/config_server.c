@@ -2381,6 +2381,70 @@ static const httpd_uri_t wake_probe_uri = {
     .user_ctx  = NULL
 };
 
+/* ---- GET /sleep_status (#85) ------------------------------------------------------------------
+ * Tiny live view of the sleep state machine, for the web UI's sleep-countdown banner. Deliberately
+ * NOT folded into /check_status: that response is ~2 KB, rebuilds a dozen subsystem strings and
+ * carries (redacted) WiFi credentials, and the banner has to poll from EVERY tab every couple of
+ * seconds. This one is a stack buffer and a single non-blocking queue peek.
+ *
+ *   state       -- "off"       sleep is disabled in config, or the state machine has published
+ *                              nothing yet. The publish site is gated on sleep_en == 1, so with
+ *                              sleep off the peek simply fails -- which is what we report, and is
+ *                              what stops the UI rendering "undefined".
+ *                  "normal"    awake, no countdown running.
+ *                  "countdown" counting down to sleep; secs_left is meaningful.
+ *                  "sleeping" / "waking" -- present for completeness. Never observable in practice:
+ *                              the radio is down through both, so nothing can answer this request.
+ *   secs_left   -- whole seconds until sleep, rounded UP so it never reads 0 while still counting.
+ *                  0 unless state is "countdown".
+ *   secs_total  -- the countdown length in seconds, AS THE SLEEP TASK ARMED IT. The browser uses
+ *                  (secs_total - secs_left) as "how long has this countdown been running", which is
+ *                  how it suppresses the ~2-second countdown that every boot starts and cancels.
+ *                  Taken from the published struct, NOT re-read from config here: the task and a
+ *                  local read fall back to different values on a bad parse (120000 ms vs 0), and a
+ *                  secs_total of 0 would make elapsed clamp to 0 so the banner never appeared.
+ *   voltage     -- the reading that started the countdown, so the banner can say why.
+ * ---------------------------------------------------------------------------------------------- */
+static esp_err_t sleep_status_handler(httpd_req_t *req)
+{
+    sleep_state_info_t info = {0};
+    const char *state_str = "off";
+    unsigned secs_left = 0, secs_total = 0;
+    float voltage = 0.0f;
+
+    if (sleep_mode_get_state(&info) == ESP_OK)
+    {
+        voltage    = info.voltage;
+        secs_total = (unsigned)(info.total_ms / 1000u);
+        switch (info.state)
+        {
+            case STATE_NORMAL:       state_str = "normal";    break;
+            case STATE_LOW_VOLTAGE:  state_str = "countdown";
+                                     /* Round UP: 1..999 ms left must not render as "0:00". */
+                                     secs_left = (unsigned)((info.timer + 999u) / 1000u);
+                                     break;
+            case STATE_SLEEPING:     state_str = "sleeping";  break;
+            case STATE_WAKE_PENDING: state_str = "waking";    break;
+        }
+    }
+
+    char body[160];
+    snprintf(body, sizeof(body),
+             "{\"state\":\"%s\",\"secs_left\":%u,\"secs_total\":%u,\"voltage\":%.2f}",
+             state_str, secs_left, secs_total, (double)voltage);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, body);
+    return ESP_OK;
+}
+
+static const httpd_uri_t sleep_status_uri = {
+    .uri       = "/sleep_status",
+    .method    = HTTP_GET,
+    .handler   = sleep_status_handler,
+    .user_ctx  = NULL
+};
+
 static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 {
 	cJSON * root, *key = 0;
@@ -3339,6 +3403,7 @@ static void register_server_uris(void)
 	httpd_register_uri_handler(server, &std_pid_info);
 	httpd_register_uri_handler(server, &poll_status_uri);
 	httpd_register_uri_handler(server, &wake_probe_uri);  /* #4 -- permanent sleep/resume diagnostic */
+	httpd_register_uri_handler(server, &sleep_status_uri);  /* #85 -- feeds the countdown banner */
 
 	//Add before this line
 	httpd_register_uri_handler(server, &csv_status_uri);

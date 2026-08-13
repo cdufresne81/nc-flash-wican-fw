@@ -26,5 +26,7 @@ typedef int64_t wc_timer_t;
 
 void wc_timer_set(wc_timer_t *timer, uint64_t expire_time_ms);
 bool wc_timer_is_expired(wc_timer_t *timer);
+/* How long is left, for callers that REPORT a countdown instead of just testing it. Clamped at 0. */
+uint32_t wc_timer_remaining_ms(wc_timer_t *timer);
 
 #endif
