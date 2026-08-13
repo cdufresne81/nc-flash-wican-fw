@@ -118,6 +118,7 @@ static const char *evl_code_str(event_log_code_t code)
         case EVL_DATALOG_RESUME:return "DATALOG_RESUME";
         case EVL_REAPER_RESUME: return "REAPER_RESUME";
         case EVL_CAN_WAKE:      return "CAN_WAKE";
+        case EVL_WIFI:          return "WIFI";
         case EVL_WARN:          return "WARN";
         case EVL_INFO:          return "INFO";
         case EVL_CODE_MAX:      break;

@@ -1226,6 +1226,16 @@
                             <div id="sta_status">Not Connected&nbsp;</div>
                         </td>
                     </tr>
+                    <!-- #105: entry point to the standalone Wi-Fi diagnostic page. Deliberately a
+                         separate page opened in a new tab, not a modal in here: the browser's own
+                         reload then works, the URL survives being bookmarked or sent to a phone,
+                         and it stays readable when the link this app rides on is the thing failing. -->
+                    <tr>
+                        <td>WiFi Diagnostics:</td>
+                        <td>
+                            <button class="console-mini-btn" type="button" onclick="openWifiDiag()">Open diagnostics</button>
+                        </td>
+                    </tr>
                     <tr>
                         <td>Station IP:</td>
                         <td>

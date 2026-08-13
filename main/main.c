@@ -62,6 +62,7 @@
 #include "fast_log.h"
 #include "poll_log.h"
 #include "event_log.h"
+#include "wifi_diag.h"
 #include "led.h"
 #include "led_indicator.h"
 #include "obd.h"
@@ -979,6 +980,31 @@ void app_main(void)
 	}
 	vehicle_init(&vehicle_config);
 	wifi_network_init(ap_ssid);
+
+	/* #105: start the Wi-Fi link diagnostics right after the radio is up, so the 1 Hz sampler sees
+	 * the very first association. The event hooks inside wifi_mgr already work before this point
+	 * (they only fill a RAM ring), so nothing that happened during bring-up is lost.
+	 *
+	 * Both injections exist because wifi_diag is a leaf component and cannot reach back into main:
+	 * the firmware version, so a pasted report can be tied to a build, and the diagnostic page's
+	 * embedded bytes, which only main can name. */
+	{
+		extern const uint8_t web_wifi_diag_html_start[] asm("_binary_wifi_diag_html_start");
+		extern const uint8_t web_wifi_diag_html_end[]   asm("_binary_wifi_diag_html_end");
+		wifi_diag_set_page(web_wifi_diag_html_start,
+		                   (size_t)(web_wifi_diag_html_end - web_wifi_diag_html_start));
+	}
+	/* Deliberately NOT the file-static firmware_version[]: nothing ever assigns it (it reaches
+	 * wc_mdns_init as an empty string), so a report built from it would carry a blank build. The
+	 * running app descriptor is the same source the boot event-log line above uses. */
+	{
+		esp_app_desc_t *wd_app = dev_status_get_running_app_info();
+		if (wd_app != NULL)
+		{
+			wifi_diag_set_fw_version(wd_app->version);
+		}
+	}
+	wifi_diag_init();
 
 	int32_t port = config_server_get_port();
 

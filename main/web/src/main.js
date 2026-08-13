@@ -4447,6 +4447,15 @@ function consoleLoadChips() {
         .catch(function() {});
 }
 
+/* #105: open the standalone Wi-Fi diagnostic page (/wifi_diag/page, embedded separately from this
+ * app -- see main/web/wifi_diag.html). A new tab rather than navigation, so the user does not lose
+ * whatever they had open in here; a popup blocker returning null is handled by navigating in place
+ * rather than leaving the button looking broken. */
+function openWifiDiag() {
+    var w = window.open('/wifi_diag/page', '_blank');
+    if (!w) window.location.href = '/wifi_diag/page';
+}
+
 function consoleRefresh() {
     consoleLoadTrips();
     consoleLoadChips();

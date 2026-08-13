@@ -89,6 +89,7 @@
 #include "csv_logger.h"
 #include "poll_log.h"
 #include "event_log.h"
+#include "wifi_diag.h"
 #include "esp_timer.h"   /* /wake_probe uptime reporting */
 #include "sd_filemgr.h"
 #include "sdcard.h"
@@ -3415,6 +3416,7 @@ static void register_server_uris(void)
 	httpd_register_uri_handler(server, &sd_files_get_uri);
 	httpd_register_uri_handler(server, &sd_files_post_uri);
 	event_log_register_handlers(server);   // GET /event_log* (Task #24) -- before the catch-all wildcard
+	wifi_diag_register_handlers(server);   // GET /wifi_diag* (#105) -- likewise before the wildcard
 }
 
 //static char* device_config = NULL;

@@ -74,6 +74,7 @@ set(requires
     wican_common
     restart_tracker
     event_log
+    wifi_diag
     crash_report
 )
 
@@ -97,6 +98,10 @@ idf_component_register(
         "web/src/lucide_icons.js"
         "web/src/main.js"
         "web/safemode.html"
+        # #105: standalone Wi-Fi diagnostic page. Hand-written and embedded verbatim, exactly like
+        # safemode.html -- it is NOT part of the build_web.py minify pipeline, which owns only the
+        # single-page app (homepage_full.html -> src/homepage.html).
+        "web/wifi_diag.html"
         # "obd_fw/V2.3.18.txt"
         "obd_fw/V2.3.22.txt"
         "logo.txt"
