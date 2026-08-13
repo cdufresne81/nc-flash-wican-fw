@@ -140,7 +140,6 @@ static uint64_t s_ttc_sum_ms;
 static uint32_t s_ttc_n;
 static uint8_t  s_last_reason;
 static uint32_t s_last_reason_up_s;
-static bool     s_had_disconnect;
 
 static struct {
     uint8_t  reason;
@@ -422,7 +421,9 @@ void wifi_diag_note_attempt(const char *ssid)
 
     wd_evt_push(s, NULL, "attempt  ");
     // Chatty by nature: a failing device retries every few seconds. Ring-only unless debug is on.
-    EVENT_LOG_DEBUG(EVL_WIFI, "attempt ssid='%s'", s);
+    char m[48];
+    wd_mask_ssid(s, m, sizeof(m));
+    EVENT_LOG_DEBUG(EVL_WIFI, "attempt ssid=%s", m);
 }
 
 void wifi_diag_note_connected(const char *ssid, const uint8_t *bssid, uint8_t channel)
@@ -434,7 +435,14 @@ void wifi_diag_note_connected(const char *ssid, const uint8_t *bssid, uint8_t ch
     portEXIT_CRITICAL(&s_lock);
 
     wd_evt_push(s, bssid, "associate ch=%u", (unsigned)channel);
-    event_log_emit(EVL_WIFI, "associated ssid='%s' ch=%u", s, (unsigned)channel);
+    // Masked, with no raw escape hatch. The report can offer ?raw=1 because the caller chooses
+    // per request; a line written to the SD event log is permanent, and /event_log is served
+    // unmasked with no query parameter -- this report's own footer sends people there to read the
+    // WIFI lines. Masking only the newer, showier route while the persisted one published the
+    // network name in full would make the "safe to paste in public" promise worthless.
+    char m[48];
+    wd_mask_ssid(s, m, sizeof(m));
+    event_log_emit(EVL_WIFI, "associated ssid=%s ch=%u", m, (unsigned)channel);
 }
 
 void wifi_diag_note_got_ip(const char *ip)
@@ -485,7 +493,6 @@ void wifi_diag_note_disconnected(const char *ssid, uint8_t reason)
 
     portENTER_CRITICAL(&s_lock);
     s_disconnects++;
-    s_had_disconnect = true;
     s_last_reason = reason;
     s_last_reason_up_s = (uint32_t)(now / 1000);
     wd_tally_add(reason);
@@ -560,9 +567,11 @@ void wifi_diag_note_ban(const char *ssid, uint32_t ms)
 
     wd_evt_push(s, NULL, "BAN       for %us", (unsigned)(ms / 1000));
     // Always logged: a banned SSID is invisible everywhere else and presents to the user as an
-    // unexplained refusal to connect.
-    event_log_emit(EVL_WIFI, "SSID '%s' banned for %us after repeated auth failures",
-                   s, (unsigned)(ms / 1000));
+    // unexplained refusal to connect. Masked for the same reason as the association line above.
+    char m[48];
+    wd_mask_ssid(s, m, sizeof(m));
+    event_log_emit(EVL_WIFI, "SSID %s banned for %us after repeated auth failures",
+                   m, (unsigned)(ms / 1000));
 }
 
 // ---- Sampler -----------------------------------------------------------------------------------
@@ -620,6 +629,11 @@ static void wd_sample_once(void)
     bool overlap = snap.sta_up && snap.ap_up && snap.ap_channel != 0 &&
                    snap.channel != 0 && snap.ap_channel != snap.channel;
 
+    // Read the clock BEFORE taking the lock. Cheap as it is (a couple of systimer reads), it was
+    // the one call left inside a critical section, against this file's own stated rule that the
+    // lock holds nothing but scalar stores.
+    int64_t now_ms = wd_up_ms();
+
     portENTER_CRITICAL(&s_lock);
     s_snap = snap;
     s_samples++;
@@ -637,7 +651,7 @@ static void wd_sample_once(void)
         s_rssi_ring_head++;
         if (s_session_start_ms != 0)
         {
-            int64_t d = wd_up_ms() - s_session_start_ms;
+            int64_t d = now_ms - s_session_start_ms;
             s_session_current_s = (d > 0) ? (uint32_t)(d / 1000) : 0;
             // Keep the maximum live rather than only closing it out on disconnect. Updating it
             // solely in the disconnect handler meant a device that never dropped reported
@@ -890,6 +904,28 @@ static void wd_pf(wd_out_t *o, const char *fmt, ...)
     }
 }
 
+// Allocate the chunk buffer both handlers stream through, laddering down under memory pressure and
+// answering the request itself on failure. Sized in one place because the floor is not arbitrary:
+// wd_pf() flushes whenever fewer than WD_FINDING_MAX+64 bytes remain, so a 256-byte buffer would
+// flush before every single write AND still risk truncating the longest finding. 512 guarantees a
+// full line always fits.
+static char *wd_out_alloc(httpd_req_t *req, size_t *cap_out)
+{
+    size_t cap = 1024;
+    while (cap >= 512)
+    {
+        char *buf = heap_caps_malloc(cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (buf != NULL)
+        {
+            *cap_out = cap;
+            return buf;
+        }
+        cap /= 2;
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    return NULL;
+}
+
 // ---- GET /wifi_diag/report ----------------------------------------------------------------------
 
 static esp_err_t wd_send_report(httpd_req_t *req)
@@ -903,34 +939,23 @@ static esp_err_t wd_send_report(httpd_req_t *req)
         if (q != NULL && strstr(q, "raw=1") != NULL) raw = true;
     }
 
-    // Floor at 512, not 256: wd_pf() flushes whenever fewer than WD_FINDING_MAX+64 bytes remain, so
-    // a 256-byte buffer would flush before every single write and still risk truncating the longest
-    // finding. 512 guarantees a full line always fits.
-    size_t cap = 1024;
-    char *buf = NULL;
-    while (cap >= 512)
-    {
-        buf = heap_caps_malloc(cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (buf != NULL) break;
-        cap /= 2;
-    }
+    size_t cap;
+    char *buf = wd_out_alloc(req, &cap);
     if (buf == NULL)
     {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-        return ESP_FAIL;
+        return ESP_FAIL;   /* wd_out_alloc already answered the request */
     }
 
     // Snapshot every number under one lock so the report is internally consistent.
     wd_snap_t snap;
     uint32_t samples, samples_up, overlap, connects, got_ips, disconnects, bans;
-    uint32_t sess_cur, sess_long, ttc_last, ttc_n, ifree_min, iblock_min, last_reason_up;
+    uint32_t sess_cur, sess_long, ttc_last, ttc_n, last_reason_up;
     uint32_t hist[WD_HIST_N];
     int32_t  rssi_sum;
     int8_t   rssi_min, rssi_max;
     uint64_t ttc_sum;
     int64_t  connected_total;
     uint8_t  last_reason;
-    bool     had_disc;
     char     ip[16];
     struct { uint8_t reason; uint16_t count; } tally[WD_TALLY_N];
 
@@ -940,7 +965,6 @@ static esp_err_t wd_send_report(httpd_req_t *req)
     connects = s_connects;        got_ips = s_got_ips;            disconnects = s_disconnects;
     bans = s_bans;                sess_cur = s_session_current_s; sess_long = s_session_longest_s;
     ttc_last = s_ttc_last_ms;     ttc_sum = s_ttc_sum_ms;         ttc_n = s_ttc_n;
-    ifree_min = s_int_free_min;   iblock_min = s_int_block_min;
     rssi_sum = s_rssi_sum;        rssi_min = s_rssi_min;          rssi_max = s_rssi_max;
     // Add the session still open, for the same reason as s_session_longest_s above: this total is
     // only banked on disconnect, so without this a device that has never dropped reports having
@@ -951,7 +975,7 @@ static esp_err_t wd_send_report(httpd_req_t *req)
         int64_t live = wd_up_ms() - s_session_start_ms;
         if (live > 0) connected_total += live;
     }
-    last_reason = s_last_reason;  last_reason_up = s_last_reason_up_s;  had_disc = s_had_disconnect;
+    last_reason = s_last_reason;  last_reason_up = s_last_reason_up_s;
     memcpy(hist, s_rssi_hist, sizeof(hist));
     memcpy(tally, s_tally, sizeof(tally));
     strlcpy(ip, s_ip, sizeof(ip));
@@ -1066,7 +1090,7 @@ static esp_err_t wd_send_report(httpd_req_t *req)
         wd_pf(&o, "connect time  : last %u ms, average %u ms over %u connect(s)\n",
               (unsigned)ttc_last, (unsigned)(ttc_sum / ttc_n), (unsigned)ttc_n);
     }
-    if (had_disc)
+    if (disconnects != 0)
     {
         wd_pf(&o, "last drop     : reason %u at uptime %u s -- %s\n",
               (unsigned)last_reason, (unsigned)last_reason_up, wifi_diag_reason_str(last_reason));
@@ -1098,8 +1122,8 @@ static esp_err_t wd_send_report(httpd_req_t *req)
         portENTER_CRITICAL(&s_lock);
         if (ifree_now < s_int_free_min)   s_int_free_min = ifree_now;
         if (iblock_now < s_int_block_min) s_int_block_min = iblock_now;
-        ifree_min = s_int_free_min;
-        iblock_min = s_int_block_min;
+        uint32_t ifree_min = s_int_free_min;
+        uint32_t iblock_min = s_int_block_min;
         portEXIT_CRITICAL(&s_lock);
 
         wd_pf(&o, "free now / lowest seen        : %u / %u bytes\n",
@@ -1192,21 +1216,11 @@ static void wd_json_str(wd_out_t *o, const char *s)
 
 static esp_err_t wd_send_json(httpd_req_t *req)
 {
-    // Floor at 512, not 256: wd_pf() flushes whenever fewer than WD_FINDING_MAX+64 bytes remain, so
-    // a 256-byte buffer would flush before every single write and still risk truncating the longest
-    // finding. 512 guarantees a full line always fits.
-    size_t cap = 1024;
-    char *buf = NULL;
-    while (cap >= 512)
-    {
-        buf = heap_caps_malloc(cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (buf != NULL) break;
-        cap /= 2;
-    }
+    size_t cap;
+    char *buf = wd_out_alloc(req, &cap);
     if (buf == NULL)
     {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-        return ESP_FAIL;
+        return ESP_FAIL;   /* wd_out_alloc already answered the request */
     }
 
     wd_snap_t snap;
@@ -1216,7 +1230,6 @@ static esp_err_t wd_send_json(httpd_req_t *req)
     int8_t   rssi_min, rssi_max;
     uint64_t ttc_sum;
     uint8_t  last_reason;
-    bool     had_disc;
     char     ip[16];
     struct { uint8_t reason; uint16_t count; } tally[WD_TALLY_N];
 
@@ -1228,7 +1241,7 @@ static esp_err_t wd_send_json(httpd_req_t *req)
     ttc_last = s_ttc_last_ms;  ttc_sum = s_ttc_sum_ms;          ttc_n = s_ttc_n;
     iblock_min = s_int_block_min;
     rssi_sum = s_rssi_sum;     rssi_min = s_rssi_min;           rssi_max = s_rssi_max;
-    last_reason = s_last_reason; had_disc = s_had_disconnect;
+    last_reason = s_last_reason;
     memcpy(tally, s_tally, sizeof(tally));
     strlcpy(ip, s_ip, sizeof(ip));
     portEXIT_CRITICAL(&s_lock);
@@ -1274,13 +1287,17 @@ static esp_err_t wd_send_json(httpd_req_t *req)
         head = s_rssi_ring_head;
         portEXIT_CRITICAL(&s_lock);
         uint32_t count = (head < WD_RSSI_RING_N) ? head : WD_RSSI_RING_N;
+        // One lock for the whole ring, not one per sample. It is 120 bytes; copying it in a single
+        // critical section costs less than the 240 lock/unlock pairs the per-sample version took,
+        // and this runs every 5 s for as long as the diagnostic page is left open.
+        int8_t ring[WD_RSSI_RING_N];
+        portENTER_CRITICAL(&s_lock);
+        memcpy(ring, s_rssi_ring, sizeof(ring));
+        portEXIT_CRITICAL(&s_lock);
         for (uint32_t i = 0; i < count; i++)
         {
-            int8_t v;
-            portENTER_CRITICAL(&s_lock);
-            v = s_rssi_ring[(head - count + i) % WD_RSSI_RING_N];
-            portEXIT_CRITICAL(&s_lock);
-            wd_pf(&o, "%s%d", (i == 0) ? "" : ",", (int)v);
+            wd_pf(&o, "%s%d", (i == 0) ? "" : ",",
+                  (int)ring[(head - count + i) % WD_RSSI_RING_N]);
         }
     }
     wd_pf(&o, "]}");
@@ -1293,8 +1310,8 @@ static esp_err_t wd_send_json(httpd_req_t *req)
     wd_pf(&o, ",\"ttc_last_ms\":%u,\"ttc_avg_ms\":%u",
           (unsigned)ttc_last, (ttc_n > 0) ? (unsigned)(ttc_sum / ttc_n) : 0);
     wd_pf(&o, ",\"last_reason\":%d,\"last_reason_str\":",
-          had_disc ? (int)last_reason : -1);
-    wd_json_str(&o, had_disc ? wifi_diag_reason_str(last_reason) : "");
+          (disconnects != 0) ? (int)last_reason : -1);
+    wd_json_str(&o, (disconnects != 0) ? wifi_diag_reason_str(last_reason) : "");
     wd_pf(&o, ",\"reasons\":[");
     {
         bool first = true;

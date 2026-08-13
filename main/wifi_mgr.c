@@ -194,11 +194,11 @@ static void wifi_mgr_fs_on_auth_failure(const char* ssid) {
     }
 }
 
-/* #105: the single place last_attempted_ssid is set on a path that is about to call
- * esp_wifi_connect(). Four sites used to open-code the same snprintf; routing them all through here
- * means the diagnostic's connection-attempt stopwatch (attempt -> got IP) cannot silently miss a
- * path when a fifth one is added. An empty SSID is recorded but not reported as an attempt: those
- * callers deliberately do NOT connect. */
+/* #105: records the SSID a connect is about to be attempted against, and starts the diagnostic's
+ * connection stopwatch (attempt -> got IP). Four sites used to open-code the same snprintf.
+ * An empty SSID is recorded but not reported as an attempt: those callers deliberately do NOT
+ * connect. Where the SSID is not known up front, go through wifi_mgr_connect_current_config()
+ * below rather than calling esp_wifi_connect() bare. */
 static void wifi_mgr_set_attempted_ssid(const char* ssid) {
     snprintf(wifi_status.last_attempted_ssid, sizeof(wifi_status.last_attempted_ssid), "%s",
              ssid ? ssid : "");
@@ -214,6 +214,18 @@ static void wifi_mgr_update_last_attempted_from_current_config(void) {
     } else {
         wifi_status.last_attempted_ssid[0] = '\0';
     }
+}
+
+/* #105: connect using whatever STA config is currently loaded, recording the attempt first.
+ * Several branches of wifi_mgr_scan_select_and_connect() give up on choosing an SSID (wrong mode,
+ * nothing configured, scan found nothing, scan failed, out of memory) and fall through to a bare
+ * connect. Those are still connection attempts, and one sibling branch already remembered to call
+ * wifi_mgr_update_last_attempted_from_current_config() first while the others did not -- so the
+ * stopwatch silently never started on those paths and a later STA_CONNECTED was attributed to a
+ * stale SSID. Routing them through one function is what makes the choke point actually hold. */
+static esp_err_t wifi_mgr_connect_current_config(void) {
+    wifi_mgr_update_last_attempted_from_current_config();
+    return esp_wifi_connect();
 }
 
 static bool wifi_mgr_reason_is_auth_related(uint8_t reason) {
@@ -258,13 +270,13 @@ static bool wifi_mgr_ssid_present(const wifi_ap_record_t* ap_records, uint16_t a
 static void wifi_mgr_scan_select_and_connect(void) {
     // Only relevant when STA is part of the current mode
     if (!(wifi_config.mode == WIFI_MGR_MODE_STA || wifi_config.mode == WIFI_MGR_MODE_APSTA)) {
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
     // If nothing to choose from (no primary and no fallbacks), just connect
     if ((wifi_config.sta_ssid[0] == '\0') && (wifi_config.fallback_count == 0)) {
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
@@ -392,7 +404,7 @@ static void wifi_mgr_scan_select_and_connect(void) {
             esp_wifi_set_mode(WIFI_MODE_AP);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
@@ -403,7 +415,7 @@ static void wifi_mgr_scan_select_and_connect(void) {
             esp_wifi_set_mode(WIFI_MODE_AP);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
@@ -415,7 +427,7 @@ static void wifi_mgr_scan_select_and_connect(void) {
             esp_wifi_set_mode(WIFI_MODE_AP);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        esp_wifi_connect();
+        wifi_mgr_connect_current_config();
         return;
     }
 
