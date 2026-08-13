@@ -58,24 +58,21 @@ _Static_assert(CSV_LOGGER_SOURCE_MAX == 8, "wide column source dim must match pr
 
 #define CSV_LOGGER_QUEUE_LEN        256
 #define CSV_LOGGER_TASK_STACK_SIZE  (1024 * 6)
-// How long after boot the writer holds off opening its FIRST session.
+// NOTE: there is deliberately NO boot delay before the datalogger starts.
 //
-// This used to be a 20 s delay before the writer task was even CREATED, and it reported
-// nothing while it waited, so "still starting" and "broken" were indistinguishable -- the
-// field failure written up in docs/internals/csv_logger.md. The writer now starts inline
-// and only the first file open waits, which buys an honest /csv_status from t=0 and starts
-// the crash guard's 15 s stability window at boot instead of 20 s in, halving the window a
-// reboot can land inside.
+// There used to be 20 s of one -- the writer task was not even created until then, and the
+// device reported nothing while it waited, so "still starting" and "broken" looked
+// identical. A user rebooted into that silence, landed inside the crash guard's armed
+// window, and lost auto-logging for the following boot entirely. The delay was never a
+// timing requirement: the crash it was added for was a task-publish race in
+// csv_logger_init(), fixed by publishing the queue before creating the task.
 //
-// What still waits is the only risky part: SD fopen/fprintf/fsync in flash-cache-disable
-// windows, held past the boot storm. The original 20 s was never a timing requirement --
-// the historical "boot crash-loop" was a task-publish race in csv_logger_init(), fixed by
-// publishing the queue before creating the task, and the delay has been margin ever since.
-#define CSV_LOGGER_OPEN_HOLDOFF_MS  10000
-// How long after a skipped bring-up the one permitted retry runs. Long enough that a
-// deterministic init crash costs a full minute of uptime before it recurs (so the device
-// stays usable and reachable), short enough that a spurious skip -- a user reboot, a
-// brownout -- costs one minute rather than the whole drive.
+// Nothing replaced it, because the ordering already gives the margin for free:
+// csv_logger_start_at_boot() runs BEFORE autopid_init()/poll_log_init() (main.c), no record
+// can exist until a producer starts, and no session opens until a record arrives. The first
+// file therefore opens when the ECU actually answers -- ~3-5 s -- rather than when a timer
+// says so. event_log's writer has always done SD fopen/fwrite/fsync from t=0 on the same
+// card with no holdoff at all, which is the evidence that a clock here bought nothing.
 #define CSV_LOGGER_SKIP_RETRY_MS    60000
 // One file per engine on/off cycle: the session already opens on ignition-on and closes on
 // ignition-off (3 s debounce), so the only thing that can split a single drive is this byte cap.
@@ -218,17 +215,15 @@ static bool csv_bringup_skipped = false;
 // csv_manual_mode above; the deadline is written once and read as a snapshot.
 enum
 {
-    CSV_AS_DISABLED = 0,   // csv_log != enable: no auto-start was ever scheduled
-    CSV_AS_HOLDOFF,        // writer up, first session open held off
-    CSV_AS_READY,          // holdoff elapsed, the gate decides from here
+    CSV_AS_DISABLED = 0,   // no auto-start pending: writer running normally, or csv_log off
     CSV_AS_SKIPPED_RETRY,  // guard skip, one delayed retry pending
     CSV_AS_SKIPPED,        // guard skip, no retry this uptime
     CSV_AS_UNAVAILABLE,    // the writer could not be started at all (e.g. out of memory)
 };
 static volatile int8_t s_autostart_state = CSV_AS_DISABLED;
-// Uptime (ms) at which the pending holdoff/retry countdown expires. Only meaningful while
-// s_autostart_state is HOLDOFF or SKIPPED_RETRY -- the STATE is what says whether a
-// countdown is running, because 0 is a legitimate uptime and would be a bogus sentinel.
+// Uptime (ms) at which the pending retry countdown expires. Only meaningful while
+// s_autostart_state is SKIPPED_RETRY -- the STATE is what says whether a countdown is
+// running, because 0 is a legitimate uptime and would be a bogus sentinel.
 // 32-bit deliberately: the httpd task reads this from the other core, and a 64-bit read
 // would tear on this 32-bit core (see csv_autostart_remaining_ms).
 static volatile uint32_t s_autostart_deadline_ms = 0;
@@ -237,14 +232,6 @@ static volatile uint32_t s_autostart_deadline_ms = 0;
 static inline uint32_t csv_uptime_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
-}
-
-// Publish a countdown. Deadline BEFORE state, always: the state is what tells a reader a
-// countdown is running, so publishing it first would expose the previous deadline.
-static void csv_autostart_arm(int8_t state, uint32_t in_ms)
-{
-    s_autostart_deadline_ms = csv_uptime_ms() + in_ms;
-    s_autostart_state = state;
 }
 
 // Set by the sleep teardown, cleared by the resume. Forces the writer task to close any open
@@ -792,24 +779,6 @@ static void csv_logger_task(void *pvParameters)
         // Session open, rate-limited if the SD card is missing or failing.
         if (!csv_session_active)
         {
-            // Boot holdoff on the FIRST file open. Records that arrive during it are
-            // drained and discarded -- deliberately, and NOT counted as pending drops:
-            // draining is what keeps the 256-slot queue from filling and making a healthy
-            // boot report rows_dropped like a failing card, and no row could be written
-            // anyway since rows are emitted solely by the grid tick of an open session.
-            // (So the holdoff does not buffer boot samples; what starting the writer early
-            // actually buys is an honest /csv_status and a crash-guard window that starts
-            // at boot instead of 20 s in.)
-            if (s_autostart_state == CSV_AS_HOLDOFF)
-            {
-                if (csv_autostart_remaining_ms(csv_uptime_ms(), s_autostart_deadline_ms) > 0)
-                {
-                    continue;
-                }
-                s_autostart_state = CSV_AS_READY;
-                ESP_LOGI(TAG, "CSV auto-start holdoff elapsed; gate is live");
-            }
-
             int64_t now_ms = esp_timer_get_time() / 1000;
             if (now_ms < csv_sd_retry_after_ms)
             {
@@ -953,15 +922,6 @@ esp_err_t csv_logger_set_manual_override(bool enable)
                 return e;
             }
         }
-        // An explicit Start outranks the boot holdoff: the operator is standing there
-        // asking for a file now, and the holdoff exists only to keep AUTO off the SD card
-        // during the boot storm. Without this, Start during the countdown would appear to
-        // do nothing for up to CSV_LOGGER_OPEN_HOLDOFF_MS -- the exact "it looks broken"
-        // failure this whole change exists to remove.
-        if (s_autostart_state == CSV_AS_HOLDOFF)
-        {
-            s_autostart_state = CSV_AS_READY;
-        }
         csv_manual_mode = CSV_MANUAL_ON;
     }
     else
@@ -1005,12 +965,10 @@ char *csv_logger_get_status_json(void)
     // computed at read time from the deadline, so no timer task is needed.
     const int8_t as = s_autostart_state;
     cJSON_AddStringToObject(root, "autostart",
-                            (as == CSV_AS_HOLDOFF)       ? "holdoff" :
-                            (as == CSV_AS_READY)         ? "ready" :
                             (as == CSV_AS_SKIPPED_RETRY) ? "skipped_retry" :
                             (as == CSV_AS_SKIPPED)       ? "skipped" :
                             (as == CSV_AS_UNAVAILABLE)   ? "unavailable" : "disabled");
-    const bool counting = (as == CSV_AS_HOLDOFF) || (as == CSV_AS_SKIPPED_RETRY);
+    const bool counting = (as == CSV_AS_SKIPPED_RETRY);
     cJSON_AddNumberToObject(root, "autostart_in_ms",
                             counting ? (double)csv_autostart_remaining_ms(
                                            csv_uptime_ms(), s_autostart_deadline_ms) : 0);
@@ -1623,7 +1581,11 @@ static void csv_retry_init_task(void *arg)
 
     if (csv_logger_init() == ESP_OK)
     {
-        csv_autostart_arm(CSV_AS_HOLDOFF, CSV_LOGGER_OPEN_HOLDOFF_MS);
+        // The countdown is over and the writer is up: nothing is pending any more. Without
+        // this the state would stay SKIPPED_RETRY and the UI would report "retrying in 0s"
+        // for the rest of the uptime on a device that had already recovered.
+        s_autostart_state = CSV_AS_DISABLED;
+        event_log_emit(EVL_INFO, "datalog writer started on retry");
     }
     else
     {
@@ -1651,20 +1613,16 @@ void csv_logger_start_at_boot(void)
     // fault can never boot-loop the device. csv_bringup_decide() owns the whole chain
     // (disarm, count, retry-or-give-up) and is host-tested; see csv_bringup_logic.h.
     const csv_bringup_decision_t decision =
-        csv_bringup_decide(&csv_attempt_inprogress, &csv_skip_count);
+        csv_bringup_decide(&csv_attempt_inprogress, &csv_skip_count, &csv_bringup_skipped);
 
     if (decision != CSV_BRINGUP_START)
     {
         const bool will_retry = (decision == CSV_BRINGUP_SKIP_RETRY);
 
-        if (will_retry)
-        {
-            csv_autostart_arm(CSV_AS_SKIPPED_RETRY, CSV_LOGGER_SKIP_RETRY_MS);
-        }
-        else
-        {
-            s_autostart_state = CSV_AS_SKIPPED;   // nothing is counting down
-        }
+        // Deadline BEFORE state: the state is what tells a reader a countdown is running,
+        // so publishing it first would briefly expose a stale deadline.
+        s_autostart_deadline_ms = csv_uptime_ms() + CSV_LOGGER_SKIP_RETRY_MS;
+        s_autostart_state = will_retry ? CSV_AS_SKIPPED_RETRY : CSV_AS_SKIPPED;
 
         ESP_LOGW(TAG, "Prior CSV auto-start attempt did not complete - skipping (%s)",
                  will_retry ? "retrying" : "no retry this boot");
@@ -1690,12 +1648,7 @@ void csv_logger_start_at_boot(void)
         return;
     }
 
-    // Start the writer NOW and hold off only the first file open. See
-    // CSV_LOGGER_OPEN_HOLDOFF_MS for why the old "create the task 20 s from now" shape was
-    // the root of a field failure rather than a safety margin.
-    csv_autostart_arm(CSV_AS_HOLDOFF, CSV_LOGGER_OPEN_HOLDOFF_MS);
-    event_log_emit(EVL_INFO, "datalog writer started; auto session armed in %ds",
-                   CSV_LOGGER_OPEN_HOLDOFF_MS / 1000);
+    event_log_emit(EVL_INFO, "datalog writer started");
 
     if (csv_logger_init() != ESP_OK)
     {

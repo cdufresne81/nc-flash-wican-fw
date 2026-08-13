@@ -62,9 +62,8 @@ esp_err_t csv_logger_init(void);
  *   (csv_logger_init()) if csv_log was disabled at boot. MUST be called from a task at
  *   priority > 4 (the httpd handler at prio 5 qualifies) so the on-demand init cannot hit
  *   the boot publish-race. Returns the csv_logger_init() error on a failed start (e.g. OOM),
- *   leaving the mode OFF. Also cancels any boot open-holdoff, so an operator pressing Start
- *   during the countdown gets a file now. Note: a session only opens once a record arrives,
- *   so logging is effective only while AutoPID records are flowing.
+ *   leaving the mode OFF. Note: a session only opens once a record arrives, so logging is
+ *   effective only while AutoPID records are flowing.
  * enable=false: force logging OFF for the rest of THIS TRIP even if ignition reads on; the
  *   writer closes the session on its next pass and stays alive (never deleted). Cleared back
  *   to AUTO on the next ignition-off edge, so the following key-on records normally -- Stop
@@ -130,10 +129,9 @@ void csv_logger_set_rate_fn(csv_rate_fn_t fn);
 /**
  * @brief Start the CSV datalogger at boot, crash-guard gated.
  *
- * Call this at boot instead of csv_logger_init(). It brings the writer up INLINE -- no
- * task is spawned on the normal path -- and holds off only the writer's FIRST file open
- * (CSV_LOGGER_OPEN_HOLDOFF_MS), so the device reports a running datalogger and an honest
- * countdown from t=0 rather than looking broken while it waits.
+ * Call this at boot instead of csv_logger_init(). It brings the writer up INLINE -- no task
+ * is spawned on the normal path and there is NO start delay, so the first file opens when
+ * the ECU actually answers (~3-5 s) rather than when a timer says so.
  *
  * Safe to call from app_main at priority 1 even though the writer runs at 4: the writer
  * cannot observe a NULL queue because csv_logger_init() publishes the queue BEFORE

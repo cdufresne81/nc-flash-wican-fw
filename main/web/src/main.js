@@ -4021,12 +4021,11 @@ function csv_notify(m, c) {
 // Pure and exported for tools/webtest/csv_status.test.mjs.
 function csvAutostartLabel(j) {
     var s = j && j.autostart;
-    if (s !== 'holdoff' && s !== 'skipped_retry' && s !== 'skipped' && s !== 'unavailable') {
+    if (s !== 'skipped_retry' && s !== 'skipped' && s !== 'unavailable') {
         return null;
     }
     // Ceil, so the label never reads "0s" while the device is still counting down.
     var secs = Math.ceil((Number(j.autostart_in_ms) || 0) / 1000);
-    if (s === 'holdoff')       return { text: 'Starting in ' + secs + 's', warn: false };
     if (s === 'skipped_retry') return { text: 'Auto-start skipped — retrying in ' + secs + 's',
                                         warn: true };
     if (s === 'unavailable')   return { text: 'Datalogger did not start — press Start, or power-cycle',

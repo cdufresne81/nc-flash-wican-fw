@@ -17,21 +17,17 @@ const plain = v => (v === null ? null : JSON.parse(JSON.stringify(v)));
 test('a running or unknown datalogger has nothing extra to say', () => {
     assert.equal(csvAutostartLabel(null), null);
     assert.equal(csvAutostartLabel({}), null);
-    assert.equal(csvAutostartLabel({ autostart: 'ready' }), null);
     assert.equal(csvAutostartLabel({ autostart: 'disabled' }), null);
 });
 
-test('the boot holdoff counts down in whole seconds, rounding up', () => {
-    // Rounded UP so the label never says "0s" while the device is still holding off.
-    assert.deepEqual(plain(csvAutostartLabel({ autostart: 'holdoff', autostart_in_ms: 10000 })),
-                     { text: 'Starting in 10s', warn: false });
-    assert.deepEqual(plain(csvAutostartLabel({ autostart: 'holdoff', autostart_in_ms: 4200 })),
-                     { text: 'Starting in 5s', warn: false });
-    assert.deepEqual(plain(csvAutostartLabel({ autostart: 'holdoff', autostart_in_ms: 1 })),
-                     { text: 'Starting in 1s', warn: false });
-    // Missing/!=number countdown must not render NaN.
-    assert.deepEqual(plain(csvAutostartLabel({ autostart: 'holdoff' })),
-                     { text: 'Starting in 0s', warn: false });
+test('the retry countdown rounds up, and never renders NaN', () => {
+    // Rounded UP so the label never says "0s" while the retry is still pending.
+    const at = ms => csvAutostartLabel({ autostart: 'skipped_retry', autostart_in_ms: ms }).text;
+    assert.match(at(60000), /retrying in 60s$/);
+    assert.match(at(4200), /retrying in 5s$/);
+    assert.match(at(1), /retrying in 1s$/);
+    // Missing / non-numeric countdown must not render NaN.
+    assert.match(csvAutostartLabel({ autostart: 'skipped_retry' }).text, /retrying in 0s$/);
 });
 
 test('a writer that failed to start is distinct from a guard skip', () => {

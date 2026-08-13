@@ -896,9 +896,10 @@ void app_main(void)
 		// #if HARDWARE_VER != WICAN_PRO
 		// can_enable();
 		// #endif
-		// CSV datalogger: brings the writer up inline and holds off only its first file
-		// open -- see CSV_LOGGER_OPEN_HOLDOFF_MS and csv_bringup_logic.h. Explicit '== 1'
-		// so a garbage csv_log value can NEVER enable the logger via bool coercion.
+		// CSV datalogger: brings the writer up inline, no start delay -- the first file
+		// opens when the ECU answers, since this runs before the producers below. See
+		// csv_bringup_logic.h for the crash-guard chain. Explicit '== 1' so a garbage
+		// csv_log value can NEVER enable the logger via bool coercion.
 		if(config_server_get_csv_log() == 1)
 		{
 			csv_logger_start_at_boot();
