@@ -4015,6 +4015,24 @@ xhttp.onload = async function() {
 function csv_notify(m, c) {
     if (typeof showNotification === 'function') showNotification(m, c); else console.log(m);
 }
+// What the recorder card says while nothing is recording. "Idle" is only honest once the
+// datalogger is actually armed -- starting up, bring-up skipped, and genuinely broken must
+// not all render as Idle. Returns null when the normal Idle/Armed/Recording labels apply.
+// Pure and exported for tools/webtest/csv_status.test.mjs.
+function csvAutostartLabel(j) {
+    var s = j && j.autostart;
+    if (s !== 'skipped_retry' && s !== 'skipped' && s !== 'unavailable') {
+        return null;
+    }
+    // Ceil, so the label never reads "0s" while the device is still counting down.
+    var secs = Math.ceil((Number(j.autostart_in_ms) || 0) / 1000);
+    if (s === 'skipped_retry') return { text: 'Auto-start skipped — retrying in ' + secs + 's',
+                                        warn: true };
+    if (s === 'unavailable')   return { text: 'Datalogger did not start — press Start, or power-cycle',
+                                        warn: true };
+    return { text: 'Auto-start disabled this boot — press Start, or power-cycle the dongle',
+             warn: true };
+}
 function csv_status_render(j) {
     var on = !!(j && (j.manual_mode === 'on' || j.session_active));
     console_status_render(j, on);
@@ -4329,8 +4347,11 @@ function console_status_render(j, on) {
     if (!dot || !state || !btn) return;
     var live = !!(j && j.session_active);
     var armed = !!(j && j.manual_mode === 'on' && !live);
+    // Auto-start state only speaks when nothing is recording -- a live trip is its own answer.
+    var auto = (live || armed) ? null : csvAutostartLabel(j);
     dot.className = 'rec-dot' + (live ? ' live' : (armed ? ' armed' : ''));
-    state.textContent = live ? 'Recording' : (armed ? 'Armed' : 'Idle');
+    state.textContent = live ? 'Recording' : (armed ? 'Armed' : (auto ? auto.text : 'Idle'));
+    state.className = 'rec-label' + ((auto && auto.warn) ? ' warn' : '');
     if (file) file.textContent = live ? (j.file || '') : (armed ? 'waiting for data\u2026' : '\u00a0');
     btn.textContent = on ? 'Stop Trip' : 'Start Trip';
     btn.className = 'console-rec-btn' + (on ? ' stop' : '');

@@ -48,6 +48,12 @@ jobs:
       - name: Host tests
         run: node --test tools/webtest/*.test.mjs
 
+      # C host tests: the csv_logger bring-up chain (RTC crash guard, manual-override
+      # lifetime, logging gate). Plain cc, no toolchain, seconds to run -- see
+      # tools/hosttest/run.sh for why that logic is separable at all.
+      - name: Host tests (C)
+        run: bash tools/hosttest/run.sh
+
   build:
     runs-on: ubuntu-latest
     steps:

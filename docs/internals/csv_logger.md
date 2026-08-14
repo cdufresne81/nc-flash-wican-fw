@@ -42,8 +42,39 @@ Adding a new protocol that should drive the Auto grid = implement a `float fn(vo
 
 ## RTC crash guard
 
-A `RTC_NOINIT` guard protects against CSV-induced boot loops: a warm reboot within ~35 s of a CSV-armed boot (deferred start ~20 s + 15 s stable window) leaves the guard armed and **every subsequent warm reboot skips CSV**. Remote recovery without a cold power cycle: `POST /csv_logger?op=start` (manual path bypasses the guard), wait ~20 s for the writer to clear it, then `POST /system_reboot`. Practical rule: avoid back-to-back `/store_config` reboots on CSV-enabled devices.
+A `RTC_NOINIT` guard protects against CSV-induced boot loops. `csv_bringup_decide()` owns the whole chain and is host-tested (`tools/hosttest/run.sh`); `csv_logger.c` only holds the two RTC words and acts on the answer.
+
+The guard is armed immediately before a bring-up attempt and cleared only once the writer has run `CSV_GUARD_STABLE_US` (15 s). A reboot inside that window leaves it armed, so the next boot **skips** bring-up — correct, because the previous attempt genuinely did not survive.
+
+What a skip costs is bounded two ways:
+
+- The first consecutive skip schedules **one delayed retry** (`CSV_LOGGER_SKIP_RETRY_MS`, 60 s), so a spurious skip — a user reboot, a brownout — costs a minute rather than the whole drive.
+- The second consecutive skip gives up until the next boot (`CSV_BRINGUP_MAX_SKIPS`). That bound is what the guard is *for*: a deterministic init crash runs START → SKIP_RETRY → SKIP_FINAL and stops.
+
+`csv_skip_count` only resets when the writer proves stable, or on a boot that starts normally. Both RTC words are cleared in exactly one place — the writer's stability block — which also clears `csv_bringup_skipped`, re-enabling sleep resume-in-place (`sleep_mode_recovery_needed()`).
+
+**This was a field failure, not a hypothetical.** RTC memory survives a software reboot but not a power cut, so before the retry existed a device whose guard got armed by an unlucky reboot could not be recovered by rebooting — only by physically unplugging the dongle. It was also silent: the skip logged at `ESP_LOGW`, which `esp_log_level_set("*", ESP_LOG_NONE)` discards whenever `debug` is off. Both are fixed: the skip now emits an `EVL_WARN` event-log line and `/csv_status` reports it.
+
+Recovery paths, in order of preference: wait 60 s for the retry; `POST /csv_logger?op=start` (the manual path never arms the guard); or power-cycle.
+
+## Auto-start visibility
+
+The writer task starts at boot with **no delay**, and the first file opens when the ECU actually answers — ~3–5 s, not 20+.
+
+There used to be a 20 s wait before the writer task was even created, with no status reported meanwhile, so "still starting" and "broken" were indistinguishable. Nothing replaced it: `csv_logger_start_at_boot()` runs *before* `autopid_init()`/`poll_log_init()`, no record can exist until a producer starts, and no session opens until a record arrives — the ordering is the margin. (`event_log`'s writer has always done SD `fopen`/`fwrite`/`fsync` from t=0 on the same card with no holdoff, which is the evidence a clock here bought nothing.) Removing it also means the crash guard's 15 s stability window starts at boot instead of 20 s in, halving the window a reboot can land inside.
+
+`/csv_status` reports the state so the UI never has to guess:
+
+| field | meaning |
+|---|---|
+| `autostart` | `disabled` \| `skipped_retry` \| `skipped` \| `unavailable` |
+| `autostart_in_ms` | ms left on the retry countdown, 0 when nothing is counting |
+| `bringup_skipped` | the raw `csv_logger_bringup_skipped()` the sleep path reads |
+
+`csvAutostartLabel()` (main.js) turns those into the recorder card's line; before it existed, "still starting", "skipped" and "broken" all rendered as **Idle**.
 
 ## Manual trip control
 
 `POST /csv_logger?op=start|stop` — starts/stops a session immediately (also the guard-recovery path above). Trip files are listed by `/csv_list` and fetched by `/download_csv`.
+
+**Stop is per-trip.** `CSV_MANUAL_OFF` is cleared back to `CSV_MANUAL_AUTO` on the next debounced ignition-off edge (`csv_manual_mode_next()`), so the following key-on records normally. It used to hold until a reboot, which meant one press of Stop silently disabled auto-logging for every subsequent trip. `CSV_MANUAL_ON` is deliberately *not* cleared that way — bench work needs FORCE_ON to survive a voltage flapping across the ignition threshold. The rearm never fires while a host holds the datalog park lease (`can_datalog_park_active()`): un-parking belongs to `datalog_restore_mode()` alone.

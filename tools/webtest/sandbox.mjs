@@ -50,6 +50,8 @@ const EXPORTS = [
     'emitSensorsYaml', 'parseSensorsYaml', 'sensorPidParts',
     // --- sweep prediction (issues #29, #67) ---
     'effDivisor', 'readSampleEvery', 'sampleLoadFromEntries', 'predictedSweepMs',
+    // --- datalogger auto-start visibility ---
+    'csvAutostartLabel',
 ];
 
 function stubElement() {

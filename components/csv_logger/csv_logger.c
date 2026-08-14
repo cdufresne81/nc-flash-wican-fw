@@ -40,6 +40,7 @@
 #include "cJSON.h"
 
 #include "csv_logger.h"
+#include "csv_bringup_logic.h"   /* bring-up/gate decisions, host-tested (tools/hosttest) */
 #include "event_log.h"
 #include "config_server.h"
 #include "sdcard.h"
@@ -57,12 +58,22 @@ _Static_assert(CSV_LOGGER_SOURCE_MAX == 8, "wide column source dim must match pr
 
 #define CSV_LOGGER_QUEUE_LEN        256
 #define CSV_LOGGER_TASK_STACK_SIZE  (1024 * 6)
-// Small settle delay before auto-starting CSV at boot. NOTE: the historical "boot
-// crash-loop" was NOT a timing/boot-window problem -- it was a task-publish race in
-// csv_logger_init() (csv_queue was assigned AFTER xTaskCreateStatic, but the higher-prio
-// writer task preempted and ran xQueueReceive(NULL) -> panic). Fixed by publishing the
-// queue before creating the task. This delay is now just a modest margin.
-#define CSV_LOGGER_DEFER_BOOT_MS    20000
+// NOTE: there is deliberately NO boot delay before the datalogger starts.
+//
+// There used to be 20 s of one -- the writer task was not even created until then, and the
+// device reported nothing while it waited, so "still starting" and "broken" looked
+// identical. A user rebooted into that silence, landed inside the crash guard's armed
+// window, and lost auto-logging for the following boot entirely. The delay was never a
+// timing requirement: the crash it was added for was a task-publish race in
+// csv_logger_init(), fixed by publishing the queue before creating the task.
+//
+// Nothing replaced it, because the ordering already gives the margin for free:
+// csv_logger_start_at_boot() runs BEFORE autopid_init()/poll_log_init() (main.c), no record
+// can exist until a producer starts, and no session opens until a record arrives. The first
+// file therefore opens when the ECU actually answers -- ~3-5 s -- rather than when a timer
+// says so. event_log's writer has always done SD fopen/fwrite/fsync from t=0 on the same
+// card with no holdoff at all, which is the evidence that a clock here bought nothing.
+#define CSV_LOGGER_SKIP_RETRY_MS    60000
 // One file per engine on/off cycle: the session already opens on ignition-on and closes on
 // ignition-off (3 s debounce), so the only thing that can split a single drive is this byte cap.
 // It is now a SAFETY BACKSTOP, not a routine split -- a realistic drive is tens of MB (~6-7 MB/h
@@ -105,9 +116,12 @@ static int64_t csv_sd_retry_after_ms = 0;
 // csv_log=enable behavior. Written by the httpd handler task, read by the writer task on
 // a possibly-different core; a naturally-aligned int8 is an atomic load/store on the
 // dual-core S3 and volatile forces a fresh read each writer-loop pass. .bss => INTERNAL RAM.
-#define CSV_MANUAL_AUTO  0   // follow ignition_on (default)
-#define CSV_MANUAL_ON    1   // force logging on
-#define CSV_MANUAL_OFF   2   // force logging off
+// CSV_MANUAL_AUTO/ON/OFF live in csv_bringup_logic.h so the host tests assert on the same
+// values the writer compares against.
+//
+// STOP is per-trip, not permanent: the writer clears OFF back to AUTO on the next
+// ignition-off edge (see csv_manual_mode_next). ON is not cleared -- bench FORCE_ON has to
+// survive a voltage that flaps across the ignition threshold.
 static volatile int8_t csv_manual_mode = CSV_MANUAL_AUTO;
 
 // One-shot trip marker (web "Mark event" button). Written 1 by the httpd handler task
@@ -173,18 +187,52 @@ static csv_rate_fn_t csv_rate_fn = NULL;
 static uint32_t csv_cols_unmatched = 0;   // WIDE record whose (source,name) isn't a column
 static uint32_t csv_pending_drops  = 0;   // records lost while a WIDE session waited for enum
 
-// One-shot auto-start crash guard (RTC_NOINIT: survives a panic/brownout/watchdog/SW
-// reset; wiped by a cold power cycle). Armed when a boot attempt starts; cleared by the
-// writer task after it proves stable for 15s. If a boot finds it still armed, the
-// previous attempt crashed -> skip CSV this boot so a CSV-startup fault can never
-// boot-loop the device; it self-recovers on the next boot.
-#define CSV_ATTEMPT_MAGIC 0xA11C0DE5u
+// Auto-start crash guard (RTC_NOINIT: survives a panic/brownout/watchdog/SW reset; wiped
+// by a cold power cycle). Armed immediately before a bring-up attempt; cleared by the
+// writer task once it proves stable for 15s. A boot that finds it still armed knows the
+// previous attempt did not survive, so a CSV-startup fault can never boot-loop the device.
+//
+// The skip is no longer all-or-nothing for the uptime: the FIRST consecutive skip
+// schedules one delayed retry (CSV_LOGGER_SKIP_RETRY_MS), the second gives up until the
+// next boot. csv_skip_count is what bounds that -- see csv_bringup_decide() in
+// csv_bringup_logic.c, and the boot-loop analysis in its header.
+//
+// Why this mattered enough to change: RTC memory survives a software reboot but not a
+// power cut, so before the retry existed a customer whose guard got armed by an unlucky
+// reboot could not recover by rebooting -- only by physically unplugging the dongle. The
+// magic itself lives in csv_bringup_logic.h alongside the decision that reads it.
 RTC_NOINIT_ATTR static uint32_t csv_attempt_inprogress;
+RTC_NOINIT_ATTR static uint32_t csv_skip_count;
 
-// True for the rest of this uptime when the guard above made us skip CSV auto-start. See
-// sleep_mode_recovery_needed(): a wake now resumes in place, so without this the "next boot"
-// the comment above promises never arrives and CSV logging stays off indefinitely.
+// True from a skipped bring-up until the writer PROVES stable -- never cleared merely
+// because a retry was scheduled. sleep_mode_recovery_needed() routes wakes to the reboot
+// repair channel while this is set; clearing it early would let a wake resume in place
+// with the datalogger dead, which is the exact failure sleep_mode.c:1142-1154 documents.
 static bool csv_bringup_skipped = false;
+
+// Auto-start state, mirrored into /csv_status so the UI can say what the device is doing
+// instead of looking broken. Same volatile-aligned-int8 cross-core contract as
+// csv_manual_mode above; the deadline is written once and read as a snapshot.
+enum
+{
+    CSV_AS_DISABLED = 0,   // no auto-start pending: writer running normally, or csv_log off
+    CSV_AS_SKIPPED_RETRY,  // guard skip, one delayed retry pending
+    CSV_AS_SKIPPED,        // guard skip, no retry this uptime
+    CSV_AS_UNAVAILABLE,    // the writer could not be started at all (e.g. out of memory)
+};
+static volatile int8_t s_autostart_state = CSV_AS_DISABLED;
+// Uptime (ms) at which the pending retry countdown expires. Only meaningful while
+// s_autostart_state is SKIPPED_RETRY -- the STATE is what says whether a countdown is
+// running, because 0 is a legitimate uptime and would be a bogus sentinel.
+// 32-bit deliberately: the httpd task reads this from the other core, and a 64-bit read
+// would tear on this 32-bit core (see csv_autostart_remaining_ms).
+static volatile uint32_t s_autostart_deadline_ms = 0;
+
+// Uptime in the same 32-bit ms domain as the deadline above.
+static inline uint32_t csv_uptime_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
 
 // Set by the sleep teardown, cleared by the resume. Forces the writer task to close any open
 // session before the CPU halts; see the note where logging_active is computed.
@@ -581,9 +629,17 @@ static void csv_logger_task(void *pvParameters)
 
     while (1)
     {
-        if (!csv_guard_cleared && (esp_timer_get_time() - csv_task_start_us) > 15000000)
+        // The single place the crash-guard chain is allowed to clear, and the only proof
+        // that anything about this bring-up worked. Clears all THREE pieces of state:
+        // the RTC guard, the RTC skip count (so a recovered device is not punished by a
+        // stale chain), and csv_bringup_skipped -- which re-enables sleep resume-in-place
+        // (sleep_mode_recovery_needed()) after a successful retry. Nothing is "waiting on
+        // a boot to repair itself" once the writer has run this long, however it got here:
+        // auto boot, delayed retry, or a manual Start on a skipped boot.
+        if (!csv_guard_cleared && csv_guard_clear_due(esp_timer_get_time(), csv_task_start_us))
         {
-            csv_attempt_inprogress = 0;   // survived the danger window; future boots may retry
+            csv_bringup_mark_stable(&csv_attempt_inprogress, &csv_skip_count,
+                                    &csv_bringup_skipped);
             csv_guard_cleared = true;
             ESP_LOGI(TAG, "CSV auto-start proven stable (15s) - crash guard cleared");
         }
@@ -621,6 +677,21 @@ static void csv_logger_task(void *pvParameters)
                 }
             }
             // VEHICLE_STATE_IGNITION_INVALID: keep last known state
+
+            // A manual Stop ends the TRIP, not auto-logging: one press used to silently
+            // disable every later key-on until someone rebooted, and a customer lost 104 s
+            // of a drive to exactly that. Evaluated as a LEVEL on every ignition poll
+            // rather than on the off EDGE -- an edge is consumed once, so an edge that
+            // landed under a host park lease would be the only one we ever saw and Stop
+            // would latch again. See csv_manual_mode_next().
+            const int8_t next_mode = csv_manual_mode_next(csv_manual_mode, ignition_on,
+                                                          can_datalog_park_active());
+            if (next_mode != csv_manual_mode)
+            {
+                csv_manual_mode = next_mode;
+                event_log_emit(EVL_INFO, "manual stop cleared -- ignition is off, auto "
+                                         "logging resumes on the next trip");
+            }
         }
 
         // Log while ignition is on (engine running). Ignition is derived from battery
@@ -639,10 +710,10 @@ static void csv_logger_task(void *pvParameters)
         // otherwise stay open across the whole sleep -- and since a wake now resumes in place
         // rather than rebooting, it would come back to the same open file with its timers seeing a
         // jump of hours. Closing here means one clean file per awake period.
-        bool logging_active = csv_sleep_requested            ? false
-                            : (csv_manual_mode == CSV_MANUAL_ON)  ? true
-                            : (csv_manual_mode == CSV_MANUAL_OFF) ? false
-                            : (ignition_on && engine_ok);
+        // The expression itself lives in csv_bringup_logic.c, pinned by a host test: the
+        // v1.18 investigation cleared this truth table, so a change here is a regression.
+        bool logging_active = csv_logging_active(csv_sleep_requested, csv_manual_mode,
+                                                 ignition_on, engine_ok);
 
         // Session close: logging stopped (ignition off / disabled) or SD was pulled.
         if (csv_session_active && (!logging_active || !sdcard_is_mounted()))
@@ -841,7 +912,7 @@ esp_err_t csv_logger_set_manual_override(bool enable)
         // return if csv_queue != NULL), so the csv_log=enable boot path is a no-op here.
         // Deliberately does NOT arm the RTC one-shot guard (csv_attempt_inprogress): a
         // manual start is operator-initiated, not a boot-loop risk, and arming it would
-        // wrongly suppress the next AUTO boot. Only csv_logger_init_deferred() arms it.
+        // wrongly suppress the next AUTO boot. Only csv_logger_start_at_boot() arms it.
         if (csv_queue == NULL)
         {
             esp_err_t e = csv_logger_init();
@@ -855,10 +926,16 @@ esp_err_t csv_logger_set_manual_override(bool enable)
     }
     else
     {
-        // STOP: authoritative force-off. The writer task stays alive (never deleted at
-        // runtime) and closes the current session on its next pass (the close logic runs
-        // every loop, even with no records). Logging stays off even if ignition reads on,
-        // until the next START or a reboot (which resets to AUTO).
+        // STOP: authoritative force-off for the REST OF THIS TRIP. The writer task stays
+        // alive (never deleted at runtime) and closes the current session on its next pass
+        // (the close logic runs every loop, even with no records). Logging stays off even
+        // if ignition reads on -- until the next START, or until the ignition goes off,
+        // which returns the mode to AUTO so the following key-on records normally.
+        //
+        // That last clause is the fix for a real loss: Stop used to hold until a reboot, so
+        // one press silently disabled auto-logging for every subsequent trip. The rearm
+        // lives in the writer's ignition tracker (csv_manual_mode_next), not here, because
+        // only the writer sees the debounced edge.
         csv_manual_mode = CSV_MANUAL_OFF;
     }
     return ESP_OK;
@@ -881,6 +958,21 @@ char *csv_logger_get_status_json(void)
     cJSON_AddStringToObject(root, "manual_mode",
                             (csv_manual_mode == CSV_MANUAL_ON)  ? "on" :
                             (csv_manual_mode == CSV_MANUAL_OFF) ? "off" : "auto");
+    // Auto-start visibility (the whole point of this triple). Before these existed, a
+    // device that was merely still starting up, one whose crash guard had skipped
+    // bring-up, and one that was genuinely broken all looked identical from the UI --
+    // which is how a startup delay turned into a field failure. "autostart_in_ms" is
+    // computed at read time from the deadline, so no timer task is needed.
+    const int8_t as = s_autostart_state;
+    cJSON_AddStringToObject(root, "autostart",
+                            (as == CSV_AS_SKIPPED_RETRY) ? "skipped_retry" :
+                            (as == CSV_AS_SKIPPED)       ? "skipped" :
+                            (as == CSV_AS_UNAVAILABLE)   ? "unavailable" : "disabled");
+    const bool counting = (as == CSV_AS_SKIPPED_RETRY);
+    cJSON_AddNumberToObject(root, "autostart_in_ms",
+                            counting ? (double)csv_autostart_remaining_ms(
+                                           csv_uptime_ms(), s_autostart_deadline_ms) : 0);
+    cJSON_AddBoolToObject(root, "bringup_skipped", csv_bringup_skipped);
     cJSON_AddStringToObject(root, "file", csv_session_active ? csv_file_path : "");
     cJSON_AddNumberToObject(root, "rows_written", csv_rows_written);
     cJSON_AddNumberToObject(root, "rows_dropped", csv_rows_dropped);
@@ -1468,14 +1560,38 @@ esp_err_t csv_logger_init(void)
     return ESP_OK;
 }
 
-static void csv_deferred_init_task(void *arg)
+// The one permitted retry after a skipped bring-up. Sleeps, re-arms the guard, then makes
+// exactly one more attempt. It re-arms rather than running unguarded on purpose: if this
+// attempt is the one that crashes, the next boot must see an armed guard and count it, or
+// the boot-loop bound cannot work. It deliberately does NOT clear csv_bringup_skipped --
+// only the writer proving stable does that (see the writer's stability block).
+static void csv_retry_init_task(void *arg)
 {
-    // Modest settle margin before init. The boot crash was a publish race in
-    // csv_logger_init() (now fixed); this delay is just headroom past the boot storm.
-    vTaskDelay(pdMS_TO_TICKS(CSV_LOGGER_DEFER_BOOT_MS));
-    if (csv_logger_init() != ESP_OK)
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(CSV_LOGGER_SKIP_RETRY_MS));
+
+    if (csv_queue != NULL)
     {
-        ESP_LOGE(TAG, "deferred CSV init failed");
+        vTaskDelete(NULL);   // a manual Start already brought the writer up; nothing to do
+    }
+
+    ESP_LOGW(TAG, "retrying CSV auto-start after a skipped bring-up");
+    event_log_emit(EVL_INFO, "datalog auto-start retry after a skipped bring-up");
+    csv_bringup_arm_retry(&csv_attempt_inprogress);
+
+    if (csv_logger_init() == ESP_OK)
+    {
+        // The countdown is over and the writer is up: nothing is pending any more. Without
+        // this the state would stay SKIPPED_RETRY and the UI would report "retrying in 0s"
+        // for the rest of the uptime on a device that had already recovered.
+        s_autostart_state = CSV_AS_DISABLED;
+        event_log_emit(EVL_INFO, "datalog writer started on retry");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "CSV auto-start retry failed");
+        event_log_emit(EVL_WARN, "datalog auto-start retry failed to start the writer");
+        s_autostart_state = CSV_AS_UNAVAILABLE;
     }
     vTaskDelete(NULL);
 }
@@ -1490,30 +1606,58 @@ void csv_logger_set_sleep_requested(bool sleeping)
     csv_sleep_requested = sleeping;
 }
 
-void csv_logger_init_deferred(void)
+void csv_logger_start_at_boot(void)
 {
-    // One-shot crash guard: if a prior boot armed an attempt and didn't survive long
-    // enough to clear it, that attempt crashed -> skip CSV this boot so we can't
-    // boot-loop. Cleared on the skip below, after 15s of stable logging (writer task),
-    // or by a cold power cycle (RTC wiped).
-    if (csv_attempt_inprogress == CSV_ATTEMPT_MAGIC)
+    // Crash guard: if a prior attempt armed the guard and didn't survive long enough to
+    // clear it, that attempt crashed -> do not bring CSV up right now, so a CSV-startup
+    // fault can never boot-loop the device. csv_bringup_decide() owns the whole chain
+    // (disarm, count, retry-or-give-up) and is host-tested; see csv_bringup_logic.h.
+    const csv_bringup_decision_t decision =
+        csv_bringup_decide(&csv_attempt_inprogress, &csv_skip_count, &csv_bringup_skipped);
+
+    if (decision != CSV_BRINGUP_START)
     {
-        /* DISARM HERE, exactly as poll_log.c and fast_log.c do. Without this the guard stays
-         * armed forever: the only other thing that clears it is the writer task after 15 s of
-         * stable logging, and on a skip boot that task never starts. One crash inside the 15 s
-         * window would then cost CSV logging permanently -- and, since resume-in-place refuses
-         * to resume while any bring-up was skipped, would also make EVERY wake take the reboot
-         * fallback forever, repairing nothing. RTC memory survives software reboots, so only
-         * physically unplugging the device would clear it. */
-        csv_attempt_inprogress = 0;   /* disarm so the next boot retries */
-        ESP_LOGW(TAG, "Prior CSV auto-start attempt did not complete - skipping this boot to avoid a boot-loop");
-        csv_bringup_skipped = true;
+        const bool will_retry = (decision == CSV_BRINGUP_SKIP_RETRY);
+
+        // Deadline BEFORE state: the state is what tells a reader a countdown is running,
+        // so publishing it first would briefly expose a stale deadline.
+        s_autostart_deadline_ms = csv_uptime_ms() + CSV_LOGGER_SKIP_RETRY_MS;
+        s_autostart_state = will_retry ? CSV_AS_SKIPPED_RETRY : CSV_AS_SKIPPED;
+
+        ESP_LOGW(TAG, "Prior CSV auto-start attempt did not complete - skipping (%s)",
+                 will_retry ? "retrying" : "no retry this boot");
+
+        /* This line is the whole reason the failure was diagnosable only by reading source.
+         * It MUST go to the event log and not through ESP_LOG: main.c nulls every ESP_LOG
+         * level when `debug` is disabled, which is the shipping default, so the existing
+         * ESP_LOGW above reaches nobody on a device with no serial console. A customer hit
+         * this exact skip and all he could report was "it stopped logging". */
+        event_log_emit(EVL_WARN,
+                       "datalog auto-start SKIPPED -- previous attempt did not survive its "
+                       "first %ds (reboot or crash); %s",
+                       CSV_GUARD_STABLE_US / 1000000,
+                       will_retry ? "retrying shortly"
+                                  : "no auto-logging this boot -- press Start or power-cycle");
+
+        if (will_retry &&
+            xTaskCreate(csv_retry_init_task, "csv_retry", 4096, NULL, 3, NULL) != pdPASS)
+        {
+            ESP_LOGE(TAG, "Failed to create CSV retry task");
+            s_autostart_state = CSV_AS_SKIPPED;   // no retry after all; message still fits
+        }
         return;
     }
-    csv_attempt_inprogress = CSV_ATTEMPT_MAGIC;   // arm the one-shot guard
-    // Tiny internal-RAM stack: it only sleeps then calls csv_logger_init().
-    if (xTaskCreate(csv_deferred_init_task, "csv_defer", 4096, NULL, 3, NULL) != pdPASS)
+
+    event_log_emit(EVL_INFO, "datalog writer started");
+
+    if (csv_logger_init() != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to create deferred-init task");
+        // NOT a guard skip -- the guard is armed and will make the next boot skip, which
+        // is right, but the user-facing reason is different and so is the recovery. Say so
+        // on the channel that survives debug=disabled rather than leaving the UI to guess.
+        ESP_LOGE(TAG, "CSV init failed");
+        event_log_emit(EVL_WARN, "datalog writer failed to start (out of memory?) -- "
+                                 "no auto-logging this boot");
+        s_autostart_state = CSV_AS_UNAVAILABLE;
     }
 }

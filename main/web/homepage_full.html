@@ -799,6 +799,13 @@
             letter-spacing: .5px
         }
 
+        /* Auto-start could not run (crash-guard skip, or the writer failed to start).
+           Same token as every other warning surface, so a palette change cannot miss it. */
+        .rec-label.warn {
+            color: var(--warning-color);
+            text-transform: none
+        }
+
         .rec-file {
             color: var(--primary-color);
             font-size: .85rem;

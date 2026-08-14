@@ -64,8 +64,11 @@ esp_err_t csv_logger_init(void);
  *   the boot publish-race. Returns the csv_logger_init() error on a failed start (e.g. OOM),
  *   leaving the mode OFF. Note: a session only opens once a record arrives, so logging is
  *   effective only while AutoPID records are flowing.
- * enable=false: force logging OFF even if ignition reads on; the writer closes the session
- *   on its next pass and stays alive (never deleted). Stays off until the next START/reboot.
+ * enable=false: force logging OFF for the rest of THIS TRIP even if ignition reads on; the
+ *   writer closes the session on its next pass and stays alive (never deleted). Cleared back
+ *   to AUTO on the next ignition-off edge, so the following key-on records normally -- Stop
+ *   is per-trip, not "disable auto-logging until someone reboots". FORCE_ON is NOT cleared
+ *   that way: bench work needs it to survive a voltage flapping across the threshold.
  *
  * @return ESP_OK, or the csv_logger_init() error on a failed on-demand start.
  */
@@ -124,17 +127,25 @@ typedef float (*csv_rate_fn_t)(void);
 void csv_logger_set_rate_fn(csv_rate_fn_t fn);
 
 /**
- * @brief Start the CSV datalogger AFTER boot settles (deferred ~20s).
+ * @brief Start the CSV datalogger at boot, crash-guard gated.
  *
- * Call this at boot instead of csv_logger_init(); it spawns a small task that waits,
- * then calls csv_logger_init() once. The wait is a modest settle margin (the historical
- * boot crash was a task-publish race in csv_logger_init(), now fixed). A one-shot RTC
- * guard skips CSV for a single boot if a startup attempt ever fails to stabilize, so a
- * CSV-startup fault can never boot-loop the device.
+ * Call this at boot instead of csv_logger_init(). It brings the writer up INLINE -- no task
+ * is spawned on the normal path and there is NO start delay, so the first file opens when
+ * the ECU actually answers (~3-5 s) rather than when a timer says so.
+ *
+ * Safe to call from app_main at priority 1 even though the writer runs at 4: the writer
+ * cannot observe a NULL queue because csv_logger_init() publishes the queue BEFORE
+ * creating the task. (That publish race, not any settling requirement, was the historical
+ * "boot crash" -- which is why the priority note on csv_logger_set_manual_override() below
+ * no longer applies here.)
+ *
+ * If the RTC guard shows the previous attempt did not survive its first
+ * CSV_GUARD_STABLE_US, bring-up is skipped, with one delayed retry before it gives up for
+ * the boot -- see csv_bringup_logic.h for the chain and its boot-loop bound.
  */
-void csv_logger_init_deferred(void);
+void csv_logger_start_at_boot(void);
 
-/* True when the RTC crash-guard made csv_logger_init_deferred() skip CSV auto-start on this boot.
+/* True when the RTC crash-guard made csv_logger_start_at_boot() skip CSV auto-start on this boot.
  * See poll_log_bringup_skipped(). */
 bool csv_logger_bringup_skipped(void);
 
