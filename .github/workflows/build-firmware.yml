@@ -1,6 +1,7 @@
 # CI: build the obd_pro firmware image (ESP-IDF v5.5.3 / esp32s3) and upload the
-# flashable artifacts. On a v* tag, also publish a GitHub Release with auto-generated
-# notes and the firmware attached. Uses the committed sdkconfig as-is (no set-target).
+# flashable artifacts. On a v* tag, also publish a GitHub Release with the firmware
+# attached and the hand-written notes from docs/releases/<tag>.md as the body
+# (auto-generated notes only if that file is absent). Uses the committed sdkconfig as-is (no set-target).
 # First-cut; refine later (matrix/other HW variants, signed images, etc.).
 name: Build firmware
 
@@ -119,15 +120,55 @@ jobs:
     permissions:
       contents: write   # create the release + upload assets
     steps:
+      # Only for docs/releases/<tag>.md -- the hand-written notes. Skipping the
+      # full tree keeps this job's checkout to the one file it reads.
+      - name: Checkout release notes
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: docs/releases
+          sparse-checkout-cone-mode: false
+
       - name: Download built artifacts
         uses: actions/download-artifact@v4
         with:
           name: wican-obd_pro-firmware
           path: dist
 
-      - name: Publish GitHub Release (auto-generated notes + firmware)
+      # A release body is written by hand, in plain English, for people who own the
+      # dongle -- auto-generated PR titles do not serve them. If the file is missing
+      # we still publish, falling back to the generated notes rather than blocking
+      # the firmware upload behind a doc.
+      - name: Locate hand-written notes
+        id: notes
+        run: |
+          set -e
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$notes" ]; then
+            echo "::warning::$notes not found -- falling back to auto-generated notes"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "title=" >> "$GITHUB_OUTPUT"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # An optional leading "# ..." line is the release title (past releases read
+          # "v1.18.0 - The adapter wakes itself when you start the car"), not body text.
+          if head -n1 "$notes" | grep -q '^# '; then
+            head -n1 "$notes" | sed 's/^# //' > title.txt
+            tail -n +2 "$notes" | sed '/./,$!d' > body.md
+          else
+            : > title.txt
+            cp "$notes" body.md
+          fi
+          echo "Using $notes (title: $(cat title.txt))"
+          echo "path=body.md" >> "$GITHUB_OUTPUT"
+          echo "title=$(cat title.txt)" >> "$GITHUB_OUTPUT"
+          echo "generate=false" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release (notes + firmware)
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true        # notes from merged PRs/commits since the last tag
+          name: ${{ steps.notes.outputs.title }}
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.generate }}
           fail_on_unmatched_files: true
           files: dist/*
