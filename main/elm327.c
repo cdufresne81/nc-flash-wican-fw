@@ -1833,6 +1833,58 @@ static int uart_read_until_pattern(uart_port_t uart_num, char* buffer, size_t bu
     return total_len;
 }
 
+/* Diagnostic timing for the last hard reset -- see elm327_hardreset_timing_t in elm327.h for why.
+ * Written by elm327_hardreset_chip() and by elm327_set_baudrate()'s lock-timeout path (the second
+ * of the two 10 s waits), read via elm327_hardreset_get_timings(). Plain scalars updated in a fixed
+ * order with the total written LAST, so a reader that races us sees stale-but-consistent numbers
+ * rather than a torn mix; no lock is worth taking on a path whose whole job is to be measured.
+ *
+ * Declared HERE, above elm327_set_baudrate(), because that function is defined before
+ * elm327_hardreset_chip() and now writes into this record too. */
+static elm327_hardreset_timing_t s_hardreset_timing;
+
+void elm327_hardreset_get_timings(elm327_hardreset_timing_t *out)
+{
+	if(out != NULL)
+	{
+		*out = s_hardreset_timing;
+	}
+}
+
+/* Milliseconds since boot. esp_timer is monotonic and keeps counting across light sleep, which
+ * matters here: this runs on the resume path. */
+static inline uint32_t elm327_now_ms(void)
+{
+	return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/* Name the task currently holding the UART lock.
+ *
+ * xSemaphoreGetMutexHolder() is a read of the mutex owner field -- it does NOT take the lock, so it
+ * is safe to call while we are ourselves blocked on it, which is the whole point. The answer is a
+ * snapshot and can be stale by the time it is logged; acceptable here because the interesting case
+ * is a holder that keeps the lock for 10 s, which is an eternity by comparison. */
+static void elm327_note_lock_holder(char *dst, size_t dstlen)
+{
+	if(dst == NULL || dstlen == 0)
+	{
+		return;
+	}
+	if(xuart1_semaphore == NULL)
+	{
+		snprintf(dst, dstlen, "nosem");
+		return;
+	}
+	TaskHandle_t holder = xSemaphoreGetMutexHolder(xuart1_semaphore);
+	if(holder == NULL)
+	{
+		snprintf(dst, dstlen, "none");
+		return;
+	}
+	const char *name = pcTaskGetName(holder);
+	snprintf(dst, dstlen, "%s", (name != NULL) ? name : "?");
+}
+
 bool elm327_set_baudrate(void)
 {
     char rx_buffer[UART_BUFFER_SIZE];
@@ -1912,36 +1964,22 @@ bool elm327_set_baudrate(void)
     }
 	else
 	{
-		ESP_LOGE(TAG, "%s: Failed to take UART semaphore", __func__);
+		/* The SECOND of the two 10 s waits that make up a slow wake. elm327_hardreset_chip() calls
+		 * this straight after releasing the lock, so on a contended wake both expire back to back:
+		 * 10 s + 10 s = the measured 20050 ms. Recorded into the hardreset record because that is
+		 * the call this always runs under, and one line then tells the whole story. */
+		elm327_note_lock_holder(s_hardreset_timing.holder_baud_to,
+		                        sizeof(s_hardreset_timing.holder_baud_to));
+		ESP_LOGE(TAG, "%s: Failed to take UART semaphore (held by %s)", __func__,
+		         s_hardreset_timing.holder_baud_to);
 	}
-    
+
     return success;
 }
 
 void elm327_lock(void)
 {
 	xSemaphoreTake(xuart1_semaphore, portMAX_DELAY);
-}
-
-/* Diagnostic timing for the last hard reset -- see elm327_hardreset_timing_t in elm327.h for why.
- * Written only here, read via elm327_hardreset_get_timings(). Plain scalars updated in a fixed
- * order with the total written LAST, so a reader that races us sees stale-but-consistent numbers
- * rather than a torn mix; no lock is worth taking on a path whose whole job is to be measured. */
-static elm327_hardreset_timing_t s_hardreset_timing;
-
-void elm327_hardreset_get_timings(elm327_hardreset_timing_t *out)
-{
-	if(out != NULL)
-	{
-		*out = s_hardreset_timing;
-	}
-}
-
-/* Milliseconds since boot. esp_timer is monotonic and keeps counting across light sleep, which
- * matters here: this runs on the resume path. */
-static inline uint32_t elm327_now_ms(void)
-{
-	return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
 void elm327_hardreset_chip(void)
@@ -1966,6 +2004,8 @@ void elm327_hardreset_chip(void)
 		s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
 		return;
 	}
+	elm327_note_lock_holder(s_hardreset_timing.holder_before,
+	                        sizeof(s_hardreset_timing.holder_before));
 	t_mark = elm327_now_ms();
 	if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
 	{
@@ -2033,7 +2073,15 @@ void elm327_hardreset_chip(void)
 	}
 	else
 	{
-		ESP_LOGE(TAG, "%s: Failed to take UART semaphore", __func__);
+		/* The confirmed slow-wake path: 10 s gone, chip never touched. Record the owner so the
+		 * next question ("who?") is answered by the log instead of another round of guessing.
+		 * mutex_ms is the measured wait, NOT the constant, so a short value here would mean
+		 * something other than the timeout broke us out. */
+		s_hardreset_timing.mutex_ms = elm327_now_ms() - t_mark;
+		elm327_note_lock_holder(s_hardreset_timing.holder_rst_to,
+		                        sizeof(s_hardreset_timing.holder_rst_to));
+		ESP_LOGE(TAG, "%s: Failed to take UART semaphore (held by %s)", __func__,
+		         s_hardreset_timing.holder_rst_to);
 	}
 
 	/* Was leaked on every single call. Harmless when this ran once per boot; a real drip now that

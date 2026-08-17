@@ -80,6 +80,16 @@ typedef struct
 	bool     used_reset_line;	/* false = ATZ path was believed sufficient */
 	bool     mutex_ok;			/* false = the 10 s mutex wait TIMED OUT and nothing was done */
 	bool     answered;			/* false = chip never sent the "\r>" prompt back */
+
+	/* WHO HOLDS THE UART LOCK -- the one question the first round of instrumentation could not
+	 * answer. Confirmed in the car 2026-08-17: a slow wake logged mutex=0(TIMEOUT) rd=0, i.e. the
+	 * resume waited the full 10 s, never got the lock, never spoke to the chip at all, and then
+	 * elm327_set_baudrate() burned a second 10 s the same way -- 20050 ms of the 20136 ms wake.
+	 * So the chip was never slow; someone else was sitting on the lock. FreeRTOS can name the
+	 * owning task, so these record it. "none" means the lock was free at that moment. */
+	char     holder_before[16];	/* owner when elm327_hardreset_chip() arrived */
+	char     holder_rst_to[16];	/* owner when the reset-path take TIMED OUT (else empty) */
+	char     holder_baud_to[16];/* owner when elm327_set_baudrate()'s take TIMED OUT (else empty) */
 } elm327_hardreset_timing_t;
 
 /* Snapshot of the LAST elm327_hardreset_chip() call. Safe to call from another task. */

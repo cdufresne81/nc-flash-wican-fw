@@ -1314,19 +1314,31 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
     {
         elm327_hardreset_timing_t hr;
         elm327_hardreset_get_timings(&hr);
+        /* TWO lines, not one: EVENT_LOG_DETAIL_MAX is 112 chars and the combined line was ~150,
+         * which silently truncated exactly the fields that matter most (calls= tells us whether a
+         * single wake resets the chip twice). Two lines per WAKE still honours the per-wake rule --
+         * what the rule forbids is per-CYCLE logging in the 2 s loop. */
         event_log_emit(EVL_INFO,
-                       "resume timing ms: hold=%u can=%u fence=%u chip=%u wifi=%u led=%u total=%u | "
-                       "hardreset mutex=%u(%s) rd=%u rt=%u baud=%u tot=%u gpio7=%d %s %s calls=%u",
+                       "resume ms: hold=%u can=%u fence=%u chip=%u wifi=%u led=%u tot=%u",
                        (unsigned)t_hold_ms, (unsigned)t_can_ms, (unsigned)t_fence_ms,
                        (unsigned)t_chip_ms, (unsigned)t_wifi_ms, (unsigned)t_led_ms,
-                       (unsigned)((uint32_t)(esp_timer_get_time() / 1000) - t_resume_start),
+                       (unsigned)((uint32_t)(esp_timer_get_time() / 1000) - t_resume_start));
+        event_log_emit(EVL_INFO,
+                       "hardreset ms: mutex=%u%s rd=%u rt=%u baud=%u tot=%u g7=%d %s %s calls=%u",
                        (unsigned)hr.mutex_ms, hr.mutex_ok ? "ok" : "TIMEOUT",
                        (unsigned)hr.reset_read_ms, (unsigned)hr.retry_read_ms,
                        (unsigned)hr.baudrate_ms, (unsigned)hr.total_ms,
                        (int)hr.gpio7_at_entry,
-                       hr.used_reset_line ? "resetline" : "atz",
-                       hr.answered ? "answered" : "NOANSWER",
+                       hr.used_reset_line ? "rstline" : "atz",
+                       hr.answered ? "ans" : "NOANS",
                        (unsigned)hr.calls);
+        /* The answer to "who?" -- the question the first round could not reach. A slow wake is two
+         * 10 s lock timeouts, so whatever is named here is the actual defect. Empty fields mean
+         * that particular take did NOT time out, which on a healthy wake is all of them. */
+        event_log_emit(EVL_INFO, "uart lock: pre=%s rstTO=%s baudTO=%s",
+                       hr.holder_before[0]  ? hr.holder_before  : "-",
+                       hr.holder_rst_to[0]  ? hr.holder_rst_to  : "-",
+                       hr.holder_baud_to[0] ? hr.holder_baud_to : "-");
     }
     #undef SLEEP_RESUME_LAP
 
