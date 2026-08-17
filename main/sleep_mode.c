@@ -667,6 +667,19 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 static uint8_t s_elm327_sleep_nudges  = 0;
 static uint8_t s_elm327_settle_passes = 0;
 
+/* DIAGNOSTIC (2026-08-17): is "MIC chip would not sleep" a real refusal, or a false alarm?
+ *
+ * It fired on three sleep entries out of three in the car, and the owner reports a SECOND WiCAN
+ * doing the same -- so it is a fixed-constant firmware behaviour, not one bad chip. The suspicion
+ * is the settle grace above: GPIO7 is known to lag (it still reads "awake" straight after a
+ * successful elm327_sleep()), and the babysitter allows exactly ONE ~2 s pass before it decides
+ * the chip disobeyed and hardresets it -- which WAKES the chip, so the cure re-creates the
+ * symptom. To settle it we need the one number nobody has measured: how long GPIO7 actually takes
+ * to flip after elm327_sleep(). These record it. */
+static uint32_t s_elm327_sleep_entry_ms   = 0;   /* when elm327_sleep() returned, this session */
+static uint16_t s_elm327_sleep_passes     = 0;   /* sleeping passes since then */
+static bool     s_elm327_asleep_logged    = false; /* one line per SESSION, never per cycle */
+
 /* One "resume stack low" warning per boot -- see the emit site for why boot scope is correct here
  * (the watermark it reports is itself a historic minimum that cannot recover within an uptime). */
 static bool s_resume_stack_warned = false;
@@ -1094,8 +1107,11 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
      * point -- a static that is only ever cleared at boot means nothing now that a wake resumes. */
     s_elm327_sleep_nudges  = 0;
     s_elm327_settle_passes = 0;
+    s_elm327_sleep_passes  = 0;
+    s_elm327_asleep_logged = false;
 
     elm327_sleep();
+    s_elm327_sleep_entry_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
     /* The one permanent marker that a sleep entry happened. Nothing else in the teardown writes to
      * the event log, so without this a sleep is invisible in the record and can only be inferred
@@ -1210,9 +1226,28 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
         return false;
     }
 
+    /* DIAGNOSTIC (2026-08-17): measure where the resume actually spends its time.
+     *
+     * Measured in the car: every wake left the LED dark and WiFi unreachable for ~23 s while the
+     * datalogger was already recording, and /wifi_diag put the first WiFi association ATTEMPT 20 s
+     * after CAN_WAKE -- so ~20 s goes somewhere BELOW, before the network is touched. Reading the
+     * code narrows it to step 4 but cannot pin it, because elm327_hardreset_chip() is really two
+     * mutex takes and up to six UART timeouts (see elm327_hardreset_timing_t).
+     *
+     * One line per WAKE, never per cycle -- the 2 s sleep loop runs ~43k times a night. */
+    const uint32_t t_resume_start = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t t_hold_ms = 0, t_can_ms = 0, t_fence_ms = 0, t_chip_ms = 0, t_wifi_ms = 0, t_led_ms = 0;
+    uint32_t t_mark = t_resume_start;
+    #define SLEEP_RESUME_LAP(dst) do { \
+        const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000); \
+        (dst) = now_ms - t_mark; \
+        t_mark = now_ms; \
+    } while(0)
+
     /* 1. Undo the pad hold that pins the OBD chip asleep. Instant (pin work only), and it must
      *    precede any attempt to talk to that chip. */
     elm327_release_sleep_hold();
+    SLEEP_RESUME_LAP(t_hold_ms);
 
     /* 2. BUS FIRST -- this is the whole point of resuming rather than rebooting.
      *    poll_log drives the TWAI controller directly and needs the interpreter chip for
@@ -1221,6 +1256,7 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
      *    the datalogger does not use. can_enable() re-installs TWAI and drives the transceiver's
      *    standby pin low itself (can.c:438), reclaiming GPIO1 from the wake sampler. */
     can_enable();
+    SLEEP_RESUME_LAP(t_can_ms);
     if(!can_is_enabled())
     {
         ESP_LOGE(TAG, "resume: can_enable() failed -- falling back to reboot");
@@ -1232,12 +1268,14 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
      *    or an unparked task could transmit into a disabled controller. */
     can_sleep_fence_clear();
     csv_logger_set_sleep_requested(false);   /* the writer may open a fresh session again */
+    SLEEP_RESUME_LAP(t_fence_ms);
 
     /* 4. The slow part, deliberately after the bus is already live: the interpreter chip. A hard
      *    reset is what the existing retry path uses and the only sequence proven to bring it back
      *    from STSLEEP0. ~555 ms floor, ~1-1.8 s typical, ~4.5 s if its UART reads time out.
      *    Nothing touches this chip until the state publish at the end reopens its UART gate. */
     elm327_hardreset_chip();
+    SLEEP_RESUME_LAP(t_chip_ms);
 
     /* 5. Network back. wifi_mgr deinit/init at runtime is proven live: smartconnect does exactly
      *    this pair on every home/drive transition (smartconnect.c:320 -> :352) with no reboot.
@@ -1263,7 +1301,34 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
         }
     }
 
+    SLEEP_RESUME_LAP(t_wifi_ms);
+
     led_indicator_resume();
+    SLEEP_RESUME_LAP(t_led_ms);
+
+    /* DIAGNOSTIC: emitted BEFORE the state publish below, so it lands even if something after this
+     * point misbehaves. hardreset_* is the breakdown INSIDE the chip step: mutex is the wait for
+     * the UART lock (cap 10 s), rd/rt are the two possible reads (~1.5 s each), baud is
+     * elm327_set_baudrate() which takes the same lock a SECOND time. calls>1 within one wake would
+     * mean the chip is being reset more than once, which is the other way to reach ~20 s. */
+    {
+        elm327_hardreset_timing_t hr;
+        elm327_hardreset_get_timings(&hr);
+        event_log_emit(EVL_INFO,
+                       "resume timing ms: hold=%u can=%u fence=%u chip=%u wifi=%u led=%u total=%u | "
+                       "hardreset mutex=%u(%s) rd=%u rt=%u baud=%u tot=%u gpio7=%d %s %s calls=%u",
+                       (unsigned)t_hold_ms, (unsigned)t_can_ms, (unsigned)t_fence_ms,
+                       (unsigned)t_chip_ms, (unsigned)t_wifi_ms, (unsigned)t_led_ms,
+                       (unsigned)((uint32_t)(esp_timer_get_time() / 1000) - t_resume_start),
+                       (unsigned)hr.mutex_ms, hr.mutex_ok ? "ok" : "TIMEOUT",
+                       (unsigned)hr.reset_read_ms, (unsigned)hr.retry_read_ms,
+                       (unsigned)hr.baudrate_ms, (unsigned)hr.total_ms,
+                       (int)hr.gpio7_at_entry,
+                       hr.used_reset_line ? "resetline" : "atz",
+                       hr.answered ? "answered" : "NOANSWER",
+                       (unsigned)hr.calls);
+    }
+    #undef SLEEP_RESUME_LAP
 
     /* 6. Publish the state FIRST, then release the tasks parked on the awake bit. The order
      *    matters: the elm327 task wakes on DEV_AWAKE_BIT, pulls a queued command, then checks
@@ -2002,6 +2067,24 @@ void light_sleep_task(void *pvParameters)
                  * 5000 ms for the same thing (:841). Judging on the first ~2 s pass would
                  * hardreset a chip that was going to sleep on its own -- and a hardreset WAKES
                  * it, so the babysitter would be racing its own cause. */
+                /* DIAGNOSTIC: the settle time nobody has measured. Log the FIRST pass on which
+                 * GPIO7 finally reads asleep, and how long after elm327_sleep() that was. If this
+                 * lands later than the single ~2 s grace pass allowed below, the "would not sleep"
+                 * message is a false alarm and the grace is simply too short. Latched, so it costs
+                 * one line per sleep SESSION and not one per 2 s cycle. */
+                s_elm327_sleep_passes++;
+                if(!s_elm327_asleep_logged && elm327_chip_get_status() == ELM327_SLEEP)
+                {
+                    s_elm327_asleep_logged = true;
+                    event_log_emit(EVL_INFO,
+                                   "DIAG gpio7 settled asleep after %u ms / %u passes "
+                                   "(grace allows 1 pass; nudges used %u)",
+                                   (unsigned)((uint32_t)(esp_timer_get_time() / 1000)
+                                              - s_elm327_sleep_entry_ms),
+                                   (unsigned)s_elm327_sleep_passes,
+                                   (unsigned)s_elm327_sleep_nudges);
+                }
+
                 if(elm327_chip_get_status() == ELM327_READY && s_elm327_settle_passes < 1)
                 {
                     /* Give the pin one full pass (~2 s, so ~4 s since elm327_sleep()) to settle
@@ -2031,7 +2114,13 @@ void light_sleep_task(void *pvParameters)
                         ESP_LOGW(TAG, "ELM327 chip will not sleep -- leaving it awake this session");
                         event_log_emit(EVL_INFO,
                                        "MIC chip would not sleep after %u nudges -- left awake "
-                                       "(costs mA, NOT rebooting)", (unsigned)SLEEP_ELM327_MAX_NUDGES);
+                                       "(costs mA, NOT rebooting) [DIAG %u ms / %u passes since "
+                                       "elm327_sleep(), gpio7=%d]",
+                                       (unsigned)SLEEP_ELM327_MAX_NUDGES,
+                                       (unsigned)((uint32_t)(esp_timer_get_time() / 1000)
+                                                  - s_elm327_sleep_entry_ms),
+                                       (unsigned)s_elm327_sleep_passes,
+                                       (int)gpio_get_level(OBD_READY_PIN));
                     }
                 }
                 else

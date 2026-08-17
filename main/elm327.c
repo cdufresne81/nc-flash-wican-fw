@@ -1923,17 +1923,54 @@ void elm327_lock(void)
 	xSemaphoreTake(xuart1_semaphore, portMAX_DELAY);
 }
 
+/* Diagnostic timing for the last hard reset -- see elm327_hardreset_timing_t in elm327.h for why.
+ * Written only here, read via elm327_hardreset_get_timings(). Plain scalars updated in a fixed
+ * order with the total written LAST, so a reader that races us sees stale-but-consistent numbers
+ * rather than a torn mix; no lock is worth taking on a path whose whole job is to be measured. */
+static elm327_hardreset_timing_t s_hardreset_timing;
+
+void elm327_hardreset_get_timings(elm327_hardreset_timing_t *out)
+{
+	if(out != NULL)
+	{
+		*out = s_hardreset_timing;
+	}
+}
+
+/* Milliseconds since boot. esp_timer is monotonic and keeps counting across light sleep, which
+ * matters here: this runs on the resume path. */
+static inline uint32_t elm327_now_ms(void)
+{
+	return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
 void elm327_hardreset_chip(void)
 {
+	const uint32_t t_entry = elm327_now_ms();
+	uint32_t t_mark;
+
+	/* Reset the record for THIS call before anything can return early, so a caller reading the
+	 * timings never sees a mix of this call and the previous one. calls[] deliberately keeps
+	 * counting across calls -- it is how we find out whether a single resume hard-resets twice,
+	 * which is one of the two ways the measured ~20 s could be reached. */
+	const uint32_t prev_calls = s_hardreset_timing.calls;
+	memset(&s_hardreset_timing, 0, sizeof(s_hardreset_timing));
+	s_hardreset_timing.calls = prev_calls + 1;
+	s_hardreset_timing.gpio7_at_entry = (int8_t)gpio_get_level(OBD_READY_PIN);
+
     char *rsp_buffer = (char *)heap_caps_malloc(UART_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	ESP_LOGW(TAG, "Performing hard reset of ELM327 chip");
 	if (rsp_buffer == NULL)
 	{
 		ESP_LOGE(TAG, "%s: response buffer alloc failed", __func__);
+		s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
 		return;
 	}
+	t_mark = elm327_now_ms();
 	if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
 	{
+		s_hardreset_timing.mutex_ms = elm327_now_ms() - t_mark;
+		s_hardreset_timing.mutex_ok = true;
 		vTaskDelay(pdMS_TO_TICKS(500));
 		uart_flush_input(UART_NUM_1);
 		// xQueueReset(uart1_queue);
@@ -1953,7 +1990,9 @@ void elm327_hardreset_chip(void)
 			elm327_uart_write_bytes(UART_NUM_1, "ATZ\r", strlen("ATZ\r"));
 		}
 		memset(rsp_buffer, 0, UART_BUFFER_SIZE);
+		t_mark = elm327_now_ms();
         int len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", UART_TIMEOUT_MS+300);
+		s_hardreset_timing.reset_read_ms = elm327_now_ms() - t_mark;
 
 		/* The ATZ path is taken precisely when the chip is awake -- but if what is BROKEN is the
 		 * UART link itself (a desynced baud rate after a reset, say), then talking to it over
@@ -1967,9 +2006,14 @@ void elm327_hardreset_chip(void)
 			vTaskDelay(pdMS_TO_TICKS(5));
 			gpio_set_level(OBD_RESET_PIN, 1);
 			memset(rsp_buffer, 0, UART_BUFFER_SIZE);
+			t_mark = elm327_now_ms();
 			len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", UART_TIMEOUT_MS+300);
+			s_hardreset_timing.retry_read_ms = elm327_now_ms() - t_mark;
 			used_reset_line = true;
 		}
+
+		s_hardreset_timing.used_reset_line = used_reset_line;
+		s_hardreset_timing.answered = (len > 0);
 
 		if(len > 0)
 		{
@@ -1998,6 +2042,10 @@ void elm327_hardreset_chip(void)
 	heap_caps_free(rsp_buffer);
 
 	vTaskDelay(pdMS_TO_TICKS(50));
+	/* NOT a cheap tail call: elm327_set_baudrate() takes xuart1_semaphore a SECOND time (another
+	 * ELM327_CMD_MUTEX_TIMOUT = 10 s worst case) and can issue four more UART_TIMEOUT_MS reads.
+	 * Timed separately because it, not the reset above, is the larger half of the worst case. */
+	t_mark = elm327_now_ms();
     if (elm327_set_baudrate())
     {
         ESP_LOGI(TAG, "UART configuration completed successfully");
@@ -2006,6 +2054,9 @@ void elm327_hardreset_chip(void)
     {
         ESP_LOGE(TAG, "UART configuration failed");
     }
+	s_hardreset_timing.baudrate_ms = elm327_now_ms() - t_mark;
+	/* Written LAST: a non-zero total is the reader's signal that the rest of the record is complete. */
+	s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
 	// uint8_t protocol_number = 0;
 	// elm327_get_protocol_number(&protocol_number);
 }

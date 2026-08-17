@@ -53,6 +53,38 @@ void elm327_lock(void);
 void elm327_send_cmd(uint8_t* cmd, uint32_t cmd_len);
 esp_err_t elm327_get_protocol_number(uint8_t *protocol_number);
 void elm327_hardreset_chip(void);
+
+/* Where the time goes inside elm327_hardreset_chip().
+ *
+ * Diagnostic only (issue: wake takes ~23 s instead of ~3.5 s). Measured live in the car on
+ * 2026-08-17: every wake had the LED dark and WiFi down for ~23 s, and /wifi_diag put the first
+ * WiFi association ATTEMPT 20 s after CAN_WAKE -- so ~20 s is spent in the resume BEFORE the
+ * network is even touched, and elm327_hardreset_chip() is the only slow step there.
+ *
+ * Reading the code bounds it but cannot pin it, because one "hard reset" is really TWO mutex
+ * acquisitions and up to six UART timeouts: this function takes xuart1_semaphore (up to
+ * ELM327_CMD_MUTEX_TIMOUT = 10 s), waits 500 ms, reads once (~1.5 s), may fall through to the
+ * reset line and read AGAIN (~1.5 s), releases the mutex -- and then calls elm327_set_baudrate(),
+ * which takes the SAME mutex a second time (another 10 s worst case) and can do four more 1.2 s
+ * reads. So these fields split the call into the pieces that can each be checked against their
+ * own constant. */
+typedef struct
+{
+	uint32_t mutex_ms;			/* waiting for xuart1_semaphore (cap ELM327_CMD_MUTEX_TIMOUT) */
+	uint32_t reset_read_ms;		/* first uart_read_until_pattern (ATZ, or after the reset line) */
+	uint32_t retry_read_ms;		/* the ATZ-failed fall-through read; 0 when not taken */
+	uint32_t baudrate_ms;		/* elm327_set_baudrate() -- second mutex take + up to 4 reads */
+	uint32_t total_ms;			/* the whole call, wall clock */
+	uint32_t calls;				/* hard resets since boot -- catches "called more than once" */
+	int8_t   gpio7_at_entry;	/* 1 = chip reports asleep, 0 = awake (LOW=awake; hw_config.h lies) */
+	bool     used_reset_line;	/* false = ATZ path was believed sufficient */
+	bool     mutex_ok;			/* false = the 10 s mutex wait TIMED OUT and nothing was done */
+	bool     answered;			/* false = chip never sent the "\r>" prompt back */
+} elm327_hardreset_timing_t;
+
+/* Snapshot of the LAST elm327_hardreset_chip() call. Safe to call from another task. */
+void elm327_hardreset_get_timings(elm327_hardreset_timing_t *out);
+
 /* Undo elm327_sleep()'s GPIO9 pad hold. Required before the chip can be woken; called
  * from app_main at boot and from the sleep-resume path. */
 void elm327_release_sleep_hold(void);
