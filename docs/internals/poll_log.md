@@ -177,7 +177,7 @@ The Auto (fastest) logging rate is a **measurement, not an estimate** — this i
  "ignition_on":true,"quiesced":false,"bus_idle_ms":4294967295,
  "reload_ok":true,"reload_pending":false,
  "state":"fast","gate_open":true,
- "gate_volt":13.2,"rpm_known":true,"rpm":2150}
+ "gate_volt":13.2,"rpm_known":true,"rpm":2150,"engine_running":true}
 ```
 
 `ok/timeout/txfail` are cumulative; `win_*` are the last 3 s window; `bus_idle_ms` saturates at UINT32_MAX when no broadcast traffic is tracked.
@@ -207,6 +207,22 @@ The recording-gate fields. `req_s` alone is ambiguous once the gate exists — ~
 | `gate_volt` | The `engine_volt` threshold in use, read once at init. The close edge sits `VEHICLE_IGN_HYSTERESIS_V` under it. |
 | `rpm_known` | An RPM channel exists **and** its last value is fresh (within `POLLLOG_RPM_STALE_MS`). `false` ⇒ the gate is running on voltage alone. |
 | `rpm` | Last RPM seen, from either the polled or the broadcast copy. **`rpm_known:true` with a wrong low value is the one way this feature can silently stop automatic trips** — check it first if logging stops. |
+| `engine_running` | The latch behind the `ENGINE_ON` / `ENGINE_OFF` event lines (below). Same rpm verdict the gate uses, debounced on the stop edge. Always `false` on a bench PCM, which reports rpm 0. |
+
+### `ENGINE_ON` / `ENGINE_OFF` event lines
+
+The gate already knows when the crank is turning; before this it never said so, and an event log showing only steady 12.8 V readings was misread as "the engine never ran" — the `DATALOG_OPEN` line was the only (implicit) proof. Two event codes now state it outright:
+
+```
+ENGINE_ON    engine started -- 812 rpm, 14.32V
+ENGINE_OFF   engine stopped after 12m34s -- 0 rpm, 12.81V
+```
+
+- **Edge-triggered**, latched — one line per start, never per sweep (`polllog_eval_gate` runs up to 100×/s).
+- Start is announced on the first sweep over `POLLLOG_GATE_RPM_ON` (400 rpm: under any idle, over cranking), with no confirm count, so the line lands **before** the `DATALOG_OPEN` it causes.
+- All hysteresis is on the stop edge: rpm must be *known* under the threshold and stay there for `POLLLOG_ENGINE_OFF_CONFIRM_MS` (3 s, the same debounce that closes the gate). That also bounds a noisy channel — an ON/OFF pair costs at least 3 s.
+- A stale or never-answered rpm is **not** "engine off": `rpm_known` stays false and, with the latch, a boot with the key off or a table without an RPM row emits nothing.
+- The second stop path is the quiesce: a silent ECU means the engine cannot be running, so `ENGINE_OFF` is emitted there (immediately before `IGNITION_OFF`). At key-off this is usually the one that fires.
 
 ## Measured limits (bench, `v1.9.4-3-gd8b8180`, 2026-07-21)
 

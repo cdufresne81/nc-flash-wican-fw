@@ -92,6 +92,10 @@ bool     poll_log_quiesced(void);
  * Different question from poll_log_ignition_on() -- the ECU answers at key-on with the engine
  * off. This is what the CSV logger gates on. True when POLL_LOG is not the active mode. */
 bool     poll_log_gate_open(void);
+/* The engine-running LATCH behind the ENGINE_ON/ENGINE_OFF event lines: the gate's own rpm verdict,
+ * debounced on the stop edge. REPORTING ONLY (GET /poll_status) -- it fails CLOSED (false) outside
+ * POLL_LOG, the opposite of the two predicates above, so never gate logging on it. */
+bool     poll_log_engine_running(void);
 uint32_t poll_log_bus_idle_ms(void);
 
 /*

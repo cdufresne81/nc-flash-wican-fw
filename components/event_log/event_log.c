@@ -102,6 +102,8 @@ static const char *evl_code_str(event_log_code_t code)
         case EVL_BOOT:          return "BOOT";
         case EVL_IGNITION_ON:   return "IGNITION_ON";
         case EVL_IGNITION_OFF:  return "IGNITION_OFF";
+        case EVL_ENGINE_ON:     return "ENGINE_ON";
+        case EVL_ENGINE_OFF:    return "ENGINE_OFF";
         case EVL_DATALOG_OPEN:  return "DATALOG_OPEN";
         case EVL_DATALOG_CLOSE: return "DATALOG_CLOSE";
         case EVL_OTA_START:     return "OTA_START";

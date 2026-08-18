@@ -61,6 +61,13 @@ typedef enum {
     // key-on with the engine not turning too -- so these can never mean "the crank is spinning".
     EVL_IGNITION_ON,     // poll_log: ECU answering again (bus resume)
     EVL_IGNITION_OFF,    // poll_log: ECU silent -> LISTEN_ONLY quiesce
+    // The CRANK actually turning, which IGNITION_ON above deliberately does NOT mean. Own codes
+    // rather than EVL_INFO text: this is the same class of fact as the ignition pair and belongs
+    // next to it in a scan of the log, and a real code gets the -Wswitch name-table check below.
+    // Emitted by poll_log's recording gate off the SAME rpm state the gate itself decides on, so
+    // the log can never claim the engine is running while the gate says otherwise.
+    EVL_ENGINE_ON,       // poll_log: rpm crossed the running threshold (engine started)
+    EVL_ENGINE_OFF,      // poll_log: rpm stopped, or the ECU went silent under a running engine
     EVL_DATALOG_OPEN,    // csv_logger: a logging session/file opened
     EVL_DATALOG_CLOSE,   // csv_logger: a logging session/file closed
     EVL_OTA_START,       // firmware OTA upload began

@@ -179,6 +179,50 @@ static inline uint16_t polllog_rmba_size(const uint8_t *req)
 #define POLLLOG_GATE_VOLT_DEF    VEHICLE_ENGINE_ON_VOLT_DEFAULT  /* fallback when engine_volt is unreadable (vehicle.h) */
 #define POLLLOG_RPM_STALE_MS     (2u * POLLLOG_WATCH_SWEEP_MS)  /* older than this and RPM stops counting */
 
+/* ---- ENGINE_ON / ENGINE_OFF event lines -------------------------------------------------
+ * WHY THIS EXISTS. On 2026-08-17 the owner ran an engine-on/off cycle in the car to verify a fix,
+ * and the event log afterwards was read as "the engine never ran" -- every voltage line sat at
+ * 12.75-12.86 V and no event anywhere said otherwise. That reading was WRONG: a CSV trip only opens
+ * while the engine is running, so the DATALOG_OPEN line WAS the proof. The fact was present but
+ * implicit, and a verification test got misread because of it. There is also an asymmetry to fix:
+ * IGNITION_ON and IGNITION_OFF both exist, but the crank turning -- which the gate below ALREADY
+ * computes, every single sweep -- was never announced.
+ *
+ * So these lines carry no new detection. They are the edge of the gate's OWN rpm state
+ * (rpm_known / rpm_running in polllog_eval_gate), announced once. Deliberately not a second,
+ * independent "engine on" notion: two detectors WILL drift apart and then the log and the recording
+ * gate disagree, which is worse than no line at all.
+ *
+ * EDGE-TRIGGERED, latched in s_engine_on. polllog_eval_gate runs once per sweep -- up to 100 times
+ * a second in FAST -- so an unlatched line would write the SD card full in a minute. Same
+ * one-line-per-episode rule the sleep-mode veto/postpone latches follow (main/sleep_mode.c:1530).
+ *
+ * THRESHOLDS AND HYSTERESIS. Starting is announced on the FIRST sweep that sees rpm over
+ * POLLLOG_GATE_RPM_ON (400) -- the same threshold the gate opens on, chosen to sit under any idle
+ * and over cranking. It is NOT confirm-counted, and that is a deliberate trade, not an oversight:
+ * the whole point of the line is to land BEFORE the DATALOG_OPEN it causes, and the gate opens on
+ * that same first sweep. Even one extra pass of confirmation would, at watch cadence, put this line
+ * a second late -- i.e. after the CSV writer has already noticed the gate and opened the trip.
+ *
+ * All of the hysteresis therefore lives on the STOP edge: stopping needs rpm confirmed under the
+ * threshold and held there for POLLLOG_GATE_OFF_MS (3 s, the same debounce that closes the gate and
+ * the trip). That alone is what bounds a noisy channel -- an ON/OFF pair costs at minimum those
+ * 3 s, so no burst is possible, and a momentary dip through zero never reaches the log at all.
+ * A genuine stall-and-restart DOES produce a pair, which is correct and worth seeing.
+ *
+ * RPM 0 BECAUSE NOTHING ANSWERED YET IS NOT "ENGINE OFF". rpm_known is false until a real value
+ * lands (s_rpm_seen) and goes false again once one is older than POLLLOG_RPM_STALE_MS, and only a
+ * KNOWN-low reading may arm the stop debounce. Combined with the latch -- ENGINE_OFF is only ever
+ * emitted after an ENGINE_ON -- a boot with the key off, a table with no RPM row, and a probe that
+ * never gets an answer all emit exactly nothing.
+ *
+ * ENGINE_OFF IS KEPT, not dropped for brevity. Two reasons beyond symmetry with IGNITION_OFF:
+ * without it the latch would need clearing somewhere anyway (a latch left true after a drive means
+ * the NEXT start is silent -- the exact failure this feature exists to prevent), and the run
+ * duration it carries is the one number that makes a pair of lines readable at a glance.
+ * DATALOG_CLOSE is not a substitute: it only exists if a trip happened to be recording. */
+#define POLLLOG_ENGINE_OFF_CONFIRM_MS  POLLLOG_GATE_OFF_MS
+
 /* The engine-off detector is wall-clock based, so it works unchanged at watch cadence: after
  * key-off every watch sweep is all-timeouts (~45 x 30 ms = ~1.4 s) and the 5 s budget still
  * fires. That only holds while a watch sweep stays comfortably inside the budget. */
@@ -340,6 +384,13 @@ static volatile float    s_rpm_value = 0;
 static volatile uint32_t s_rpm_ms    = 0;
 static volatile int64_t s_last_flip_us   = 0;     /* dwell timer for POLLLOG_FLIP_MIN_MS */
 
+/* Engine-running latch for the ENGINE_ON/ENGINE_OFF lines (see the block above). s_engine_on is
+ * volatile because GET /poll_status reads it off the httpd task; the two timestamps are touched
+ * only by the poll task and stay plain. */
+static volatile bool    s_engine_on     = false;  /* true between ENGINE_ON and ENGINE_OFF */
+static int64_t          s_engine_on_us  = 0;      /* when the current run started (for the duration) */
+static int64_t          s_engine_low_us = 0;      /* first CONFIRMED under-threshold rpm; 0 = not armed */
+
 /* Live per-row Test under POLL_LOG (issue #41). The httpd handler stages ONE request here and
  * blocks on s_test_done_sem; the poll task (sole TWAI consumer) picks it up at the top-of-loop
  * safe point -- AFTER can_should_park() -- runs it, and gives the semaphore back. s_test_req_mtx
@@ -464,6 +515,121 @@ static inline void polllog_stamp_rpm(const char *name, float value)
     s_rpm_seen  = true;
 }
 
+/* ---- ENGINE_ON / ENGINE_OFF emitters ----------------------------------------------------
+ * Read the design block near POLLLOG_ENGINE_OFF_CONFIRM_MS before touching any of these.
+ *
+ * EVENT_LOG_DETAIL_MAX is 112 chars and truncation is SILENT (it has already cost one test round),
+ * so both lines are counted at their worst case here:
+ *   "engine started -- 99999 rpm, volts n/a"                              ->  38
+ *   "engine stopped after 1193046h28m -- ECU stopped answering, volts n/a" ->  68
+ * Both fit with room to spare. Every number that feeds them is CLAMPED below rather than trusted:
+ * s_rpm_value is a decoded PID value and a broken expression could hand us 1e38, whose %.0f alone
+ * is 39 characters. */
+
+/* rpm as a printable integer. Clamped, and the !(>0) test also swallows NaN. */
+static inline int polllog_rpm_i(float rpm)
+{
+    if (!(rpm > 0.0f))
+        return 0;
+    if (rpm > 99999.0f)
+        return 99999;
+    return (int)(rpm + 0.5f);
+}
+
+/* Battery volts for an event line, or the words "volts n/a". A queue peek (sleep_mode.c), so it is
+ * cheap enough to pay on an edge -- and these run once per engine start, not per sweep. */
+static void polllog_volt_str(char *out, size_t n)
+{
+    float v = 0;
+    if (sleep_mode_get_voltage(&v) == ESP_OK)
+        snprintf(out, n, "%.2fV", (double)v);
+    else
+        snprintf(out, n, "volts n/a");
+}
+
+/* Run length in words a human reads without dividing: "45s", "12m34s", "1h05m". */
+static void polllog_dur_str(char *out, size_t n, uint32_t secs)
+{
+    if (secs >= 3600u)
+        snprintf(out, n, "%uh%02um", (unsigned)(secs / 3600u), (unsigned)((secs / 60u) % 60u));
+    else if (secs >= 60u)
+        snprintf(out, n, "%um%02us", (unsigned)(secs / 60u), (unsigned)(secs % 60u));
+    else
+        snprintf(out, n, "%us", (unsigned)secs);
+}
+
+/* The rising edge: announce the engine ONCE. Returns immediately when already latched, which is
+ * what keeps this off the per-sweep path -- every caller may call it unconditionally. */
+static void polllog_engine_started(void)
+{
+    if (s_engine_on)
+        return;
+    s_engine_on     = true;
+    s_engine_on_us  = esp_timer_get_time();
+    s_engine_low_us = 0;
+
+    char volts[12];
+    polllog_volt_str(volts, sizeof(volts));
+    ESP_LOGI(TAG, "engine started (%d rpm, %s)", polllog_rpm_i(s_rpm_value), volts);
+    event_log_emit(EVL_ENGINE_ON, "engine started -- %d rpm, %s", polllog_rpm_i(s_rpm_value), volts);
+}
+
+/* The falling edge. `why` is the evidence, already in plain words ("0 rpm", "ECU stopped
+ * answering"), because the two call sites know different things and neither reason should be
+ * inferred from the other. No-op unless latched, so the quiesce path can call it blind. */
+static void polllog_engine_stopped(const char *why)
+{
+    if (!s_engine_on)
+        return;
+    s_engine_on     = false;
+    s_engine_low_us = 0;
+
+    int64_t ran_us = esp_timer_get_time() - s_engine_on_us;
+    if (ran_us < 0)
+        ran_us = 0;
+    char dur[16];
+    polllog_dur_str(dur, sizeof(dur), (uint32_t)(ran_us / 1000000));
+    char volts[12];
+    polllog_volt_str(volts, sizeof(volts));
+    ESP_LOGI(TAG, "engine stopped after %s (%s, %s)", dur, why, volts);
+    event_log_emit(EVL_ENGINE_OFF, "engine stopped after %s -- %s, %s", dur, why, volts);
+}
+
+/* One pass of the engine-run edge, fed the gate's own rpm verdict so the two can never disagree.
+ * Called from polllog_eval_gate ABOVE its CSV-session shortcut -- see the note there.
+ *
+ * The stop debounce is armed only by a KNOWN under-threshold reading, but once armed it is NOT
+ * disarmed by the rpm going stale, and that asymmetry is load-bearing. At key-off the rpm samples
+ * stop arriving about two seconds after the last one, which is BEFORE the 3 s debounce is up; if
+ * staleness reset the timer, the normal way an engine stops would never complete the debounce and
+ * the stop would only ever be reported by the quiesce path 5 s later. Only rpm back OVER the
+ * threshold clears it -- i.e. only actual evidence that the engine is still turning.
+ *
+ * Conversely, staleness ALONE never arms it. A configuration that starves the rpm channel (a large
+ * per-PID divisor, a dropped broadcast) must not be able to invent an engine stop mid-drive; in
+ * that case the gate keeps recording (its rpm term drops out too) and the log stays quiet. */
+static void polllog_engine_edge(int64_t now_us, bool rpm_known, bool rpm_running)
+{
+    if (rpm_known && rpm_running)
+    {
+        s_engine_low_us = 0;
+        polllog_engine_started();
+        return;
+    }
+    if (!s_engine_on)
+        return;
+    if (rpm_known && s_engine_low_us == 0)
+        s_engine_low_us = now_us;
+    if (s_engine_low_us == 0)
+        return;
+    if ((now_us - s_engine_low_us) <= (int64_t)POLLLOG_ENGINE_OFF_CONFIRM_MS * 1000)
+        return;
+
+    char why[16];
+    snprintf(why, sizeof(why), "%d rpm", polllog_rpm_i(s_rpm_value));
+    polllog_engine_stopped(why);
+}
+
 /* Decide whether the fast sweep is warranted right now. Runs once per sweep on the poll task,
  * above the sweep itself.
  *
@@ -498,6 +664,26 @@ static void polllog_eval_gate(int64_t now_us)
 {
     static int64_t low_since_us = 0;   /* poll task only */
 
+    /* RPM counts only while an RPM channel exists AND its last value is recent. Anything older
+     * than two watch periods is treated as absent, not as zero.
+     *
+     * Computed FIRST, above every early return below, for the engine-run edge: the CSV-session
+     * shortcut skips the rest of this function for the whole length of a trip, and the engine STOPS
+     * during a trip -- evaluating the edge after that shortcut would mean ENGINE_OFF only ever
+     * landed once the session had already closed. Pure reads, so hoisting it costs the shortcut
+     * path a couple of comparisons and changes no gate behaviour. */
+    bool rpm_known = false, rpm_running = false;
+    if (s_rpm_seen)
+    {
+        const uint32_t now_ms = (uint32_t)(now_us / 1000);
+        if ((uint32_t)(now_ms - s_rpm_ms) <= POLLLOG_RPM_STALE_MS)
+        {
+            rpm_known   = true;
+            rpm_running = (s_rpm_value > POLLLOG_GATE_RPM_ON);
+        }
+    }
+    polllog_engine_edge(now_us, rpm_known, rpm_running);
+
     if (csv_logger_session_active())
     {
         if (!s_gate_open)
@@ -511,19 +697,6 @@ static void polllog_eval_gate(int64_t now_us)
 
     float      volts  = 0;
     const bool have_v = (sleep_mode_get_voltage(&volts) == ESP_OK);
-
-    /* RPM counts only while an RPM channel exists AND its last value is recent. Anything older
-     * than two watch periods is treated as absent, not as zero. */
-    bool rpm_known = false, rpm_running = false;
-    if (s_rpm_seen)
-    {
-        const uint32_t now_ms = (uint32_t)(now_us / 1000);
-        if ((uint32_t)(now_ms - s_rpm_ms) <= POLLLOG_RPM_STALE_MS)
-        {
-            rpm_known   = true;
-            rpm_running = (s_rpm_value > POLLLOG_GATE_RPM_ON);
-        }
-    }
 
     /* One "is the engine running" answer, asked against a threshold that depends on which side of
      * the gate we are on: engine_volt to open, engine_volt minus the band to close. That band IS
@@ -1386,6 +1559,16 @@ static void polllog_rx_task(void *arg)
                     s_gate_open      = false;  /* ECU gone -> nothing to record; re-decide on resume */
                     s_last_rx_us     = now;   /* arm the idle clock from the flip instant */
                     s_last_flip_us   = now;
+                    /* A silent ECU is proof the engine is not turning: an engine cannot run with
+                     * its PCM off the bus. This is the SECOND stop path and the one that normally
+                     * fires -- at key-off the rpm samples stop before the rpm-based debounce in
+                     * polllog_engine_edge completes, unless the ECU keeps answering through the
+                     * spin-down. Called unconditionally (it is a no-op unless the latch is up) so
+                     * the latch cannot survive a quiesce and silence the NEXT start. Emitted BEFORE
+                     * IGNITION_OFF because that is the real order of events: the engine stops, then
+                     * the ignition goes. No extra debounce -- POLLLOG_ENGINE_OFF_MS already waited
+                     * 5 s of silence to get here. */
+                    polllog_engine_stopped("ECU stopped answering");
                     if (was_confirmed)
                     {
                         ESP_LOGI(TAG, "ECU silent %dms -> LISTEN_ONLY quiesce (stop holding bus awake)",
@@ -1650,6 +1833,16 @@ bool poll_log_gate_open(void)
     return s_active ? s_gate_open : true;
 }
 
+/* The ENGINE_ON/ENGINE_OFF latch, exposed so GET /poll_status can show the same fact the event log
+ * just claimed -- the only way to check this feature live, since the bench PCM reports rpm 0 and
+ * can never make it true. Returns FALSE outside POLL_LOG rather than the fail-open true that
+ * poll_log_gate_open() uses: this is a report, not a permission, and "we are not measuring rpm"
+ * must never read as "the engine is running". */
+bool poll_log_engine_running(void)
+{
+    return s_active && s_engine_on;
+}
+
 float poll_log_sweep_hz(void)
 {
     /* Issue #29: with per-PID divisors, mean sweep time is no longer the rate at which any
@@ -1706,7 +1899,7 @@ char *poll_log_get_status_json(void)
              "\"ignition_on\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s,"
              "\"reload_pending\":%s,"
              "\"state\":\"%s\",\"gate_open\":%s,"
-             "\"gate_volt\":%.1f,\"rpm_known\":%s,\"rpm\":%.0f}",
+             "\"gate_volt\":%.1f,\"rpm_known\":%s,\"rpm\":%.0f,\"engine_running\":%s}",
              s_active ? "true" : "false",
              (unsigned)s_cum_ok, (unsigned)s_cum_timeout, (unsigned)s_cum_txfail,
              (double)s_win_rtt_avg_ms, (double)s_win_rtt_min_ms, (double)s_win_rtt_max_ms,
@@ -1730,7 +1923,8 @@ char *poll_log_get_status_json(void)
              s_gate_open ? "true" : "false",
              (double)s_gate_volt_on,
              s_rpm_seen ? "true" : "false",
-             (double)s_rpm_value);
+             (double)s_rpm_value,
+             poll_log_engine_running() ? "true" : "false");
     /* Silent truncation would emit INVALID JSON to the web UI and to any tooling polling
      * this endpoint -- log loudly rather than let a future field addition break it quietly. */
     if (n < 0 || n >= POLLLOG_STATUS_JSON_SZ)
