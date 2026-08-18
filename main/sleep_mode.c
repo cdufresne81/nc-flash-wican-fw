@@ -1400,12 +1400,21 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
         /* Fields listed in EXECUTION order, which changed with the reorder above: led now comes
          * second and chip last. Same names, same meanings -- so old and new logs stay comparable
          * field by field -- but read left to right they are a timeline again. */
-        event_log_emit(EVL_INFO,
+        /* DEBUG-GATED (owner request): on a healthy device these three lines are pure numbers and
+         * they crowd the event page, which is the owner's normal view of what the device did. The
+         * EVENTS they describe are still recorded unconditionally -- CAN_WAKE, IGNITION_ON,
+         * DATALOG_*, and every resume refusal/failure line are untouched. What is hidden is only
+         * the millisecond breakdown, which matters when investigating and never otherwise.
+         *
+         * Turn them back on with the stored "debug" config flag when a wake needs measuring:
+         * GET /event_log/status reports the flag as "debug". Without it these will NOT appear, so
+         * do not read their absence as "the fix stopped working". */
+        EVENT_LOG_DEBUG(EVL_INFO,
                        "resume ms: hold=%u led=%u can=%u fence=%u wifi=%u chip=%u tot=%u",
                        (unsigned)t_hold_ms, (unsigned)t_led_ms, (unsigned)t_can_ms,
                        (unsigned)t_fence_ms, (unsigned)t_wifi_ms, (unsigned)t_chip_ms,
                        (unsigned)((uint32_t)(esp_timer_get_time() / 1000) - t_resume_start));
-        event_log_emit(EVL_INFO,
+        EVENT_LOG_DEBUG(EVL_INFO,
                        "hardreset ms: mutex=%u%s rd=%u rt=%u baud=%u tot=%u g7=%d %s %s calls=%u",
                        (unsigned)hr.mutex_ms, hr.mutex_ok ? "ok" : "TIMEOUT",
                        (unsigned)hr.reset_read_ms, (unsigned)hr.retry_read_ms,
@@ -1417,7 +1426,7 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
         /* The answer to "who?" -- the question the first round could not reach. A slow wake is two
          * 10 s lock timeouts, so whatever is named here is the actual defect. Empty fields mean
          * that particular take did NOT time out, which on a healthy wake is all of them. */
-        event_log_emit(EVL_INFO, "uart lock: pre=%s rstTO=%s baudTO=%s",
+        EVENT_LOG_DEBUG(EVL_INFO, "uart lock: pre=%s rstTO=%s baudTO=%s",
                        hr.holder_before[0]  ? hr.holder_before  : "-",
                        hr.holder_rst_to[0]  ? hr.holder_rst_to  : "-",
                        hr.holder_baud_to[0] ? hr.holder_baud_to : "-");
@@ -2176,7 +2185,11 @@ void light_sleep_task(void *pvParameters)
                 if(!s_elm327_asleep_logged && elm327_chip_get_status() == ELM327_SLEEP)
                 {
                     s_elm327_asleep_logged = true;
-                    event_log_emit(EVL_INFO,
+                    /* DEBUG-GATED (owner request): a normal, healthy settle is noise on the event
+                     * page. The FAILURE case is not gated -- if the chip never settles, the
+                     * babysitter's "would not sleep" line still fires unconditionally, so the bad
+                     * news can never be hidden by a config flag. */
+                    EVENT_LOG_DEBUG(EVL_INFO,
                                    "DIAG gpio7 settled asleep after %u ms / %u passes "
                                    "(grace allows %u passes; nudges used %u)",
                                    (unsigned)((uint32_t)(esp_timer_get_time() / 1000)
