@@ -412,6 +412,27 @@ static void wd_tally_add(uint8_t reason)
 
 // ---- Event hooks -------------------------------------------------------------------------------
 
+/* ⚠️ EVERY event_log_emit() IN THIS FILE RUNS ON THE ESP EVENT TASK'S STACK.
+ *
+ * These hooks are called from wifi_mgr's event handling (wifi_mgr.c), which runs on the system
+ * event task -- CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE, not a stack this component controls.
+ * One event_log_emit() costs roughly 800 bytes there: evl_vemit() alone puts 328 bytes of buffers
+ * on the stack (detail[112] + ts[24] + line[192]) and then calls vsnprintf, localtime_r, strftime
+ * and snprintf, whose newlib internals are not small.
+ *
+ * That stack was 2304 bytes and it was NOT enough. Observed 2026-08-18 on a unit whose WiFi was
+ * retrying constantly: a hard boot loop, ~13 s after every boot, decoded from the crash reporter
+ * as vApplicationStackOverflowHook -> esp_system_abort. It reproduced identically on two
+ * different firmware versions, which is what proved it was not the change being tested at the
+ * time. Raised to 4608 in sdkconfig.
+ *
+ * The trigger was the debug-gated line below (it fires on EVERY connection attempt, and a failing
+ * device attempts constantly), but the ungated lines further down -- associated / got IP / DROP --
+ * pay the same cost on the same stack and were already close to the edge with debug OFF.
+ *
+ * So: before adding another emit here, or making any of these fire more often, check the headroom.
+ * If this ever needs to be cheap, the fix is to defer the formatting off this task, not to shave
+ * the buffers. */
 void wifi_diag_note_attempt(const char *ssid)
 {
     const char *s = (ssid != NULL) ? ssid : "";
