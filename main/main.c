@@ -889,6 +889,23 @@ void app_main(void)
     elm327_uart_rx_queue_storage = (xdev_buffer *)heap_caps_malloc(32 * xdev_buffer_size, MALLOC_CAP_SPIRAM);
 	xmsg_obd_rx_queue = xQueueCreateStatic(32, xdev_buffer_size, (uint8_t *)elm327_uart_rx_queue_storage, &elm327_uart_rx_queue_buffer);
 	// elm327_init( &send_to_host, &xmsg_obd_rx_queue, NULL); //not needed
+
+	/* Only start elm327_read_task in the modes where an ELM327 client can actually reach us.
+	 *
+	 * The condition MIRRORS the router below (the `protocol == OBD_ELM327 || protocol == AUTO_PID`
+	 * arm): that arm is the only thing that ever feeds bytes to elm327, so under poll_log/fast_log
+	 * port 35000 still accepts a connection but nothing that arrives is routed to the chip. The
+	 * read task therefore serves nobody in those modes -- while still taking the shared UART lock
+	 * whenever the chip emits a byte. Measured in the car 2026-08-17: it held that lock across an
+	 * entire sleep, so the wake burned 20 s failing to get it (LED dark, WiFi down, datalogger
+	 * recording throughout) and the sleep babysitter's nudges silently did nothing, which is what
+	 * produced the misleading "MIC chip would not sleep" line.
+	 *
+	 * Keep the two conditions identical if either is ever edited. `protocol` is already resolved
+	 * above INCLUDING the SmartConnect override, which is why this reads the local variable rather
+	 * than calling config_server_protocol() again -- that would miss the override and gate wrongly.
+	 * Protocol changes require a reboot, so deciding once here is sound. */
+	elm327_set_read_task_enabled(protocol == OBD_ELM327 || protocol == AUTO_PID);
 	elm327_init(&send_to_host, &xmsg_ble_tx_queue, NULL);
 	if(protocol == AUTO_PID)
 	{
@@ -910,9 +927,16 @@ void app_main(void)
 	{
 		// Native-TWAI fast datalogger (Task #18), Phase A: passive broadcast capture.
 		// fast_log brings up the bus LISTEN_ONLY and decodes broadcast frames at bus rate,
-		// in place of the AutoPID/ELM poll loop. elm327_init() above stays dormant (no client
-		// drives it in FAST_LOG mode, so it never touches the CAN bus). Same CSV gate as
-		// AUTO_PID: deferred start when csv_log is enabled.
+		// in place of the AutoPID/ELM poll loop. Same CSV gate as AUTO_PID: deferred start
+		// when csv_log is enabled.
+		//
+		// elm327_init() above still runs -- it owns the UART, the lock and the chip's boot
+		// maintenance, all of which the sleep path needs every cycle. What it does NOT start in
+		// this mode is elm327_read_task; see elm327_set_read_task_enabled() at the call site.
+		// This comment used to claim elm327_init() "stays dormant (no client drives it)". That
+		// was true of the CAN bus and FALSE of the UART lock: the read task took that lock on
+		// every byte the chip emitted and deadlocked the wake for 20 s. The wrong comment is a
+		// large part of why that took a whole evening to find -- do not restore it.
 		uint32_t log_period = 0;
 		if(config_server_get_log_period(&log_period) == -1)
 		{
@@ -928,8 +952,17 @@ void app_main(void)
 	{
 		// Native-TWAI request/response poller (Task #18, Phase B "measure-first"). Brings up the
 		// bus NORMAL/on-bus and polls the configured mode-01/22 PIDs with no ELM emulation and no
-		// hardcoded 100ms inter-poll delay, in place of the AutoPID/ELM poll loop. elm327_init()
-		// above stays dormant (no client drives it). Same CSV gate as FAST_LOG: deferred start.
+		// hardcoded 100ms inter-poll delay, in place of the AutoPID/ELM poll loop. Same CSV gate
+		// as FAST_LOG: deferred start.
+		//
+		// elm327_init() above still runs -- it owns the UART, the lock and the chip's boot
+		// maintenance, all of which the sleep path needs every cycle. What it does NOT start in
+		// this mode is elm327_read_task; see elm327_set_read_task_enabled() at the call site.
+		// This comment used to claim elm327_init() "stays dormant (no client drives it)". That
+		// was true of the CAN bus and FALSE of the UART lock: the read task took that lock on
+		// every byte the chip emitted and held it across a whole sleep, so the wake spent 20 s
+		// failing to acquire it -- LED dark, WiFi down, datalogger recording the entire time.
+		// Do not restore the old claim.
 		uint32_t log_period = 0;
 		if(config_server_get_log_period(&log_period) == -1)
 		{

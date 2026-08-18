@@ -39,6 +39,23 @@ typedef enum{
 
 void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void (*can_log)(twai_message_t* frame, uint8_t type));
 
+/* Choose whether elm327_init() creates elm327_read_task. Call BEFORE elm327_init(); it has no
+ * effect afterwards. Defaults to ENABLED, so a caller that forgets gets today's behaviour.
+ *
+ * elm327_read_task exists only to forward UNSOLICITED output from the interpreter chip to a
+ * connected ELM327 client. Under poll_log/fast_log no client can reach it -- main.c's router only
+ * feeds elm327 when protocol is OBD_ELM327 or AUTO_PID -- so the task serves nobody, yet it still
+ * takes the shared UART lock whenever the chip emits a byte. Measured in the car 2026-08-17: it
+ * held that lock across a whole sleep, so the wake spent 20 s failing to get it (LED dark, WiFi
+ * down, datalogger recording the entire time) and the sleep babysitter's nudges silently did
+ * nothing, producing the misleading "MIC chip would not sleep" line.
+ *
+ * ONLY this one task is optional. elm327_init()'s other work is load-bearing in every mode: it
+ * creates the UART driver, uart1_queue and xuart1_semaphore that the sleep path uses on every
+ * cycle, runs the chip's boot maintenance, and starts uart1_event_task -- which executes the
+ * chip's own sleep/wake voltage configuration queued by obd_init(). Never gate those. */
+void elm327_set_read_task_enabled(bool enabled);
+
 #if HARDWARE_VER == WICAN_PRO
 int8_t elm327_process_cmd(uint8_t *buf, uint32_t len, QueueHandle_t *q, char *cmd_buffer, uint32_t *cmd_buffer_len, int64_t *last_cmd_time, response_callback_t response_callback);
 elm327_chip_status_t elm327_chip_get_status(void);

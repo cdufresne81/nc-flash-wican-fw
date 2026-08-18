@@ -60,6 +60,16 @@
 
 static QueueHandle_t *xqueue_elm327_uart_rx = NULL;
 
+/* Whether elm327_init() creates elm327_read_task. See elm327_set_read_task_enabled() in elm327.h.
+ * Defaults TRUE on purpose: a caller that forgets to decide gets the historical behaviour, which
+ * is the safe direction to fail -- the dangerous mistake is NOT starting a task something needs. */
+static bool s_read_task_enabled = true;
+
+void elm327_set_read_task_enabled(bool enabled)
+{
+	s_read_task_enabled = enabled;
+}
+
 void (*elm327_can_log)(twai_message_t* frame, uint8_t type);
 
 #if HARDWARE_VER != WICAN_PRO
@@ -1361,6 +1371,23 @@ typedef struct
 static QueueHandle_t elm327_cmd_queue;
 static StaticQueue_t elm327_cmd_queue_struct;
 static uint8_t *elm327_cmd_queue_storage = NULL;
+/* UART1 -- the link to the MIC3624 interpreter chip. TWO INVARIANTS, both learned the hard way
+ * from a bug that made the device look dead for 20 s after every other wake (2026-08-17):
+ *
+ * 1. NEVER BLOCK WHILE HOLDING xuart1_semaphore. Every consumer of uart1_queue pops only under
+ *    this lock, so one blocked consumer stalls the interpreter chip for everyone -- including the
+ *    sleep/wake path, which cannot then reset the chip, put it to sleep, or even find out why.
+ *    elm327_read_task did exactly this: it read with portMAX_DELAY under the lock and held it
+ *    across an entire sleep, costing the wake 2 x ELM327_CMD_MUTEX_TIMOUT.
+ *
+ * 2. EVERY uart_flush_input() MUST BE PAIRED WITH xQueueReset(uart1_queue), UNDER THE SAME LOCK
+ *    HOLD. The flush empties the driver's RX ring but leaves already-posted UART_DATA events in
+ *    this queue. An unpaired flush therefore leaves ORPHANED events: a consumer receives one,
+ *    asks for event.size bytes that were thrown away, and waits. That was the source of the
+ *    orphan that triggered invariant 1.
+ *
+ * Several raw readers (uart_read_until_pattern) consume bytes without consuming their events,
+ * which is what makes rule 2 load-bearing rather than tidy. */
 QueueHandle_t uart1_queue = NULL;
 static SemaphoreHandle_t xuart1_semaphore = NULL;
 
@@ -1400,7 +1427,11 @@ static void elm327_powerpin_commands(void)
 			return;
 		}
 		bzero(rx_buffer, ELM327_CMD_BUFFER_SIZE);
+		/* PAIRED -- see the invariant at the uart1_queue declaration. Boot-time only, so this one
+		 * was the mildest of the unpaired flushes, but the rule holds everywhere or it is not a
+		 * rule. Inside the lock hold. */
 		uart_flush_input(UART_NUM_1);
+		xQueueReset(uart1_queue);
 
 		// VTVERS
 		elm327_uart_write_bytes(UART_NUM_1, "VTVERS\r", strlen("VTVERS\r"));
@@ -2012,8 +2043,11 @@ void elm327_hardreset_chip(void)
 		s_hardreset_timing.mutex_ms = elm327_now_ms() - t_mark;
 		s_hardreset_timing.mutex_ok = true;
 		vTaskDelay(pdMS_TO_TICKS(500));
+		/* PAIRED -- the reset was commented out here. A flush that empties the RX ring without
+		 * clearing uart1_queue leaves orphaned UART_DATA events behind, which is what deadlocked
+		 * elm327_read_task on the UART lock. Both calls stay inside the lock hold. */
 		uart_flush_input(UART_NUM_1);
-		// xQueueReset(uart1_queue);
+		xQueueReset(uart1_queue);
 		/* GPIO7 HIGH means the chip is ASLEEP (see hw_config.h) -- it cannot hear UART, so the
 		 * only way in is the reset line. LOW means it is awake and should answer ATZ. */
 		bool used_reset_line = (gpio_get_level(OBD_READY_PIN) == 1);
@@ -2064,7 +2098,9 @@ void elm327_hardreset_chip(void)
 		{
 			ESP_LOGE(TAG, "Hardreset failed even via the reset line");
 		}
+		/* PAIRED -- see the flush at the top of this function. Still inside the lock hold. */
 		uart_flush_input(UART_NUM_1);
+		xQueueReset(uart1_queue);
 		if(xuart1_semaphore == NULL)
 		{
 			ESP_LOGE(TAG, "xuart1_semaphore is NULL");
@@ -2319,7 +2355,23 @@ esp_err_t elm327_sleep(void)
 			ESP_LOGE(TAG, "%s: Sleep failed", __func__);
 			ret = ESP_FAIL;
 		}
+		/* PAIRED, and this is THE site that caused the 20 s wakes.
+		 *
+		 * uart_flush_input() empties the driver's RX ring but leaves already-posted UART_DATA
+		 * events in uart1_queue. The STSLEEP0 reply above is read raw by
+		 * uart_read_until_pattern(), which never consumes the events that reply generated -- so
+		 * the flush destroyed the bytes while the events survived. elm327_read_task then took the
+		 * UART lock, received one of those orphaned events, and blocked forever waiting for bytes
+		 * that no longer existed, holding the lock across the whole sleep. The wake then spent
+		 * 2 x 10 s failing to acquire it.
+		 *
+		 * Whether the reply's event was still queued at this instant was pure scheduling luck,
+		 * which is exactly why the fault looked like a coin flip in the car.
+		 *
+		 * Both calls stay inside the lock hold, which is what makes the pair atomic against the
+		 * other consumers. */
 		uart_flush_input(UART_NUM_1);
+		xQueueReset(uart1_queue);
 
 		gpio_sleep_set_pull_mode(OBD_SLEEP_PIN, GPIO_PULLDOWN_ONLY);
 		gpio_set_level(OBD_SLEEP_PIN, 0);
@@ -2334,7 +2386,9 @@ esp_err_t elm327_sleep(void)
 		gpio_hold_en(OBD_READY_PIN);
 		gpio_deep_sleep_hold_en();
 
-		// xQueueReset(uart1_queue);
+		/* (The xQueueReset that used to be commented out here now lives with its flush above,
+		 * where it belongs -- a reset without its flush, or after the pin work, does not close
+		 * the orphaned-event window.) */
 		xSemaphoreGive(xuart1_semaphore);
 	}
 	else
@@ -3318,25 +3372,65 @@ void elm327_read_task(void *pvParameters)
 			if(xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
 			{
 				bzero(dtmp.ucElement, sizeof(dtmp.ucElement));
-				// TODO: fix this. Here it's checking if queu is not empty, other task might have processed the queue while waiting for empty queue
-				if((xQueuePeek(uart1_queue, (void *)&event, 0)) == pdTRUE && xQueueReceive(uart1_queue, (void *)&event, portMAX_DELAY) == pdTRUE)
+				/* Both waits below are ZERO. THE INVARIANT FOR THIS WHOLE BLOCK: nothing here may
+				 * ever block while holding xuart1_semaphore. Breaking that is what caused the
+				 * 20 s wakes -- see the UART_DATA case.
+				 *
+				 * The re-peek also settles the old "TODO: another task might have processed the
+				 * queue while we waited" note: with a zero-timeout receive, losing that race now
+				 * costs a wasted wakeup instead of a hang, which is all the guard needs to do. */
+				if((xQueuePeek(uart1_queue, (void *)&event, 0)) == pdTRUE && xQueueReceive(uart1_queue, (void *)&event, 0) == pdTRUE)
 				{
-					switch(event.type) 
+					switch(event.type)
 					{
 						case UART_DATA:
-							elm327_uart_read_bytes(UART_NUM_1, dtmp.ucElement, event.size, portMAX_DELAY);
-							
+						{
+							/* THE DEADLOCK, FIXED. This used to read event.size bytes with
+							 * portMAX_DELAY while holding the lock above.
+							 *
+							 * The IDF driver posts UART_DATA only AFTER copying the bytes into its
+							 * RX ring, so for a genuine event they are already there and a zero
+							 * wait is enough. The one case where they are NOT there is an event
+							 * ORPHANED by a uart_flush_input() that emptied the ring without
+							 * clearing the event queue -- and waiting for bytes that were thrown
+							 * away is exactly the bug: the task then held the UART lock forever.
+							 * Measured in the car 2026-08-17: held across an entire sleep, so the
+							 * wake spent 2 x 10 s failing to take the lock while the LED stayed
+							 * dark and WiFi stayed down.
+							 *
+							 * So: take what is actually there, and DROP a stale event rather than
+							 * wait for it. The flush/reset pairing elsewhere in this file removes
+							 * the orphans at source; this makes them harmless even if one slips
+							 * through. */
+							size_t want = event.size;
+							if(want > sizeof(dtmp.ucElement))
+							{
+								/* Driver-bounded well below this in practice; the clamp removes
+								 * the assumption rather than trusting it. */
+								want = sizeof(dtmp.ucElement);
+							}
+							const int got = elm327_uart_read_bytes(UART_NUM_1, dtmp.ucElement, want, 0);
+							if(got <= 0)
+							{
+								/* Stale/orphaned event. Silent on purpose: this runs per UART
+								 * event, so a log line here could flood. */
+								break;
+							}
+
 							if(elm327_response != NULL)
 							{
-								ESP_LOG_BUFFER_HEXDUMP(TAG, (char*)dtmp.ucElement, event.size, ESP_LOG_INFO);
-								dtmp.usLen = event.size;
-								// ESP_LOG_BUFFER_CHAR(TAG, (char*)dtmp, event.size);
-								elm327_response((char*)dtmp.ucElement, 
-														event.size, 
-														xqueue_elm327_uart_rx, 
+								/* Everything below uses `got`, never event.size. They differ on a
+								 * short read, and passing event.size then handed the client
+								 * uninitialised tail bytes. */
+								ESP_LOG_BUFFER_HEXDUMP(TAG, (char*)dtmp.ucElement, got, ESP_LOG_INFO);
+								dtmp.usLen = got;
+								elm327_response((char*)dtmp.ucElement,
+														got,
+														xqueue_elm327_uart_rx,
 														NULL);
 							}
 							break;
+						}
 						case UART_FIFO_OVF:
 							uart_flush_input(UART_NUM_1);
 							xQueueReset(uart1_queue);
@@ -3459,20 +3553,23 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
 
     static StackType_t *uart1_event_task_stack, *elm327_read_task_stack;
     static StaticTask_t uart1_event_task_buffer, elm327_read_task_buffer;
-    
+
 	// Keep stacks in internal RAM (external/PSRAM stacks can crash if caches are temporarily disabled).
 	uart1_event_task_stack = heap_caps_malloc((2048*2) * sizeof(StackType_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-	elm327_read_task_stack = heap_caps_malloc((2048*2) * sizeof(StackType_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-    
-    if (uart1_event_task_stack == NULL || elm327_read_task_stack == NULL)
+
+    if (uart1_event_task_stack == NULL)
     {
         ESP_LOGE(TAG, "Failed to allocate task stack memory");
-        if (uart1_event_task_stack) heap_caps_free(uart1_event_task_stack);
-        if (elm327_read_task_stack) heap_caps_free(elm327_read_task_stack);
         return;
     }
-    
-    // Create static tasks
+
+	/* uart1_event_task is created in EVERY mode and must stay that way. It executes the chip
+	 * commands queued by obd_init() above -- which write the interpreter chip's own sleep/wake
+	 * voltage thresholds and switch its autonomous sleep OFF. Gate it and those commands sit in
+	 * the queue forever, leaving the chip to sleep or wake on whatever its NVM last held, which
+	 * on a car means mid-drive. It is also harmless to leave running: it blocks on
+	 * elm327_cmd_queue WITHOUT the UART lock, and after boot nothing feeds that queue unless an
+	 * ELM client is actually driving us. */
     TaskHandle_t uart1_event_task_handle = xTaskCreateStatic(
         uart1_event_task,
         "uart1_event_task",
@@ -3482,7 +3579,31 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
         uart1_event_task_stack,
         &uart1_event_task_buffer
     );
-    
+    if (uart1_event_task_handle == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create uart1_event_task");
+        heap_caps_free(uart1_event_task_stack);
+        uart1_event_task_stack = NULL;
+    }
+
+	/* elm327_read_task is the ONLY optional one -- see elm327_set_read_task_enabled() in elm327.h
+	 * for the full story. It forwards unsolicited chip output to a connected ELM327 client, and
+	 * under poll_log/fast_log no client can reach us, so it serves nobody while still taking the
+	 * shared UART lock on every byte the chip emits. Not creating it also gives back its 16 KB of
+	 * internal RAM. */
+	if(!s_read_task_enabled)
+	{
+		ESP_LOGW(TAG, "elm327_read_task NOT started (no ELM client possible in this protocol)");
+		return;
+	}
+
+	elm327_read_task_stack = heap_caps_malloc((2048*2) * sizeof(StackType_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    if (elm327_read_task_stack == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate elm327_read_task stack");
+        return;
+    }
+
     TaskHandle_t elm327_read_task_handle = xTaskCreateStatic(
         elm327_read_task,
         "elm327_read_task",
@@ -3492,12 +3613,12 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
         elm327_read_task_stack,
         &elm327_read_task_buffer
     );
-    
-    if (uart1_event_task_handle == NULL || elm327_read_task_handle == NULL)
+
+    if (elm327_read_task_handle == NULL)
     {
-        ESP_LOGE(TAG, "Failed to create tasks");
-        if (uart1_event_task_handle == NULL) heap_caps_free(uart1_event_task_stack);
-        if (elm327_read_task_handle == NULL) heap_caps_free(elm327_read_task_stack);
+        ESP_LOGE(TAG, "Failed to create elm327_read_task");
+        heap_caps_free(elm327_read_task_stack);
+        elm327_read_task_stack = NULL;
     }
 
 }
