@@ -434,23 +434,6 @@ static void wd_tally_add(uint8_t reason)
  * If this ever needs to be cheap, the fix is to defer the formatting off this task, not to shave
  * the buffers. */
 
-/* The floor under that headroom, in BYTES still free on sys_evt's stack (#112).
- *
- * 1024 is justified, not picked for comfort. One more event_log_emit() on this stack costs roughly
- * 800 B (see the paragraph above), and interrupt entry saves context on the RUNNING task's stack
- * before switching to the interrupt stack, which needs a couple hundred more. So below 1024 B free
- * the honest statement is "the next log line no longer fits": one added emit plus an ill-timed
- * interrupt is a panic. Above it there is still room to react before the cliff.
- *
- * Deliberately tighter than the sleep task's 2048 (sleep_mode.c:768). That task's resume path runs
- * the whole WiFi bring-up and is expected to grow; this task's job is supposed to SHRINK (#111). */
-#define WD_SYS_EVT_STACK_WARN_MIN_FREE 1024
-
-/* Looked up once and cached. The default event loop task is created during startup and never
- * exits, so the handle stays valid for the whole boot. NULL until the lookup succeeds -- on the
- * first sampler ticks the loop may not exist yet, which is normal, not an error. */
-static TaskHandle_t s_sys_evt = NULL;
-static bool         s_sys_evt_stack_warned = false;
 void wifi_diag_note_attempt(const char *ssid)
 {
     const char *s = (ssid != NULL) ? ssid : "";
@@ -614,6 +597,25 @@ void wifi_diag_note_ban(const char *ssid, uint32_t ms)
 }
 
 // ---- Sampler -----------------------------------------------------------------------------------
+
+/* The floor under that headroom, in BYTES still free on sys_evt's stack (#112).
+ *
+ * 1024 is justified, not picked for comfort. One more event_log_emit() on this stack costs roughly
+ * 800 B (see the WARNING block in "Event hooks" above), and interrupt entry saves context on the
+ * RUNNING task's stack before switching to the interrupt stack, which needs a couple hundred more.
+ * So below 1024 B free the honest statement is "the next log line no longer fits": one added emit
+ * plus an ill-timed interrupt is a panic. Above it there is still room to react before the cliff.
+ *
+ * Deliberately tighter than the sleep task's 2048 (sleep_mode.c:768). That task's resume path runs
+ * the whole WiFi bring-up and is expected to grow; this task's job is supposed to SHRINK (#111). */
+#define WD_SYS_EVT_STACK_WARN_MIN_FREE 1024
+
+/* Looked up once and cached, so the healthy case costs a pointer read rather than a task-list walk
+ * every second. The default event loop task is created during startup and never exits, so the
+ * handle stays valid for the whole boot. NULL until the lookup succeeds -- on the first sampler
+ * ticks the loop may not exist yet, which is normal, not an error. */
+static TaskHandle_t s_sys_evt = NULL;
+static bool         s_sys_evt_stack_warned = false;
 
 /* Read sys_evt's stack headroom and complain ONCE if it is near the edge (#112).
  *

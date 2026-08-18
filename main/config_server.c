@@ -2326,6 +2326,18 @@ static const httpd_uri_t poll_status_uri = {
     .user_ctx  = NULL
 };
 
+/* Bytes still free on a named task's stack at its worst moment, or 0 if the task was not found.
+ *
+ * Two things this hides, both easy to get wrong when open-coded per task: uxTaskGetStackHighWaterMark
+ * reports WORDS, not bytes, and the value is a HISTORIC MINIMUM -- the closest that task has ever
+ * come to the end of its stack -- not a live reading. So a caller may read it at any convenient
+ * moment and still get the worst case. */
+static unsigned task_stack_free_b(const char *name)
+{
+    const TaskHandle_t t = xTaskGetHandle(name);
+    return t ? (unsigned)(uxTaskGetStackHighWaterMark(t) * sizeof(StackType_t)) : 0u;
+}
+
 /* ------------------------------------------------------------------------------------------
  * PERMANENT diagnostic endpoint:  GET /wake_probe
  *
@@ -2359,19 +2371,11 @@ static esp_err_t wake_probe_handler(httpd_req_t *req)
      * that used to happen only in app_main because waking always rebooted. If this trends toward
      * zero across wake cycles, the task is overflowing its static stack -- which corrupts whatever
      * sits next to it and panics with a jump to a nonsense address. */
-    const TaskHandle_t sleep_task = xTaskGetHandle("sleep_task");   /* the task's real name */
-    const unsigned sleep_hw = sleep_task ? (unsigned)(uxTaskGetStackHighWaterMark(sleep_task) * sizeof(StackType_t))
-                                         : 0u;
+    const unsigned sleep_hw = task_stack_free_b("sleep_task");   /* the task's real name */
 
-    /* Same reading, for the ESP-IDF system event task (#112). Sized by
-     * CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE -- a number nobody measured until this field existed.
-     * At 2304 it overflowed and boot-looped a device until safe-mode rescue; it is 4608 now, and
-     * this is how anyone checks that is still enough. 0 means the lookup failed, not "no headroom".
-     * The high-water mark is a HISTORIC MINIMUM, so reading it here, long after the deep path ran,
-     * still reports that path's worst case. */
-    const TaskHandle_t evt_task = xTaskGetHandle("sys_evt");        /* IDF's default event loop */
-    const unsigned evt_hw = evt_task ? (unsigned)(uxTaskGetStackHighWaterMark(evt_task) * sizeof(StackType_t))
-                                     : 0u;
+    /* The same reading for the ESP-IDF system event task (#112). Why it is worth watching is in
+     * the field list above; the mechanics are in task_stack_free_b(). */
+    const unsigned evt_hw = task_stack_free_b("sys_evt");        /* IDF's default event loop */
 
     char body[384];
     snprintf(body, sizeof(body),
