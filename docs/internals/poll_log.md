@@ -177,7 +177,7 @@ The Auto (fastest) logging rate is a **measurement, not an estimate** — this i
  "ignition_on":true,"quiesced":false,"bus_idle_ms":4294967295,
  "reload_ok":true,"reload_pending":false,
  "state":"fast","gate_open":true,
- "gate_volt":13.2,"rpm_known":true,"rpm":2150}
+ "gate_volt":13.2,"rpm_known":true,"rpm":2150,"engine_running":true}
 ```
 
 `ok/timeout/txfail` are cumulative; `win_*` are the last 3 s window; `bus_idle_ms` saturates at UINT32_MAX when no broadcast traffic is tracked.
@@ -207,6 +207,27 @@ The recording-gate fields. `req_s` alone is ambiguous once the gate exists — ~
 | `gate_volt` | The `engine_volt` threshold in use, read once at init. The close edge sits `VEHICLE_IGN_HYSTERESIS_V` under it. |
 | `rpm_known` | An RPM channel exists **and** its last value is fresh (within `POLLLOG_RPM_STALE_MS`). `false` ⇒ the gate is running on voltage alone. |
 | `rpm` | Last RPM seen, from either the polled or the broadcast copy. **`rpm_known:true` with a wrong low value is the one way this feature can silently stop automatic trips** — check it first if logging stops. |
+| `engine_running` | The latch behind the `ENGINE_ON` / `ENGINE_OFF` event lines (below). Same rpm verdict the gate uses, debounced on the stop edge. Always `false` on a bench PCM, which reports rpm 0. |
+
+### `ENGINE_ON` / `ENGINE_OFF` event lines
+
+The gate already knows when the crank is turning; before this it never said so, and an event log showing only steady 12.8 V readings was misread as "the engine never ran" — the `DATALOG_OPEN` line was the only (implicit) proof. Two event codes now state it outright:
+
+```
+ENGINE_ON    engine started -- 812 rpm, 14.32V
+ENGINE_OFF   engine stopped after 12m34s -- 0 rpm, 12.81V
+```
+
+- **Edge-triggered**, latched — one line per start, never per sweep (`polllog_eval_gate` runs up to 100×/s).
+- Start is announced on the first sweep over `POLLLOG_GATE_RPM_ON` (400 rpm: under any idle, over cranking), with no confirm count, so the line lands **before** the `DATALOG_OPEN` it causes.
+- All hysteresis is on the stop edge: rpm must be *known* under the threshold and stay there for `POLLLOG_ENGINE_OFF_CONFIRM_MS` (3 s, the same debounce that closes the gate). That also bounds a noisy channel — an ON/OFF pair costs at least 3 s.
+- A stale or never-answered rpm is **not** "engine off": `rpm_known` stays false and, with the latch, a boot with the key off or a table without an RPM row emits nothing.
+- The second stop path is the quiesce: a silent ECU means the engine cannot be running, so `ENGINE_OFF` is emitted there (immediately before `IGNITION_OFF`). At key-off this is usually the one that fires.
+
+**Two known ways these lines can lie.** Neither affects recording — the gate is untouched and a trip in progress keeps writing — but both produce wrong lines, so read a surprising pair with this in mind:
+
+- **A spurious mid-drive pair.** Once the stop debounce is armed by a genuine known-low reading, going *stale* does not disarm it. That asymmetry is load-bearing: at key-off the rpm samples stop arriving before 3 s is up, so if staleness reset the timer the normal way an engine stops would never complete the debounce. The cost is that a near-stall bounce under 400 rpm followed by a ≥3 s rpm-channel dropout emits `ENGINE_OFF` while the engine is still running, and the next reading over 400 emits a fresh `ENGINE_ON`. Self-correcting, one pair. Staleness *alone* never arms it, so a starved rpm channel cannot invent a stop.
+- **A start that is never announced, after a sleep.** The latch lives in `.bss` and this device resumes in place rather than rebooting, and sleep entry only parks the poll task — it never quiesces, so nothing clears the latch on the way down. Sleep with the latch up, then wake to an ECU that answers at once, and that start gets **no** `ENGINE_ON`, while its eventual `ENGINE_OFF` carries a duration spanning both drives and the sleep between them. Waking with the engine off is benign: the probe re-quiesce clears the latch within seconds and only the duration is inflated. This rides on the separate "device sleeps while the ECU is still answering" bug and is expected to close with it.
 
 ## Measured limits (bench, `v1.9.4-3-gd8b8180`, 2026-07-21)
 
