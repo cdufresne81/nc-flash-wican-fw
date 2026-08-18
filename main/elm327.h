@@ -54,6 +54,25 @@ void elm327_send_cmd(uint8_t* cmd, uint32_t cmd_len);
 esp_err_t elm327_get_protocol_number(uint8_t *protocol_number);
 void elm327_hardreset_chip(void);
 
+/* Same hard reset, but the wait for the shared UART lock is bounded by the caller instead of the
+ * fixed ELM327_CMD_MUTEX_TIMOUT (10 s). Returns true when the chip is talking again.
+ *
+ * This exists because of a measured 20 s wake: with the lock held by another task, the resume
+ * path waited 10 s here and another 10 s inside the elm327_set_baudrate() tail call, with the LED
+ * dark and WiFi unreachable the whole time. The bounded form gives up quickly AND skips the tail
+ * call when the lock was never obtained, so the worst case is the lock budget, not 20 s.
+ *
+ * elm327_hardreset_chip() is a wrapper passing ELM327_CMD_MUTEX_TIMOUT, so every pre-existing
+ * caller keeps its old behaviour.
+ *
+ * To tell "could not get the lock" apart from "the chip is sick", read mutex_ok from
+ * elm327_hardreset_get_timings() -- this call rewrites that record before it returns. */
+bool elm327_hardreset_chip_timeout(uint32_t lock_wait_ms);
+
+/* Name the task currently holding the UART lock, or "none"/"nosem". Does NOT take the lock, so it
+ * is safe to call right after a failed acquisition -- which is its reason for existing. */
+void elm327_lock_holder_name(char *dst, size_t dstlen);
+
 /* Where the time goes inside elm327_hardreset_chip().
  *
  * Diagnostic only (issue: wake takes ~23 s instead of ~3.5 s). Measured live in the car on
