@@ -1295,17 +1295,26 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
     elm327_release_sleep_hold();
     SLEEP_RESUME_LAP(t_hold_ms);
 
-    /* 2. LIGHT THE LED, and light it EARLY. It used to be the second-to-last step, which meant
-     *    the owner stared at a dark device for the whole resume -- ~3.5 s on a good wake and a
-     *    measured ~20 s on a bad one -- while the datalogger was already recording happily. He
-     *    reasonably concluded the device was dead. Nothing below this line needs the LED, and the
-     *    LED needs nothing below this line, so there is no reason for it to wait.
+    /* 2. Hand the LED back to its own task.
      *
-     *    Yes, this lights up before a resume that may still bail out to the reboot fallback. That
-     *    is accepted on purpose: "alive" is the truth at this moment, and the reboot path repaints
-     *    the LED during boot anyway, so the worst case is a light that is briefly right and then
-     *    right again. A separate "resuming" colour was considered and rejected -- it buys a
-     *    distinction nobody needs at the price of another LED state to keep consistent. */
+     *    READ THIS BEFORE ASSUMING IT LIGHTS THE LED HERE -- IT DOES NOT, AND AN EARLIER VERSION
+     *    OF THIS COMMENT CLAIMED IT DID. led_indicator_resume() only decrements the suspend
+     *    counter (led_indicator.c:105-118). The task that actually paints is parked on
+     *    DEV_AWAKE_BIT (led_indicator.c:152) and refuses to paint without dev_status_is_awake()
+     *    as a second backstop (led_indicator.c:186). That bit is set by dev_status_set_awake() at
+     *    the very END of this function, so the LED cannot come on before the state publish no
+     *    matter where this call sits. The measured t_led=0 is that: the call returns instantly
+     *    because it paints nothing.
+     *
+     *    So moving it here is tidiness, not a fix. The owner's "the device looks dead" symptom was
+     *    cured by removing the 20 s stall further down, NOT by this line. If light-before-network
+     *    is ever genuinely wanted, the change belongs in the indicator task's DEV_AWAKE_BIT gate
+     *    -- and that gate is deliberate, it is what lets the sleep paths darken the LED, so do not
+     *    remove it casually.
+     *
+     *    Position still matters for one reason: the suspend count must be back to zero before the
+     *    publish, or the first paint after the publish is skipped. Keeping it above every step
+     *    that can fail guarantees that without depending on where the failures are. */
     led_indicator_resume();
     SLEEP_RESUME_LAP(t_led_ms);
 
@@ -1390,6 +1399,11 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
      * the UART lock (cap 10 s), rd/rt are the two possible reads (~1.5 s each), baud is
      * elm327_set_baudrate() which takes the same lock a SECOND time. calls>1 within one wake would
      * mean the chip is being reset more than once, which is the other way to reach ~20 s. */
+    /* The whole block is behind ONE explicit debug check rather than relying on the three
+     * EVENT_LOG_DEBUG macros below. Those do already avoid evaluating their arguments when the
+     * gate is shut, but elm327_hardreset_get_timings() sits OUTSIDE them and would otherwise copy
+     * the ~88-byte timing struct on every single wake for nothing. */
+    if(event_log_debug_enabled())
     {
         elm327_hardreset_timing_t hr;
         elm327_hardreset_get_timings(&hr);
@@ -1436,7 +1450,7 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
     /* 7. STAYS LAST. Publish the state FIRST, then release the tasks parked on the awake bit. The order
      *    matters: the elm327 task wakes on DEV_AWAKE_BIT, pulls a queued command, then checks
      *    the sleep-state queue and DISCARDS the command if it still reads SLEEPING
-     *    (elm327.c:1619-1625). Setting the bit first opens a window where the first command
+     *    (elm327.c:1657-1663). Setting the bit first opens a window where the first command
      *    after every wake is silently dropped.
      *
      *    This must stay the FINAL step of the resume, however the steps above are reordered. The
@@ -2182,7 +2196,14 @@ void light_sleep_task(void *pvParameters)
                  * why SLEEP_ELM327_SETTLE_PASSES is now 2. Latched, so it costs one line per sleep
                  * SESSION and not one per 2 s cycle. */
                 s_elm327_sleep_passes++;
-                if(!s_elm327_asleep_logged && elm327_chip_get_status() == ELM327_SLEEP)
+
+                /* Sample the pin ONCE per pass and use that one answer everywhere below.
+                 * Re-reading it per branch let a single pass both log "settled asleep" and then
+                 * nudge the chip, because GPIO7 can change between two reads microseconds apart --
+                 * which is precisely the lag this whole block exists to tolerate. */
+                const elm327_chip_status_t chip_status = elm327_chip_get_status();
+
+                if(!s_elm327_asleep_logged && chip_status == ELM327_SLEEP)
                 {
                     s_elm327_asleep_logged = true;
                     /* DEBUG-GATED (owner request): a normal, healthy settle is noise on the event
@@ -2199,7 +2220,7 @@ void light_sleep_task(void *pvParameters)
                                    (unsigned)s_elm327_sleep_nudges);
                 }
 
-                if(elm327_chip_get_status() == ELM327_READY
+                if(chip_status == ELM327_READY
                    && s_elm327_settle_passes < SLEEP_ELM327_SETTLE_PASSES)
                 {
                     /* Give the pin a couple of full passes (~2 s each, so ~4-6 s since
@@ -2207,7 +2228,7 @@ void light_sleep_task(void *pvParameters)
                      * so one pass left literally no margin. */
                     s_elm327_settle_passes++;
                 }
-                else if(elm327_chip_get_status() == ELM327_READY)
+                else if(chip_status == ELM327_READY)
                 {
                     if(s_elm327_sleep_nudges < SLEEP_ELM327_MAX_NUDGES
                        && s_elm327_lock_fails < SLEEP_ELM327_MAX_LOCK_FAILS)
@@ -2226,12 +2247,16 @@ void light_sleep_task(void *pvParameters)
                                  (unsigned)(s_elm327_sleep_nudges + 1),
                                  (unsigned)SLEEP_ELM327_MAX_NUDGES);
 
-                        const bool reset_ok =
-                            elm327_hardreset_chip_timeout(SLEEP_ELM327_LOCK_WAIT_MS);
+                        (void)elm327_hardreset_chip_timeout(SLEEP_ELM327_LOCK_WAIT_MS);
                         elm327_hardreset_timing_t hr;
                         elm327_hardreset_get_timings(&hr);
 
-                        if(!reset_ok && !hr.mutex_ok)
+                        /* mutex_ok alone, deliberately: the return value adds nothing here because
+                         * a failed lock ALWAYS returns false (elm327.c, the early return on the
+                         * !mutex_ok path), so testing both only reads as if two independent things
+                         * were being checked. What we need to know is specifically "did we reach
+                         * the chip at all", and that is exactly mutex_ok. */
+                        if(!hr.mutex_ok)
                         {
                             /* Lock never obtained: the chip was not reset and must not be told to
                              * sleep either -- elm327_sleep() would just queue behind the same

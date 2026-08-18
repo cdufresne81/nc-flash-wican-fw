@@ -1374,11 +1374,18 @@ static uint8_t *elm327_cmd_queue_storage = NULL;
 /* UART1 -- the link to the MIC3624 interpreter chip. TWO INVARIANTS, both learned the hard way
  * from a bug that made the device look dead for 20 s after every other wake (2026-08-17):
  *
- * 1. NEVER BLOCK WHILE HOLDING xuart1_semaphore. Every consumer of uart1_queue pops only under
- *    this lock, so one blocked consumer stalls the interpreter chip for everyone -- including the
- *    sleep/wake path, which cannot then reset the chip, put it to sleep, or even find out why.
- *    elm327_read_task did exactly this: it read with portMAX_DELAY under the lock and held it
- *    across an entire sleep, costing the wake 2 x ELM327_CMD_MUTEX_TIMOUT.
+ * 1. NEVER BLOCK **UNBOUNDED** WHILE HOLDING xuart1_semaphore. Every wait taken under this lock
+ *    must have a deadline you can name. Bounded waits under it are fine and are used all over this
+ *    file on purpose -- uart1_event_task waits ELM327_CMD_TIMEOUT_MS for a command reply while
+ *    holding it, which is correct. The rule is about waits with NO deadline.
+ *    (Stated as a flat "never block" it would forbid working, shipping code, and a rule that the
+ *    code visibly breaks gets read as decoration and then ignored -- which is how the real one
+ *    gets broken.)
+ *    Why it matters: every consumer of uart1_queue pops only under this lock, so one blocked
+ *    consumer stalls the interpreter chip for everyone -- including the sleep/wake path, which
+ *    cannot then reset the chip, put it to sleep, or even find out why. elm327_read_task did
+ *    exactly this: it read with portMAX_DELAY under the lock and held it across an entire sleep,
+ *    costing the wake 2 x ELM327_CMD_MUTEX_TIMOUT.
  *
  * 2. EVERY uart_flush_input() MUST BE PAIRED WITH xQueueReset(uart1_queue), UNDER THE SAME LOCK
  *    HOLD. The flush empties the driver's RX ring but leaves already-posted UART_DATA events in
@@ -1903,7 +1910,7 @@ static inline uint32_t elm327_now_ms(void)
  * is safe to call while we are ourselves blocked on it, which is the whole point. The answer is a
  * snapshot and can be stale by the time it is logged; acceptable here because the interesting case
  * is a holder that keeps the lock for 10 s, which is an eternity by comparison. */
-static void elm327_note_lock_holder(char *dst, size_t dstlen)
+void elm327_lock_holder_name(char *dst, size_t dstlen)
 {
 	if(dst == NULL || dstlen == 0)
 	{
@@ -2007,7 +2014,7 @@ bool elm327_set_baudrate(void)
 		 * this straight after releasing the lock, so on a contended wake both expire back to back:
 		 * 10 s + 10 s = the measured 20050 ms. Recorded into the hardreset record because that is
 		 * the call this always runs under, and one line then tells the whole story. */
-		elm327_note_lock_holder(s_hardreset_timing.holder_baud_to,
+		elm327_lock_holder_name(s_hardreset_timing.holder_baud_to,
 		                        sizeof(s_hardreset_timing.holder_baud_to));
 		ESP_LOGE(TAG, "%s: Failed to take UART semaphore (held by %s)", __func__,
 		         s_hardreset_timing.holder_baud_to);
@@ -2076,7 +2083,7 @@ bool elm327_hardreset_chip_timeout(uint32_t lock_wait_ms)
 		s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
 		return false;
 	}
-	elm327_note_lock_holder(s_hardreset_timing.holder_before,
+	elm327_lock_holder_name(s_hardreset_timing.holder_before,
 	                        sizeof(s_hardreset_timing.holder_before));
 	t_mark = elm327_now_ms();
 	if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(lock_wait_ms)) == pdTRUE)
@@ -2155,7 +2162,7 @@ bool elm327_hardreset_chip_timeout(uint32_t lock_wait_ms)
 		 * mutex_ms is the measured wait, NOT the constant, so a short value here would mean
 		 * something other than the timeout broke us out. */
 		s_hardreset_timing.mutex_ms = elm327_now_ms() - t_mark;
-		elm327_note_lock_holder(s_hardreset_timing.holder_rst_to,
+		elm327_lock_holder_name(s_hardreset_timing.holder_rst_to,
 		                        sizeof(s_hardreset_timing.holder_rst_to));
 		ESP_LOGE(TAG, "%s: Failed to take UART semaphore (held by %s)", __func__,
 		         s_hardreset_timing.holder_rst_to);
@@ -2215,14 +2222,6 @@ bool elm327_hardreset_chip_timeout(uint32_t lock_wait_ms)
 void elm327_hardreset_chip(void)
 {
 	(void)elm327_hardreset_chip_timeout(ELM327_CMD_MUTEX_TIMOUT);
-}
-
-/* Public wrapper over the file-local helper, for callers outside this file that need to name the
- * task sitting on the UART lock (the sleep babysitter, so it stops blaming the chip for a lock it
- * never obtained). Takes nothing; see elm327_note_lock_holder() for why that is safe. */
-void elm327_lock_holder_name(char *dst, size_t dstlen)
-{
-	elm327_note_lock_holder(dst, dstlen);
 }
 
 esp_err_t elm327_get_protocol_number(uint8_t *protocol_number)
