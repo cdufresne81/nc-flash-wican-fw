@@ -1387,7 +1387,15 @@ static uint8_t *elm327_cmd_queue_storage = NULL;
  *    orphan that triggered invariant 1.
  *
  * Several raw readers (uart_read_until_pattern) consume bytes without consuming their events,
- * which is what makes rule 2 load-bearing rather than tidy. */
+ * which is what makes rule 2 load-bearing rather than tidy.
+ *
+ * KNOWN EXCEPTIONS to rule 2, deliberately left alone: the three flushes in the chip
+ * FIRMWARE-UPDATE paths (elm327_send_update_command, elm327_disable_wake_commands,
+ * elm327_update_obd). They run only at boot or on an explicit update request, never on the
+ * sleep/wake path, and that code drives a line-by-line protocol whose responses it reads itself --
+ * resetting the event queue underneath it is a real risk on the one path where a mistake leaves
+ * the interpreter chip unusable. If you touch those functions for another reason, fix the pairing
+ * then, with a way to test the update end to end. */
 QueueHandle_t uart1_queue = NULL;
 static SemaphoreHandle_t xuart1_semaphore = NULL;
 
