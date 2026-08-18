@@ -2013,10 +2013,43 @@ void elm327_lock(void)
 	xSemaphoreTake(xuart1_semaphore, portMAX_DELAY);
 }
 
-void elm327_hardreset_chip(void)
+/* How long to wait for the chip's "\r>" prompt after a reset, as opposed to the ordinary
+ * UART_TIMEOUT_MS used for every other command.
+ *
+ * Measured in the car 2026-08-17 on a HEALTHY wake: rd=1507, i.e. this read burned its whole
+ * UART_TIMEOUT_MS+300 = 1500 ms deadline and returned nothing -- and then elm327_set_baudrate()
+ * talked to the very same chip successfully 10 ms later. So the chip was never dead; it just
+ * needs a little longer than 1500 ms after a reset to print its prompt, and we were giving up
+ * with the answer already on its way.
+ *
+ * 2500 ms is raised HERE ONLY, deliberately. UART_TIMEOUT_MS governs every normal command, where
+ * a longer deadline would make a genuinely unresponsive chip cost more on every single exchange.
+ * A pattern read returns the instant the pattern arrives, so on healthy hardware a bigger number
+ * costs nothing -- it can only stop us from walking away one moment too early.
+ *
+ * Deleting the exchange instead was considered and rejected: it is the readiness gate for
+ * elm327_set_baudrate(), and probing a chip that is still booting risks the no-answer branch that
+ * drops to 115200 baud and then burns several 1.2 s timeouts -- more expensive than the 1.5 s. */
+#define ELM327_HARDRESET_PROMPT_TIMEOUT_MS	2500
+
+/* Hard reset, with the wait for the UART lock bounded by the caller.
+ *
+ * Returns true only when the lock was taken and the baud-rate handshake that follows got a real
+ * reply out of the chip -- i.e. "the chip is talking to us again".
+ *
+ * WHY a caller-supplied lock timeout: the resume path runs this on every wake, and the fixed
+ * ELM327_CMD_MUTEX_TIMOUT of 10 s made a contended lock cost 20 s of dark LED and unreachable
+ * WiFi (10 s here, then another 10 s inside elm327_set_baudrate()). A wake must never pay that,
+ * so sleep_mode_resume() passes ~1 s and treats failure as non-fatal. Boot-time and error-recovery
+ * callers keep the old 10 s via the elm327_hardreset_chip() wrapper below.
+ *
+ * Callers that need to tell "could not get the lock" apart from "chip is sick" read mutex_ok out
+ * of elm327_hardreset_get_timings() -- this call rewrites that record before it can return. */
+bool elm327_hardreset_chip_timeout(uint32_t lock_wait_ms)
 {
 	const uint32_t t_entry = elm327_now_ms();
 	uint32_t t_mark;
+	bool ok = false;
 
 	/* Reset the record for THIS call before anything can return early, so a caller reading the
 	 * timings never sees a mix of this call and the previous one. calls[] deliberately keeps
@@ -2033,12 +2066,12 @@ void elm327_hardreset_chip(void)
 	{
 		ESP_LOGE(TAG, "%s: response buffer alloc failed", __func__);
 		s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
-		return;
+		return false;
 	}
 	elm327_note_lock_holder(s_hardreset_timing.holder_before,
 	                        sizeof(s_hardreset_timing.holder_before));
 	t_mark = elm327_now_ms();
-	if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
+	if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(lock_wait_ms)) == pdTRUE)
 	{
 		s_hardreset_timing.mutex_ms = elm327_now_ms() - t_mark;
 		s_hardreset_timing.mutex_ok = true;
@@ -2065,7 +2098,7 @@ void elm327_hardreset_chip(void)
 		}
 		memset(rsp_buffer, 0, UART_BUFFER_SIZE);
 		t_mark = elm327_now_ms();
-        int len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", UART_TIMEOUT_MS+300);
+        int len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", ELM327_HARDRESET_PROMPT_TIMEOUT_MS);
 		s_hardreset_timing.reset_read_ms = elm327_now_ms() - t_mark;
 
 		/* The ATZ path is taken precisely when the chip is awake -- but if what is BROKEN is the
@@ -2081,7 +2114,7 @@ void elm327_hardreset_chip(void)
 			gpio_set_level(OBD_RESET_PIN, 1);
 			memset(rsp_buffer, 0, UART_BUFFER_SIZE);
 			t_mark = elm327_now_ms();
-			len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", UART_TIMEOUT_MS+300);
+			len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", ELM327_HARDRESET_PROMPT_TIMEOUT_MS);
 			s_hardreset_timing.retry_read_ms = elm327_now_ms() - t_mark;
 			used_reset_line = true;
 		}
@@ -2125,6 +2158,24 @@ void elm327_hardreset_chip(void)
 	 * the per-resume heap decline measured on the bench. */
 	heap_caps_free(rsp_buffer);
 
+	/* SKIP the baud-rate tail call when we never got the lock.
+	 *
+	 * This is the single biggest fix in this file. elm327_set_baudrate() takes the SAME
+	 * xuart1_semaphore, with its own hardcoded ELM327_CMD_MUTEX_TIMOUT of 10 s. So a wake that
+	 * failed to get the lock up there used to walk straight into a second full 10 s wait on the
+	 * very same unavailable lock: measured in the car as mutex=10000TIMEOUT ... baud=10000
+	 * tot=20050, with the chip never touched once. Whoever is holding the lock is not going to
+	 * hand it over in the next 50 ms, so asking again is pure dead time.
+	 *
+	 * Bounding only the first take would therefore have fixed nothing -- half of the 20 s lives
+	 * here. Do not "restore symmetry" by calling it unconditionally again. */
+	if(!s_hardreset_timing.mutex_ok)
+	{
+		ESP_LOGE(TAG, "%s: UART lock unavailable -- skipping the baud-rate handshake", __func__);
+		s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
+		return false;
+	}
+
 	vTaskDelay(pdMS_TO_TICKS(50));
 	/* NOT a cheap tail call: elm327_set_baudrate() takes xuart1_semaphore a SECOND time (another
 	 * ELM327_CMD_MUTEX_TIMOUT = 10 s worst case) and can issue four more UART_TIMEOUT_MS reads.
@@ -2133,6 +2184,11 @@ void elm327_hardreset_chip(void)
     if (elm327_set_baudrate())
     {
         ESP_LOGI(TAG, "UART configuration completed successfully");
+        /* Success is judged on the baud-rate handshake, NOT on s_hardreset_timing.answered.
+         * The reset prompt can be missed while the chip is perfectly healthy -- that is exactly
+         * the 1.5 s timeout this change also widened -- and set_baudrate() getting a real reply
+         * out of the chip is the stronger, later evidence that it is back. */
+        ok = true;
     }
     else
     {
@@ -2143,6 +2199,22 @@ void elm327_hardreset_chip(void)
 	s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
 	// uint8_t protocol_number = 0;
 	// elm327_get_protocol_number(&protocol_number);
+	return ok;
+}
+
+/* The original signature, unchanged in behaviour: the same 10 s lock wait every existing caller
+ * has always had. Only the sleep-resume path wants a shorter one, and it says so explicitly. */
+void elm327_hardreset_chip(void)
+{
+	(void)elm327_hardreset_chip_timeout(ELM327_CMD_MUTEX_TIMOUT);
+}
+
+/* Public wrapper over the file-local helper, for callers outside this file that need to name the
+ * task sitting on the UART lock (the sleep babysitter, so it stops blaming the chip for a lock it
+ * never obtained). Takes nothing; see elm327_note_lock_holder() for why that is safe. */
+void elm327_lock_holder_name(char *dst, size_t dstlen)
+{
+	elm327_note_lock_holder(dst, dstlen);
 }
 
 esp_err_t elm327_get_protocol_number(uint8_t *protocol_number)
@@ -2393,7 +2465,14 @@ esp_err_t elm327_sleep(void)
 	}
 	else
 	{
+		/* ESP_ERR_TIMEOUT, not ESP_FAIL, and the difference is the whole point: "I never got the
+		 * UART lock, so I never asked the chip anything" is a completely different fault from "I
+		 * asked and the chip refused". The sleep babysitter used to see only ESP_FAIL-or-nothing
+		 * and printed "MIC chip would not sleep", which sent an evening of investigation after a
+		 * chip that was innocent. Every existing caller either ignores the result or tests
+		 * != ESP_OK, so both still behave exactly as before. */
 		ESP_LOGE(TAG, "%s: Failed to take semaphore", __func__);
+		ret = ESP_ERR_TIMEOUT;
 	}
 	return ret;
 }
