@@ -224,6 +224,11 @@ ENGINE_OFF   engine stopped after 12m34s -- 0 rpm, 12.81V
 - A stale or never-answered rpm is **not** "engine off": `rpm_known` stays false and, with the latch, a boot with the key off or a table without an RPM row emits nothing.
 - The second stop path is the quiesce: a silent ECU means the engine cannot be running, so `ENGINE_OFF` is emitted there (immediately before `IGNITION_OFF`). At key-off this is usually the one that fires.
 
+**Two known ways these lines can lie.** Neither affects recording — the gate is untouched and a trip in progress keeps writing — but both produce wrong lines, so read a surprising pair with this in mind:
+
+- **A spurious mid-drive pair.** Once the stop debounce is armed by a genuine known-low reading, going *stale* does not disarm it. That asymmetry is load-bearing: at key-off the rpm samples stop arriving before 3 s is up, so if staleness reset the timer the normal way an engine stops would never complete the debounce. The cost is that a near-stall bounce under 400 rpm followed by a ≥3 s rpm-channel dropout emits `ENGINE_OFF` while the engine is still running, and the next reading over 400 emits a fresh `ENGINE_ON`. Self-correcting, one pair. Staleness *alone* never arms it, so a starved rpm channel cannot invent a stop.
+- **A start that is never announced, after a sleep.** The latch lives in `.bss` and this device resumes in place rather than rebooting, and sleep entry only parks the poll task — it never quiesces, so nothing clears the latch on the way down. Sleep with the latch up, then wake to an ECU that answers at once, and that start gets **no** `ENGINE_ON`, while its eventual `ENGINE_OFF` carries a duration spanning both drives and the sleep between them. Waking with the engine off is benign: the probe re-quiesce clears the latch within seconds and only the duration is inflated. This rides on the separate "device sleeps while the ECU is still answering" bug and is expected to close with it.
+
 ## Measured limits (bench, `v1.9.4-3-gd8b8180`, 2026-07-21)
 
 Numbers from the NC bench PCM, 19 configured PIDs of which 16 are enabled (IAT/ECT/VSS are disabled — they come from broadcast filters instead). Recorded so nobody has to re-derive them.
