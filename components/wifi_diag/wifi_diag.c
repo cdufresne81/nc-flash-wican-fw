@@ -623,9 +623,17 @@ static bool         s_sys_evt_stack_warned = false;
  * design. uxTaskGetStackHighWaterMark() returns a HISTORIC MINIMUM -- the closest the task has
  * ever come to the end of its stack, recovered by scanning the untouched fill pattern -- so
  * reading it a second later from another task yields exactly the same worst case as reading it at
- * the deepest moment. Reading is free. WARNING is not: emitting from inside a wifi_diag_note_*
- * hook would spend ~800 B on the very stack that just proved short, so the warning could cause the
- * overflow it warns about.
+ * the deepest moment.
+ *
+ * Reading is cheap but not free: the mark is recovered by scanning the untouched fill pattern one
+ * BYTE at a time (tasks.c:4807), so a call costs about as many iterations as there are free bytes
+ * -- roughly 2 KB, near 50 us, once a second. It takes no lock and disables no interrupts, so it
+ * cannot delay sys_evt or anything else, and it gets cheaper as the stack fills. If that ever
+ * needs trimming, check every 30th tick: a historic minimum is worth the same read 30 s later.
+ *
+ * WARNING is the expensive part: emitting from inside a wifi_diag_note_* hook would spend ~800 B
+ * on the very stack that just proved short, so the warning could cause the overflow it warns
+ * about.
  *
  * Latched for one boot for the same reason documented at sleep_mode.c:1479-1484: the mark only
  * ever shrinks, so within one uptime the condition can never clear, and re-emitting would repeat
