@@ -120,6 +120,19 @@ static xdev_buffer ucBLE_TX_Buffer;
 
 static uint8_t protocol = OBD_ELM327;
 
+/* Does this protocol route host traffic to the ELM327 interpreter chip?
+ *
+ * Single-sources a test that was written out in three places and has to stay identical in all of
+ * them: the TCP/BLE router arm, the BLE echo suppression, and the decision of whether to start
+ * elm327_read_task at all. That last one is why it matters -- if the router feeds elm327 in a mode
+ * where the read task was not started, unsolicited chip output goes nowhere; if the read task runs
+ * in a mode the router never feeds, it sits on the UART lock for nobody, which is the 20 s wake bug
+ * this predicate was extracted during. The two must agree by construction, not by comment. */
+static inline bool protocol_feeds_elm327(uint8_t p)
+{
+	return (p == OBD_ELM327) || (p == AUTO_PID);
+}
+
 static uint8_t derived_mac_addr[6] = {0};
 static uint8_t uid[16];
 static uint8_t ble_uid[33];
@@ -307,7 +320,7 @@ static void can_tx_task(void *pvParameters)
 				slcan_parse_str(msg_ptr, temp_len, &tx_msg, &xmsg_uart_tx_queue);
 			}
 		}
-		else if(protocol == OBD_ELM327 || protocol == AUTO_PID)
+		else if(protocol_feeds_elm327(protocol))
 		{
 			#if HARDWARE_VER == WICAN_PRO
 			static char elm327_cmd_buffer[2048];
@@ -444,7 +457,7 @@ static void can_rx_task(void *pvParameters)
 					ucTCP_TX_Buffer.usLen = slcan_parse_frame(ucTCP_TX_Buffer.ucElement, &rx_msg);
 				}
 				#if HARDWARE_VER != WICAN_PRO
-				else if(protocol == OBD_ELM327 || protocol == AUTO_PID)
+				else if(protocol_feeds_elm327(protocol))
 				{
 					// Let elm327.c decide which messages to process
 					xQueueSend( xmsg_obd_rx_queue, ( void * ) &rx_msg, pdMS_TO_TICKS(0) );
@@ -460,7 +473,7 @@ static void can_rx_task(void *pvParameters)
 					{
 						xQueueSend( xMsg_Tx_Queue, ( void * ) &ucTCP_TX_Buffer, pdMS_TO_TICKS(0) );
 					}
-					if(ble_connected() && protocol != OBD_ELM327 && protocol != AUTO_PID)
+					if(ble_connected() && !protocol_feeds_elm327(protocol))
 					{
 						xQueueSend( xmsg_ble_tx_queue, ( void * ) &ucTCP_TX_Buffer, pdMS_TO_TICKS(0) );
 						ESP_LOG_BUFFER_HEXDUMP(TAG, ucTCP_TX_Buffer.ucElement, ucTCP_TX_Buffer.usLen, ESP_LOG_INFO);
@@ -889,6 +902,15 @@ void app_main(void)
     elm327_uart_rx_queue_storage = (xdev_buffer *)heap_caps_malloc(32 * xdev_buffer_size, MALLOC_CAP_SPIRAM);
 	xmsg_obd_rx_queue = xQueueCreateStatic(32, xdev_buffer_size, (uint8_t *)elm327_uart_rx_queue_storage, &elm327_uart_rx_queue_buffer);
 	// elm327_init( &send_to_host, &xmsg_obd_rx_queue, NULL); //not needed
+
+	/* Only start elm327_read_task in the modes where an ELM327 client can actually reach us --
+	 * see elm327_set_read_task_enabled() in elm327.h for what goes wrong when it runs otherwise.
+	 *
+	 * It shares protocol_feeds_elm327() with the router rather than repeating the test, so the two
+	 * cannot drift apart. Read the resolved `protocol` local, NOT config_server_protocol(): the
+	 * SmartConnect override above rewrites it, and calling the getter again would miss that and
+	 * gate wrongly. Protocol changes need a reboot, so deciding once here is sound. */
+	elm327_set_read_task_enabled(protocol_feeds_elm327(protocol));
 	elm327_init(&send_to_host, &xmsg_ble_tx_queue, NULL);
 	if(protocol == AUTO_PID)
 	{
@@ -910,9 +932,14 @@ void app_main(void)
 	{
 		// Native-TWAI fast datalogger (Task #18), Phase A: passive broadcast capture.
 		// fast_log brings up the bus LISTEN_ONLY and decodes broadcast frames at bus rate,
-		// in place of the AutoPID/ELM poll loop. elm327_init() above stays dormant (no client
-		// drives it in FAST_LOG mode, so it never touches the CAN bus). Same CSV gate as
-		// AUTO_PID: deferred start when csv_log is enabled.
+		// in place of the AutoPID/ELM poll loop. Same CSV gate as AUTO_PID: deferred start
+		// when csv_log is enabled.
+		//
+		// elm327_init() above still runs (the sleep path needs its UART, lock and chip
+		// maintenance) but elm327_read_task is NOT started here -- see
+		// elm327_set_read_task_enabled() in elm327.h. Do NOT re-add the old claim that
+		// elm327_init() "stays dormant" in this mode: it was false about the UART lock and cost
+		// an evening of debugging.
 		uint32_t log_period = 0;
 		if(config_server_get_log_period(&log_period) == -1)
 		{
@@ -928,8 +955,14 @@ void app_main(void)
 	{
 		// Native-TWAI request/response poller (Task #18, Phase B "measure-first"). Brings up the
 		// bus NORMAL/on-bus and polls the configured mode-01/22 PIDs with no ELM emulation and no
-		// hardcoded 100ms inter-poll delay, in place of the AutoPID/ELM poll loop. elm327_init()
-		// above stays dormant (no client drives it). Same CSV gate as FAST_LOG: deferred start.
+		// hardcoded 100ms inter-poll delay, in place of the AutoPID/ELM poll loop. Same CSV gate
+		// as FAST_LOG: deferred start.
+		//
+		// elm327_init() above still runs (the sleep path needs its UART, lock and chip
+		// maintenance) but elm327_read_task is NOT started here -- see
+		// elm327_set_read_task_enabled() in elm327.h. Do NOT re-add the old claim that
+		// elm327_init() "stays dormant" in this mode: it was false about the UART lock and cost
+		// an evening of debugging.
 		uint32_t log_period = 0;
 		if(config_server_get_log_period(&log_period) == -1)
 		{

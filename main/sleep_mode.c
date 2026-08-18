@@ -664,8 +664,48 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
  * counters are file-scope so the teardown can reset them per session; as function statics they
  * were effectively per-boot, which means nothing on a device that no longer reboots to wake. */
 #define SLEEP_ELM327_MAX_NUDGES  2
+
+/* How many ~2 s passes GPIO7 is allowed to still read "awake" before we believe the chip really
+ * refused to sleep.
+ *
+ * Was 1, which is one pass too few. Measured on the bench and in the car, the pin settles at
+ * ~4010 ms after elm327_sleep() ("DIAG gpio7 settled asleep after 4011 ms / 1 passes") -- and one
+ * grace pass allows about 4 s. Zero margin: a chip 50 ms slower than usual gets hard-reset, and a
+ * hardreset WAKES it, so the babysitter creates the very symptom it is reacting to.
+ *
+ * Two costs nothing when the chip is on time: grace passes are only consumed while the pin still
+ * reads awake, so a chip that has settled never spends the second one. */
+#define SLEEP_ELM327_SETTLE_PASSES  2
+
+/* How long to wait for the shared UART lock inside the babysitter, per attempt. Short on purpose:
+ * this runs inside the 2 s sleep loop, so blocking the full ELM327_CMD_MUTEX_TIMOUT of 10 s here
+ * would stall the whole sleep state machine -- including the CAN-wake check -- for five loop
+ * passes. A parked device has nothing else talking to the chip, so a lock that is free is free
+ * immediately; a lock that is busy is a bug worth naming, not worth waiting 10 s for. */
+#define SLEEP_ELM327_LOCK_WAIT_MS   1000
+
+/* Cap on lock-failed nudge attempts per SLEEP SESSION, and it is a real requirement, not tidiness.
+ * "Could not get the lock -- try again next pass" without a cap means retrying every 2 s for the
+ * whole night in a parked car, each attempt burning the lock wait above. That is exactly the
+ * battery drain sleeping exists to prevent. Same budget as the chip nudges. */
+#define SLEEP_ELM327_MAX_LOCK_FAILS 2
+
 static uint8_t s_elm327_sleep_nudges  = 0;
 static uint8_t s_elm327_settle_passes = 0;
+static uint8_t s_elm327_lock_fails    = 0;   /* nudges abandoned because the UART lock was held */
+
+/* DIAGNOSTIC (2026-08-17): is "MIC chip would not sleep" a real refusal, or a false alarm?
+ *
+ * It fired on three sleep entries out of three in the car, and the owner reports a SECOND WiCAN
+ * doing the same -- so it is a fixed-constant firmware behaviour, not one bad chip. The suspicion
+ * is the settle grace above: GPIO7 is known to lag (it still reads "awake" straight after a
+ * successful elm327_sleep()), and the babysitter allows exactly ONE ~2 s pass before it decides
+ * the chip disobeyed and hardresets it -- which WAKES the chip, so the cure re-creates the
+ * symptom. To settle it we need the one number nobody has measured: how long GPIO7 actually takes
+ * to flip after elm327_sleep(). These record it. */
+static uint32_t s_elm327_sleep_entry_ms   = 0;   /* when elm327_sleep() returned, this session */
+static uint16_t s_elm327_sleep_passes     = 0;   /* sleeping passes since then */
+static bool     s_elm327_asleep_logged    = false; /* one line per SESSION, never per cycle */
 
 /* One "resume stack low" warning per boot -- see the emit site for why boot scope is correct here
  * (the watermark it reports is itself a historic minimum that cannot recover within an uptime). */
@@ -1089,13 +1129,35 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 
-    /* Fresh budget for this sleep session: two nudges, and one pass of grace for GPIO7 to settle
-     * before we believe it. Resetting HERE rather than relying on a function-static is the whole
-     * point -- a static that is only ever cleared at boot means nothing now that a wake resumes. */
+    /* Fresh budget for this sleep session: two nudges, two lock-failed attempts, and two passes of
+     * grace for GPIO7 to settle before we believe it. Resetting HERE rather than relying on a
+     * function-static is the whole point -- a static that is only ever cleared at boot means
+     * nothing now that a wake resumes. */
     s_elm327_sleep_nudges  = 0;
     s_elm327_settle_passes = 0;
+    s_elm327_sleep_passes  = 0;
+    s_elm327_lock_fails    = 0;
+    s_elm327_asleep_logged = false;
 
-    elm327_sleep();
+    /* The result was thrown away here too. It is worth one line: a sleep entry whose STSLEEP0 never
+     * reached the chip explains everything the babysitter is about to see, and saying so at the
+     * moment it happens beats inferring it two minutes later from GPIO7. */
+    {
+        const esp_err_t sleep_ret = elm327_sleep();
+        if(sleep_ret == ESP_ERR_TIMEOUT)
+        {
+            char holder[16] = {0};
+            elm327_lock_holder_name(holder, sizeof(holder));
+            event_log_emit(EVL_INFO, "sleep entry: UART lock held by %s -- chip not told to sleep",
+                           holder);
+        }
+        else if(sleep_ret != ESP_OK)
+        {
+            event_log_emit(EVL_INFO, "sleep entry: chip refused STSLEEP0 (%s)",
+                           esp_err_to_name(sleep_ret));
+        }
+    }
+    s_elm327_sleep_entry_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
     /* The one permanent marker that a sleep entry happened. Nothing else in the teardown writes to
      * the event log, so without this a sleep is invisible in the record and can only be inferred
@@ -1210,17 +1272,60 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
         return false;
     }
 
+    /* DIAGNOSTIC (2026-08-17): measure where the resume actually spends its time.
+     *
+     * Measured in the car: every wake left the LED dark and WiFi unreachable for ~23 s while the
+     * datalogger was already recording, and /wifi_diag put the first WiFi association ATTEMPT 20 s
+     * after CAN_WAKE -- so ~20 s goes somewhere BELOW, before the network is touched. Reading the
+     * code narrows it to the chip step but cannot pin it, because elm327_hardreset_chip() is really two
+     * mutex takes and up to six UART timeouts (see elm327_hardreset_timing_t).
+     *
+     * One line per WAKE, never per cycle -- the 2 s sleep loop runs ~43k times a night. */
+    const uint32_t t_resume_start = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t t_hold_ms = 0, t_can_ms = 0, t_fence_ms = 0, t_chip_ms = 0, t_wifi_ms = 0, t_led_ms = 0;
+    uint32_t t_mark = t_resume_start;
+    #define SLEEP_RESUME_LAP(dst) do { \
+        const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000); \
+        (dst) = now_ms - t_mark; \
+        t_mark = now_ms; \
+    } while(0)
+
     /* 1. Undo the pad hold that pins the OBD chip asleep. Instant (pin work only), and it must
      *    precede any attempt to talk to that chip. */
     elm327_release_sleep_hold();
+    SLEEP_RESUME_LAP(t_hold_ms);
 
-    /* 2. BUS FIRST -- this is the whole point of resuming rather than rebooting.
+    /* 2. Hand the LED back to its own task.
+     *
+     *    READ THIS BEFORE ASSUMING IT LIGHTS THE LED HERE -- IT DOES NOT, AND AN EARLIER VERSION
+     *    OF THIS COMMENT CLAIMED IT DID. led_indicator_resume() only decrements the suspend
+     *    counter (led_indicator.c:105-118). The task that actually paints is parked on
+     *    DEV_AWAKE_BIT (led_indicator.c:152) and refuses to paint without dev_status_is_awake()
+     *    as a second backstop (led_indicator.c:186). That bit is set by dev_status_set_awake() at
+     *    the very END of this function, so the LED cannot come on before the state publish no
+     *    matter where this call sits. The measured t_led=0 is that: the call returns instantly
+     *    because it paints nothing.
+     *
+     *    So moving it here is tidiness, not a fix. The owner's "the device looks dead" symptom was
+     *    cured by removing the 20 s stall further down, NOT by this line. If light-before-network
+     *    is ever genuinely wanted, the change belongs in the indicator task's DEV_AWAKE_BIT gate
+     *    -- and that gate is deliberate, it is what lets the sleep paths darken the LED, so do not
+     *    remove it casually.
+     *
+     *    Position still matters for one reason: the suspend count must be back to zero before the
+     *    publish, or the first paint after the publish is skipped. Keeping it above every step
+     *    that can fail guarantees that without depending on where the failures are. */
+    led_indicator_resume();
+    SLEEP_RESUME_LAP(t_led_ms);
+
+    /* 3. BUS FIRST -- this is the whole point of resuming rather than rebooting.
      *    poll_log drives the TWAI controller directly and needs the interpreter chip for
      *    NOTHING, so getting the bus back before the chip handshake means logging restarts in
      *    single-digit milliseconds instead of waiting ~1-2 s (worst case ~4.5 s) for a chip that
      *    the datalogger does not use. can_enable() re-installs TWAI and drives the transceiver's
      *    standby pin low itself (can.c:438), reclaiming GPIO1 from the wake sampler. */
     can_enable();
+    SLEEP_RESUME_LAP(t_can_ms);
     if(!can_is_enabled())
     {
         ESP_LOGE(TAG, "resume: can_enable() failed -- falling back to reboot");
@@ -1228,18 +1333,19 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
         return false;
     }
 
-    /* 3. Only now release the parked producers. Bus first, fence second -- never the reverse,
+    /* 4. Only now release the parked producers. Bus first, fence second -- never the reverse,
      *    or an unparked task could transmit into a disabled controller. */
     can_sleep_fence_clear();
     csv_logger_set_sleep_requested(false);   /* the writer may open a fresh session again */
+    SLEEP_RESUME_LAP(t_fence_ms);
 
-    /* 4. The slow part, deliberately after the bus is already live: the interpreter chip. A hard
-     *    reset is what the existing retry path uses and the only sequence proven to bring it back
-     *    from STSLEEP0. ~555 ms floor, ~1-1.8 s typical, ~4.5 s if its UART reads time out.
-     *    Nothing touches this chip until the state publish at the end reopens its UART gate. */
-    elm327_hardreset_chip();
-
-    /* 5. Network back. wifi_mgr deinit/init at runtime is proven live: smartconnect does exactly
+    /* 5. Network back, and note it now runs BEFORE the interpreter chip rather than after.
+     *    The chip step is the only slow one left, and the owner's way of asking "is it alive?" is
+     *    to reach the device over WiFi -- so the network must not queue behind a chip nobody is
+     *    waiting on. Safe in this order because nothing in wifi_network_init() touches UART1, so
+     *    the two steps share no state; only wall-clock order changes.
+     *
+     *    wifi_mgr deinit/init at runtime is proven live: smartconnect does exactly
      *    this pair on every home/drive transition (smartconnect.c:320 -> :352) with no reboot.
      *    ap_ssid is rebuilt from the MAC rather than reached for in main.c, which owns a static. */
     {
@@ -1263,13 +1369,94 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
         }
     }
 
-    led_indicator_resume();
+    SLEEP_RESUME_LAP(t_wifi_ms);
 
-    /* 6. Publish the state FIRST, then release the tasks parked on the awake bit. The order
+    /* 6. LAST of the real work, and now BOUNDED: the interpreter chip. A hard reset is what the
+     *    existing retry path uses and the only sequence proven to bring it back from STSLEEP0.
+     *
+     *    The 1000 ms is the wait for the shared UART lock, not for the chip. With the old fixed
+     *    10 s, a lock held by another task cost this wake 10 s here plus another 10 s inside the
+     *    elm327_set_baudrate() tail call -- the measured 20 s of dark LED and dead WiFi. Bounded,
+     *    the worst case is ~1 s (lock never free) or ~4.5 s (chip genuinely sick), never 20 s.
+     *
+     *    FAILURE IS NON-FATAL and always was: we log it and carry on rather than rebooting. A
+     *    device that is awake, on the network and logging CAN beats one that reboots because a
+     *    chip the datalogger does not even use failed to answer.
+     *
+     *    Doing this on a worker task so the resume never waits at all was considered and rejected:
+     *    it buys ~1.8 s typical at the price of task lifetime, re-entry and publish-ordering
+     *    questions on the one path that must not grow new failure modes. Synchronous and bounded.
+     *
+     *    Nothing touches this chip until the state publish at the end reopens its UART gate. */
+    if(!elm327_hardreset_chip_timeout(1000))
+    {
+        ESP_LOGW(TAG, "resume: chip reset did not complete -- continuing anyway (non-fatal)");
+    }
+    SLEEP_RESUME_LAP(t_chip_ms);
+
+    /* DIAGNOSTIC: emitted BEFORE the state publish below, so it lands even if something after this
+     * point misbehaves. hardreset_* is the breakdown INSIDE the chip step: mutex is the wait for
+     * the UART lock (cap 10 s), rd/rt are the two possible reads (~1.5 s each), baud is
+     * elm327_set_baudrate() which takes the same lock a SECOND time. calls>1 within one wake would
+     * mean the chip is being reset more than once, which is the other way to reach ~20 s. */
+    /* The whole block is behind ONE explicit debug check rather than relying on the three
+     * EVENT_LOG_DEBUG macros below. Those do already avoid evaluating their arguments when the
+     * gate is shut, but elm327_hardreset_get_timings() sits OUTSIDE them and would otherwise copy
+     * the ~88-byte timing struct on every single wake for nothing. */
+    if(event_log_debug_enabled())
+    {
+        elm327_hardreset_timing_t hr;
+        elm327_hardreset_get_timings(&hr);
+        /* TWO lines, not one: EVENT_LOG_DETAIL_MAX is 112 chars and the combined line was ~150,
+         * which silently truncated exactly the fields that matter most (calls= tells us whether a
+         * single wake resets the chip twice). Two lines per WAKE still honours the per-wake rule --
+         * what the rule forbids is per-CYCLE logging in the 2 s loop. */
+        /* Fields listed in EXECUTION order, which changed with the reorder above: led now comes
+         * second and chip last. Same names, same meanings -- so old and new logs stay comparable
+         * field by field -- but read left to right they are a timeline again. */
+        /* DEBUG-GATED (owner request): on a healthy device these three lines are pure numbers and
+         * they crowd the event page, which is the owner's normal view of what the device did. The
+         * EVENTS they describe are still recorded unconditionally -- CAN_WAKE, IGNITION_ON,
+         * DATALOG_*, and every resume refusal/failure line are untouched. What is hidden is only
+         * the millisecond breakdown, which matters when investigating and never otherwise.
+         *
+         * Turn them back on with the stored "debug" config flag when a wake needs measuring:
+         * GET /event_log/status reports the flag as "debug". Without it these will NOT appear, so
+         * do not read their absence as "the fix stopped working". */
+        EVENT_LOG_DEBUG(EVL_INFO,
+                       "resume ms: hold=%u led=%u can=%u fence=%u wifi=%u chip=%u tot=%u",
+                       (unsigned)t_hold_ms, (unsigned)t_led_ms, (unsigned)t_can_ms,
+                       (unsigned)t_fence_ms, (unsigned)t_wifi_ms, (unsigned)t_chip_ms,
+                       (unsigned)((uint32_t)(esp_timer_get_time() / 1000) - t_resume_start));
+        EVENT_LOG_DEBUG(EVL_INFO,
+                       "hardreset ms: mutex=%u%s rd=%u rt=%u baud=%u tot=%u g7=%d %s %s calls=%u",
+                       (unsigned)hr.mutex_ms, hr.mutex_ok ? "ok" : "TIMEOUT",
+                       (unsigned)hr.reset_read_ms, (unsigned)hr.retry_read_ms,
+                       (unsigned)hr.baudrate_ms, (unsigned)hr.total_ms,
+                       (int)hr.gpio7_at_entry,
+                       hr.used_reset_line ? "rstline" : "atz",
+                       hr.answered ? "ans" : "NOANS",
+                       (unsigned)hr.calls);
+        /* The answer to "who?" -- the question the first round could not reach. A slow wake is two
+         * 10 s lock timeouts, so whatever is named here is the actual defect. Empty fields mean
+         * that particular take did NOT time out, which on a healthy wake is all of them. */
+        EVENT_LOG_DEBUG(EVL_INFO, "uart lock: pre=%s rstTO=%s baudTO=%s",
+                       hr.holder_before[0]  ? hr.holder_before  : "-",
+                       hr.holder_rst_to[0]  ? hr.holder_rst_to  : "-",
+                       hr.holder_baud_to[0] ? hr.holder_baud_to : "-");
+    }
+    #undef SLEEP_RESUME_LAP
+
+    /* 7. STAYS LAST. Publish the state FIRST, then release the tasks parked on the awake bit. The order
      *    matters: the elm327 task wakes on DEV_AWAKE_BIT, pulls a queued command, then checks
      *    the sleep-state queue and DISCARDS the command if it still reads SLEEPING
-     *    (elm327.c:1619-1625). Setting the bit first opens a window where the first command
-     *    after every wake is silently dropped. */
+     *    (elm327.c:1657-1663). Setting the bit first opens a window where the first command
+     *    after every wake is silently dropped.
+     *
+     *    This must stay the FINAL step of the resume, however the steps above are reordered. The
+     *    LED moved to the top and the chip reset moved to the bottom precisely because they could;
+     *    the publish cannot, and moving it earlier "so the device looks awake sooner" reintroduces
+     *    that dropped-command window on every single wake. */
     state_info->state   = STATE_NORMAL;
     state_info->voltage = battery_voltage;
     state_info->timer   = 0;   /* awake again: no countdown until the state machine arms a new one */
@@ -1994,50 +2181,158 @@ void light_sleep_task(void *pvParameters)
                  *    through sleep_mode_resume()'s fallback. This path does not need its own.
                  *
                  * So: at most two nudges per SLEEP SESSION, then log it and leave the chip alone
-                 * until the next sleep entry.
+                 * until the next sleep entry. And at most two ABANDONED attempts per session as
+                 * well, for the case where the UART lock is held and we never reach the chip --
+                 * "failed, try again in 2 s" all night is its own battery drain.
                  *
-                 * The first check is deliberately SKIPPED. GPIO7 lags -- measured on the bench,
+                 * The first checks are deliberately SKIPPED. GPIO7 lags -- measured on the bench,
                  * it still reads "awake" immediately after a successful elm327_sleep() and only
-                 * settles once the chip has actually powered down. enter_deep_sleep() allows
-                 * 5000 ms for the same thing (:841). Judging on the first ~2 s pass would
-                 * hardreset a chip that was going to sleep on its own -- and a hardreset WAKES
-                 * it, so the babysitter would be racing its own cause. */
-                if(elm327_chip_get_status() == ELM327_READY && s_elm327_settle_passes < 1)
+                 * settles once the chip has actually powered down (~4010 ms, measured). Judging
+                 * too early would hardreset a chip that was going to sleep on its own -- and a
+                 * hardreset WAKES it, so the babysitter would be racing its own cause. */
+                /* DIAGNOSTIC: the settle time nobody had measured. Log the FIRST pass on which
+                 * GPIO7 finally reads asleep, and how long after elm327_sleep() that was. It came
+                 * back at ~4010 ms / 1 pass, against a grace that allowed about 4 s -- which is
+                 * why SLEEP_ELM327_SETTLE_PASSES is now 2. Latched, so it costs one line per sleep
+                 * SESSION and not one per 2 s cycle. */
+                s_elm327_sleep_passes++;
+
+                /* Sample the pin ONCE per pass and use that one answer everywhere below.
+                 * Re-reading it per branch let a single pass both log "settled asleep" and then
+                 * nudge the chip, because GPIO7 can change between two reads microseconds apart --
+                 * which is precisely the lag this whole block exists to tolerate. */
+                const elm327_chip_status_t chip_status = elm327_chip_get_status();
+
+                if(!s_elm327_asleep_logged && chip_status == ELM327_SLEEP)
                 {
-                    /* Give the pin one full pass (~2 s, so ~4 s since elm327_sleep()) to settle
-                     * before believing it. */
+                    s_elm327_asleep_logged = true;
+                    /* DEBUG-GATED (owner request): a normal, healthy settle is noise on the event
+                     * page. The FAILURE case is not gated -- if the chip never settles, the
+                     * babysitter's "would not sleep" line still fires unconditionally, so the bad
+                     * news can never be hidden by a config flag. */
+                    EVENT_LOG_DEBUG(EVL_INFO,
+                                   "DIAG gpio7 settled asleep after %u ms / %u passes "
+                                   "(grace allows %u passes; nudges used %u)",
+                                   (unsigned)((uint32_t)(esp_timer_get_time() / 1000)
+                                              - s_elm327_sleep_entry_ms),
+                                   (unsigned)s_elm327_sleep_passes,
+                                   (unsigned)SLEEP_ELM327_SETTLE_PASSES,
+                                   (unsigned)s_elm327_sleep_nudges);
+                }
+
+                if(chip_status == ELM327_READY
+                   && s_elm327_settle_passes < SLEEP_ELM327_SETTLE_PASSES)
+                {
+                    /* Give the pin a couple of full passes (~2 s each, so ~4-6 s since
+                     * elm327_sleep()) to settle before believing it. Measured settle is ~4010 ms,
+                     * so one pass left literally no margin. */
                     s_elm327_settle_passes++;
                 }
-                else if(elm327_chip_get_status() == ELM327_READY)
+                else if(chip_status == ELM327_READY)
                 {
-                    if(s_elm327_sleep_nudges < SLEEP_ELM327_MAX_NUDGES)
+                    if(s_elm327_sleep_nudges < SLEEP_ELM327_MAX_NUDGES
+                       && s_elm327_lock_fails < SLEEP_ELM327_MAX_LOCK_FAILS)
                     {
-                        s_elm327_sleep_nudges++;
+                        /* TWO different failures used to look identical here, and telling them
+                         * apart is the point of this block.
+                         *
+                         * Old code called elm327_hardreset_chip() and elm327_sleep() and looked at
+                         * neither result, so a nudge that never even got the UART lock -- chip
+                         * untouched, nothing asked of it -- counted as a nudge, and after two of
+                         * them the log said "MIC chip would not sleep". That message accused an
+                         * innocent chip and cost an evening of investigation. Now: if we could not
+                         * take the lock, we name the task holding it, spend a LOCK-FAIL credit
+                         * rather than a nudge credit, and leave the chip alone. */
                         ESP_LOGW(TAG, "ELM327 chip still awake -- nudging (%u/%u)",
-                                 (unsigned)s_elm327_sleep_nudges, (unsigned)SLEEP_ELM327_MAX_NUDGES);
-                        elm327_hardreset_chip();
-                        vTaskDelay(pdMS_TO_TICKS(500));
-                        elm327_sleep();
-                        /* The GPIO7 pad holds that used to live here are gone on purpose. They
-                         * were deep-sleep-flow leftovers doing nothing for this light-sleep loop,
-                         * nothing ever released them, and gpio_deep_sleep_hold_en() is a GLOBAL
-                         * flag affecting every held pad on the chip. The copies inside
-                         * elm327_sleep() serve the deep-sleep failsafe and stay. */
-                        vTaskDelay(pdMS_TO_TICKS(100));
+                                 (unsigned)(s_elm327_sleep_nudges + 1),
+                                 (unsigned)SLEEP_ELM327_MAX_NUDGES);
+
+                        (void)elm327_hardreset_chip_timeout(SLEEP_ELM327_LOCK_WAIT_MS);
+                        elm327_hardreset_timing_t hr;
+                        elm327_hardreset_get_timings(&hr);
+
+                        /* mutex_ok alone, deliberately: the return value adds nothing here because
+                         * a failed lock ALWAYS returns false (elm327.c, the early return on the
+                         * !mutex_ok path), so testing both only reads as if two independent things
+                         * were being checked. What we need to know is specifically "did we reach
+                         * the chip at all", and that is exactly mutex_ok. */
+                        if(!hr.mutex_ok)
+                        {
+                            /* Lock never obtained: the chip was not reset and must not be told to
+                             * sleep either -- elm327_sleep() would just queue behind the same
+                             * unavailable lock for another wait. One line per ATTEMPT, and the cap
+                             * above keeps that to at most two lines per sleep session. */
+                            s_elm327_lock_fails++;
+                            event_log_emit(EVL_INFO,
+                                           "nudge skipped: UART lock held by %s (%u/%u)",
+                                           hr.holder_rst_to[0] ? hr.holder_rst_to : "?",
+                                           (unsigned)s_elm327_lock_fails,
+                                           (unsigned)SLEEP_ELM327_MAX_LOCK_FAILS);
+                        }
+                        else
+                        {
+                            /* We really did reach the chip, so this really is a nudge. */
+                            s_elm327_sleep_nudges++;
+                            vTaskDelay(pdMS_TO_TICKS(500));
+                            const esp_err_t sleep_ret = elm327_sleep();
+                            if(sleep_ret == ESP_ERR_TIMEOUT)
+                            {
+                                /* Reset got the lock, STSLEEP0 did not. Still not the chip's
+                                 * fault, so name the holder rather than blaming it. */
+                                char holder[16] = {0};
+                                elm327_lock_holder_name(holder, sizeof(holder));
+                                event_log_emit(EVL_INFO,
+                                               "nudge %u: reset ok but UART lock held by %s at "
+                                               "STSLEEP0", (unsigned)s_elm327_sleep_nudges, holder);
+                            }
+                            /* The GPIO7 pad holds that used to live here are gone on purpose. They
+                             * were deep-sleep-flow leftovers doing nothing for this light-sleep
+                             * loop, nothing ever released them, and gpio_deep_sleep_hold_en() is a
+                             * GLOBAL flag affecting every held pad on the chip. The copies inside
+                             * elm327_sleep() serve the deep-sleep failsafe and stay. */
+                            vTaskDelay(pdMS_TO_TICKS(100));
+                        }
                     }
+                    /* Budget exhausted. The nudge check comes FIRST on purpose: if the chip really
+                     * was reset and told to sleep twice and is still awake, that IS a chip refusal
+                     * and deserves the accusing message, whatever else also ran out. Only when the
+                     * nudges were never spent can "we never reached the chip" be the true story. */
                     else if(s_elm327_sleep_nudges == SLEEP_ELM327_MAX_NUDGES)
                     {
                         s_elm327_sleep_nudges++;   /* step past, so this logs once per session */
                         ESP_LOGW(TAG, "ELM327 chip will not sleep -- leaving it awake this session");
                         event_log_emit(EVL_INFO,
                                        "MIC chip would not sleep after %u nudges -- left awake "
-                                       "(costs mA, NOT rebooting)", (unsigned)SLEEP_ELM327_MAX_NUDGES);
+                                       "(costs mA, NOT rebooting) [DIAG %u ms / %u passes since "
+                                       "elm327_sleep(), gpio7=%d]",
+                                       (unsigned)SLEEP_ELM327_MAX_NUDGES,
+                                       (unsigned)((uint32_t)(esp_timer_get_time() / 1000)
+                                                  - s_elm327_sleep_entry_ms),
+                                       (unsigned)s_elm327_sleep_passes,
+                                       (int)gpio_get_level(OBD_READY_PIN));
+                    }
+                    else if(s_elm327_lock_fails == SLEEP_ELM327_MAX_LOCK_FAILS)
+                    {
+                        /* Out of lock-fail credit. Step past so this logs once per session, and say
+                         * plainly that the chip was never asked -- the OPPOSITE conclusion from the
+                         * "would not sleep" line above, and the one the old code got wrong. */
+                        s_elm327_lock_fails++;
+                        char holder[16] = {0};
+                        elm327_lock_holder_name(holder, sizeof(holder));
+                        ESP_LOGW(TAG, "ELM327 nudges abandoned -- UART lock held (by %s)", holder);
+                        /* Kept under EVENT_LOG_DETAIL_MAX (112) -- a longer line truncates away
+                         * the holder name, which is the only new information in it. */
+                        event_log_emit(EVL_INFO,
+                                       "MIC left awake: UART lock held by %s after %u tries -- "
+                                       "chip never asked, NOT rebooting",
+                                       holder, (unsigned)SLEEP_ELM327_MAX_LOCK_FAILS);
                     }
                 }
                 else
                 {
                     s_elm327_sleep_nudges  = 0;
                     s_elm327_settle_passes = 0;
+                    s_elm327_lock_fails    = 0;
                 }
             }
         }

@@ -60,6 +60,16 @@
 
 static QueueHandle_t *xqueue_elm327_uart_rx = NULL;
 
+/* Whether elm327_init() creates elm327_read_task. See elm327_set_read_task_enabled() in elm327.h.
+ * Defaults TRUE on purpose: a caller that forgets to decide gets the historical behaviour, which
+ * is the safe direction to fail -- the dangerous mistake is NOT starting a task something needs. */
+static bool s_read_task_enabled = true;
+
+void elm327_set_read_task_enabled(bool enabled)
+{
+	s_read_task_enabled = enabled;
+}
+
 void (*elm327_can_log)(twai_message_t* frame, uint8_t type);
 
 #if HARDWARE_VER != WICAN_PRO
@@ -1361,6 +1371,38 @@ typedef struct
 static QueueHandle_t elm327_cmd_queue;
 static StaticQueue_t elm327_cmd_queue_struct;
 static uint8_t *elm327_cmd_queue_storage = NULL;
+/* UART1 -- the link to the MIC3624 interpreter chip. TWO INVARIANTS, both learned the hard way
+ * from a bug that made the device look dead for 20 s after every other wake (2026-08-17):
+ *
+ * 1. NEVER BLOCK **UNBOUNDED** WHILE HOLDING xuart1_semaphore. Every wait taken under this lock
+ *    must have a deadline you can name. Bounded waits under it are fine and are used all over this
+ *    file on purpose -- uart1_event_task waits ELM327_CMD_TIMEOUT_MS for a command reply while
+ *    holding it, which is correct. The rule is about waits with NO deadline.
+ *    (Stated as a flat "never block" it would forbid working, shipping code, and a rule that the
+ *    code visibly breaks gets read as decoration and then ignored -- which is how the real one
+ *    gets broken.)
+ *    Why it matters: every consumer of uart1_queue pops only under this lock, so one blocked
+ *    consumer stalls the interpreter chip for everyone -- including the sleep/wake path, which
+ *    cannot then reset the chip, put it to sleep, or even find out why. elm327_read_task did
+ *    exactly this: it read with portMAX_DELAY under the lock and held it across an entire sleep,
+ *    costing the wake 2 x ELM327_CMD_MUTEX_TIMOUT.
+ *
+ * 2. EVERY uart_flush_input() MUST BE PAIRED WITH xQueueReset(uart1_queue), UNDER THE SAME LOCK
+ *    HOLD. The flush empties the driver's RX ring but leaves already-posted UART_DATA events in
+ *    this queue. An unpaired flush therefore leaves ORPHANED events: a consumer receives one,
+ *    asks for event.size bytes that were thrown away, and waits. That was the source of the
+ *    orphan that triggered invariant 1.
+ *
+ * Several raw readers (uart_read_until_pattern) consume bytes without consuming their events,
+ * which is what makes rule 2 load-bearing rather than tidy.
+ *
+ * KNOWN EXCEPTIONS to rule 2, deliberately left alone: the three flushes in the chip
+ * FIRMWARE-UPDATE paths (elm327_send_update_command, elm327_disable_wake_commands,
+ * elm327_update_obd). They run only at boot or on an explicit update request, never on the
+ * sleep/wake path, and that code drives a line-by-line protocol whose responses it reads itself --
+ * resetting the event queue underneath it is a real risk on the one path where a mistake leaves
+ * the interpreter chip unusable. If you touch those functions for another reason, fix the pairing
+ * then, with a way to test the update end to end. */
 QueueHandle_t uart1_queue = NULL;
 static SemaphoreHandle_t xuart1_semaphore = NULL;
 
@@ -1400,7 +1442,11 @@ static void elm327_powerpin_commands(void)
 			return;
 		}
 		bzero(rx_buffer, ELM327_CMD_BUFFER_SIZE);
+		/* PAIRED -- see the invariant at the uart1_queue declaration. Boot-time only, so this one
+		 * was the mildest of the unpaired flushes, but the rule holds everywhere or it is not a
+		 * rule. Inside the lock hold. */
 		uart_flush_input(UART_NUM_1);
+		xQueueReset(uart1_queue);
 
 		// VTVERS
 		elm327_uart_write_bytes(UART_NUM_1, "VTVERS\r", strlen("VTVERS\r"));
@@ -1833,6 +1879,58 @@ static int uart_read_until_pattern(uart_port_t uart_num, char* buffer, size_t bu
     return total_len;
 }
 
+/* Diagnostic timing for the last hard reset -- see elm327_hardreset_timing_t in elm327.h for why.
+ * Written by elm327_hardreset_chip() and by elm327_set_baudrate()'s lock-timeout path (the second
+ * of the two 10 s waits), read via elm327_hardreset_get_timings(). Plain scalars updated in a fixed
+ * order with the total written LAST, so a reader that races us sees stale-but-consistent numbers
+ * rather than a torn mix; no lock is worth taking on a path whose whole job is to be measured.
+ *
+ * Declared HERE, above elm327_set_baudrate(), because that function is defined before
+ * elm327_hardreset_chip() and now writes into this record too. */
+static elm327_hardreset_timing_t s_hardreset_timing;
+
+void elm327_hardreset_get_timings(elm327_hardreset_timing_t *out)
+{
+	if(out != NULL)
+	{
+		*out = s_hardreset_timing;
+	}
+}
+
+/* Milliseconds since boot. esp_timer is monotonic and keeps counting across light sleep, which
+ * matters here: this runs on the resume path. */
+static inline uint32_t elm327_now_ms(void)
+{
+	return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/* Name the task currently holding the UART lock.
+ *
+ * xSemaphoreGetMutexHolder() is a read of the mutex owner field -- it does NOT take the lock, so it
+ * is safe to call while we are ourselves blocked on it, which is the whole point. The answer is a
+ * snapshot and can be stale by the time it is logged; acceptable here because the interesting case
+ * is a holder that keeps the lock for 10 s, which is an eternity by comparison. */
+void elm327_lock_holder_name(char *dst, size_t dstlen)
+{
+	if(dst == NULL || dstlen == 0)
+	{
+		return;
+	}
+	if(xuart1_semaphore == NULL)
+	{
+		snprintf(dst, dstlen, "nosem");
+		return;
+	}
+	TaskHandle_t holder = xSemaphoreGetMutexHolder(xuart1_semaphore);
+	if(holder == NULL)
+	{
+		snprintf(dst, dstlen, "none");
+		return;
+	}
+	const char *name = pcTaskGetName(holder);
+	snprintf(dst, dstlen, "%s", (name != NULL) ? name : "?");
+}
+
 bool elm327_set_baudrate(void)
 {
     char rx_buffer[UART_BUFFER_SIZE];
@@ -1912,9 +2010,16 @@ bool elm327_set_baudrate(void)
     }
 	else
 	{
-		ESP_LOGE(TAG, "%s: Failed to take UART semaphore", __func__);
+		/* The SECOND of the two 10 s waits that make up a slow wake. elm327_hardreset_chip() calls
+		 * this straight after releasing the lock, so on a contended wake both expire back to back:
+		 * 10 s + 10 s = the measured 20050 ms. Recorded into the hardreset record because that is
+		 * the call this always runs under, and one line then tells the whole story. */
+		elm327_lock_holder_name(s_hardreset_timing.holder_baud_to,
+		                        sizeof(s_hardreset_timing.holder_baud_to));
+		ESP_LOGE(TAG, "%s: Failed to take UART semaphore (held by %s)", __func__,
+		         s_hardreset_timing.holder_baud_to);
 	}
-    
+
     return success;
 }
 
@@ -1923,20 +2028,74 @@ void elm327_lock(void)
 	xSemaphoreTake(xuart1_semaphore, portMAX_DELAY);
 }
 
-void elm327_hardreset_chip(void)
+/* How long to wait for the chip's "\r>" prompt after a reset, as opposed to the ordinary
+ * UART_TIMEOUT_MS used for every other command.
+ *
+ * Measured in the car 2026-08-17 on a HEALTHY wake: rd=1507, i.e. this read burned its whole
+ * UART_TIMEOUT_MS+300 = 1500 ms deadline and returned nothing -- and then elm327_set_baudrate()
+ * talked to the very same chip successfully 10 ms later. So the chip was never dead; it just
+ * needs a little longer than 1500 ms after a reset to print its prompt, and we were giving up
+ * with the answer already on its way.
+ *
+ * 2500 ms is raised HERE ONLY, deliberately. UART_TIMEOUT_MS governs every normal command, where
+ * a longer deadline would make a genuinely unresponsive chip cost more on every single exchange.
+ * A pattern read returns the instant the pattern arrives, so on healthy hardware a bigger number
+ * costs nothing -- it can only stop us from walking away one moment too early.
+ *
+ * Deleting the exchange instead was considered and rejected: it is the readiness gate for
+ * elm327_set_baudrate(), and probing a chip that is still booting risks the no-answer branch that
+ * drops to 115200 baud and then burns several 1.2 s timeouts -- more expensive than the 1.5 s. */
+#define ELM327_HARDRESET_PROMPT_TIMEOUT_MS	2500
+
+/* Hard reset, with the wait for the UART lock bounded by the caller.
+ *
+ * Returns true only when the lock was taken and the baud-rate handshake that follows got a real
+ * reply out of the chip -- i.e. "the chip is talking to us again".
+ *
+ * WHY a caller-supplied lock timeout: the resume path runs this on every wake, and the fixed
+ * ELM327_CMD_MUTEX_TIMOUT of 10 s made a contended lock cost 20 s of dark LED and unreachable
+ * WiFi (10 s here, then another 10 s inside elm327_set_baudrate()). A wake must never pay that,
+ * so sleep_mode_resume() passes ~1 s and treats failure as non-fatal. Boot-time and error-recovery
+ * callers keep the old 10 s via the elm327_hardreset_chip() wrapper below.
+ *
+ * Callers that need to tell "could not get the lock" apart from "chip is sick" read mutex_ok out
+ * of elm327_hardreset_get_timings() -- this call rewrites that record before it can return. */
+bool elm327_hardreset_chip_timeout(uint32_t lock_wait_ms)
 {
+	const uint32_t t_entry = elm327_now_ms();
+	uint32_t t_mark;
+	bool ok = false;
+
+	/* Reset the record for THIS call before anything can return early, so a caller reading the
+	 * timings never sees a mix of this call and the previous one. calls[] deliberately keeps
+	 * counting across calls -- it is how we find out whether a single resume hard-resets twice,
+	 * which is one of the two ways the measured ~20 s could be reached. */
+	const uint32_t prev_calls = s_hardreset_timing.calls;
+	memset(&s_hardreset_timing, 0, sizeof(s_hardreset_timing));
+	s_hardreset_timing.calls = prev_calls + 1;
+	s_hardreset_timing.gpio7_at_entry = (int8_t)gpio_get_level(OBD_READY_PIN);
+
     char *rsp_buffer = (char *)heap_caps_malloc(UART_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	ESP_LOGW(TAG, "Performing hard reset of ELM327 chip");
 	if (rsp_buffer == NULL)
 	{
 		ESP_LOGE(TAG, "%s: response buffer alloc failed", __func__);
-		return;
+		s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
+		return false;
 	}
-	if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
+	elm327_lock_holder_name(s_hardreset_timing.holder_before,
+	                        sizeof(s_hardreset_timing.holder_before));
+	t_mark = elm327_now_ms();
+	if (xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(lock_wait_ms)) == pdTRUE)
 	{
+		s_hardreset_timing.mutex_ms = elm327_now_ms() - t_mark;
+		s_hardreset_timing.mutex_ok = true;
 		vTaskDelay(pdMS_TO_TICKS(500));
+		/* PAIRED -- the reset was commented out here. A flush that empties the RX ring without
+		 * clearing uart1_queue leaves orphaned UART_DATA events behind, which is what deadlocked
+		 * elm327_read_task on the UART lock. Both calls stay inside the lock hold. */
 		uart_flush_input(UART_NUM_1);
-		// xQueueReset(uart1_queue);
+		xQueueReset(uart1_queue);
 		/* GPIO7 HIGH means the chip is ASLEEP (see hw_config.h) -- it cannot hear UART, so the
 		 * only way in is the reset line. LOW means it is awake and should answer ATZ. */
 		bool used_reset_line = (gpio_get_level(OBD_READY_PIN) == 1);
@@ -1953,7 +2112,9 @@ void elm327_hardreset_chip(void)
 			elm327_uart_write_bytes(UART_NUM_1, "ATZ\r", strlen("ATZ\r"));
 		}
 		memset(rsp_buffer, 0, UART_BUFFER_SIZE);
-        int len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", UART_TIMEOUT_MS+300);
+		t_mark = elm327_now_ms();
+        int len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", ELM327_HARDRESET_PROMPT_TIMEOUT_MS);
+		s_hardreset_timing.reset_read_ms = elm327_now_ms() - t_mark;
 
 		/* The ATZ path is taken precisely when the chip is awake -- but if what is BROKEN is the
 		 * UART link itself (a desynced baud rate after a reset, say), then talking to it over
@@ -1967,9 +2128,14 @@ void elm327_hardreset_chip(void)
 			vTaskDelay(pdMS_TO_TICKS(5));
 			gpio_set_level(OBD_RESET_PIN, 1);
 			memset(rsp_buffer, 0, UART_BUFFER_SIZE);
-			len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", UART_TIMEOUT_MS+300);
+			t_mark = elm327_now_ms();
+			len = uart_read_until_pattern(UART_NUM_1, rsp_buffer, UART_BUFFER_SIZE - 1, "\r>", ELM327_HARDRESET_PROMPT_TIMEOUT_MS);
+			s_hardreset_timing.retry_read_ms = elm327_now_ms() - t_mark;
 			used_reset_line = true;
 		}
+
+		s_hardreset_timing.used_reset_line = used_reset_line;
+		s_hardreset_timing.answered = (len > 0);
 
 		if(len > 0)
 		{
@@ -1980,7 +2146,9 @@ void elm327_hardreset_chip(void)
 		{
 			ESP_LOGE(TAG, "Hardreset failed even via the reset line");
 		}
+		/* PAIRED -- see the flush at the top of this function. Still inside the lock hold. */
 		uart_flush_input(UART_NUM_1);
+		xQueueReset(uart1_queue);
 		if(xuart1_semaphore == NULL)
 		{
 			ESP_LOGE(TAG, "xuart1_semaphore is NULL");
@@ -1989,7 +2157,15 @@ void elm327_hardreset_chip(void)
 	}
 	else
 	{
-		ESP_LOGE(TAG, "%s: Failed to take UART semaphore", __func__);
+		/* The confirmed slow-wake path: 10 s gone, chip never touched. Record the owner so the
+		 * next question ("who?") is answered by the log instead of another round of guessing.
+		 * mutex_ms is the measured wait, NOT the constant, so a short value here would mean
+		 * something other than the timeout broke us out. */
+		s_hardreset_timing.mutex_ms = elm327_now_ms() - t_mark;
+		elm327_lock_holder_name(s_hardreset_timing.holder_rst_to,
+		                        sizeof(s_hardreset_timing.holder_rst_to));
+		ESP_LOGE(TAG, "%s: Failed to take UART semaphore (held by %s)", __func__,
+		         s_hardreset_timing.holder_rst_to);
 	}
 
 	/* Was leaked on every single call. Harmless when this ran once per boot; a real drip now that
@@ -1997,17 +2173,55 @@ void elm327_hardreset_chip(void)
 	 * the per-resume heap decline measured on the bench. */
 	heap_caps_free(rsp_buffer);
 
+	/* SKIP the baud-rate tail call when we never got the lock.
+	 *
+	 * This is the single biggest fix in this file. elm327_set_baudrate() takes the SAME
+	 * xuart1_semaphore, with its own hardcoded ELM327_CMD_MUTEX_TIMOUT of 10 s. So a wake that
+	 * failed to get the lock up there used to walk straight into a second full 10 s wait on the
+	 * very same unavailable lock: measured in the car as mutex=10000TIMEOUT ... baud=10000
+	 * tot=20050, with the chip never touched once. Whoever is holding the lock is not going to
+	 * hand it over in the next 50 ms, so asking again is pure dead time.
+	 *
+	 * Bounding only the first take would therefore have fixed nothing -- half of the 20 s lives
+	 * here. Do not "restore symmetry" by calling it unconditionally again. */
+	if(!s_hardreset_timing.mutex_ok)
+	{
+		ESP_LOGE(TAG, "%s: UART lock unavailable -- skipping the baud-rate handshake", __func__);
+		s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
+		return false;
+	}
+
 	vTaskDelay(pdMS_TO_TICKS(50));
+	/* NOT a cheap tail call: elm327_set_baudrate() takes xuart1_semaphore a SECOND time (another
+	 * ELM327_CMD_MUTEX_TIMOUT = 10 s worst case) and can issue four more UART_TIMEOUT_MS reads.
+	 * Timed separately because it, not the reset above, is the larger half of the worst case. */
+	t_mark = elm327_now_ms();
     if (elm327_set_baudrate())
     {
         ESP_LOGI(TAG, "UART configuration completed successfully");
+        /* Success is judged on the baud-rate handshake, NOT on s_hardreset_timing.answered.
+         * The reset prompt can be missed while the chip is perfectly healthy -- that is exactly
+         * the 1.5 s timeout this change also widened -- and set_baudrate() getting a real reply
+         * out of the chip is the stronger, later evidence that it is back. */
+        ok = true;
     }
     else
     {
         ESP_LOGE(TAG, "UART configuration failed");
     }
+	s_hardreset_timing.baudrate_ms = elm327_now_ms() - t_mark;
+	/* Written LAST: a non-zero total is the reader's signal that the rest of the record is complete. */
+	s_hardreset_timing.total_ms = elm327_now_ms() - t_entry;
 	// uint8_t protocol_number = 0;
 	// elm327_get_protocol_number(&protocol_number);
+	return ok;
+}
+
+/* The original signature, unchanged in behaviour: the same 10 s lock wait every existing caller
+ * has always had. Only the sleep-resume path wants a shorter one, and it says so explicitly. */
+void elm327_hardreset_chip(void)
+{
+	(void)elm327_hardreset_chip_timeout(ELM327_CMD_MUTEX_TIMOUT);
 }
 
 esp_err_t elm327_get_protocol_number(uint8_t *protocol_number)
@@ -2220,7 +2434,23 @@ esp_err_t elm327_sleep(void)
 			ESP_LOGE(TAG, "%s: Sleep failed", __func__);
 			ret = ESP_FAIL;
 		}
+		/* PAIRED, and this is THE site that caused the 20 s wakes.
+		 *
+		 * uart_flush_input() empties the driver's RX ring but leaves already-posted UART_DATA
+		 * events in uart1_queue. The STSLEEP0 reply above is read raw by
+		 * uart_read_until_pattern(), which never consumes the events that reply generated -- so
+		 * the flush destroyed the bytes while the events survived. elm327_read_task then took the
+		 * UART lock, received one of those orphaned events, and blocked forever waiting for bytes
+		 * that no longer existed, holding the lock across the whole sleep. The wake then spent
+		 * 2 x 10 s failing to acquire it.
+		 *
+		 * Whether the reply's event was still queued at this instant was pure scheduling luck,
+		 * which is exactly why the fault looked like a coin flip in the car.
+		 *
+		 * Both calls stay inside the lock hold, which is what makes the pair atomic against the
+		 * other consumers. */
 		uart_flush_input(UART_NUM_1);
+		xQueueReset(uart1_queue);
 
 		gpio_sleep_set_pull_mode(OBD_SLEEP_PIN, GPIO_PULLDOWN_ONLY);
 		gpio_set_level(OBD_SLEEP_PIN, 0);
@@ -2235,12 +2465,21 @@ esp_err_t elm327_sleep(void)
 		gpio_hold_en(OBD_READY_PIN);
 		gpio_deep_sleep_hold_en();
 
-		// xQueueReset(uart1_queue);
+		/* (The xQueueReset that used to be commented out here now lives with its flush above,
+		 * where it belongs -- a reset without its flush, or after the pin work, does not close
+		 * the orphaned-event window.) */
 		xSemaphoreGive(xuart1_semaphore);
 	}
 	else
 	{
+		/* ESP_ERR_TIMEOUT, not ESP_FAIL, and the difference is the whole point: "I never got the
+		 * UART lock, so I never asked the chip anything" is a completely different fault from "I
+		 * asked and the chip refused". The sleep babysitter used to see only ESP_FAIL-or-nothing
+		 * and printed "MIC chip would not sleep", which sent an evening of investigation after a
+		 * chip that was innocent. Every existing caller either ignores the result or tests
+		 * != ESP_OK, so both still behave exactly as before. */
 		ESP_LOGE(TAG, "%s: Failed to take semaphore", __func__);
+		ret = ESP_ERR_TIMEOUT;
 	}
 	return ret;
 }
@@ -3219,25 +3458,65 @@ void elm327_read_task(void *pvParameters)
 			if(xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
 			{
 				bzero(dtmp.ucElement, sizeof(dtmp.ucElement));
-				// TODO: fix this. Here it's checking if queu is not empty, other task might have processed the queue while waiting for empty queue
-				if((xQueuePeek(uart1_queue, (void *)&event, 0)) == pdTRUE && xQueueReceive(uart1_queue, (void *)&event, portMAX_DELAY) == pdTRUE)
+				/* Both waits below are ZERO. THE INVARIANT FOR THIS WHOLE BLOCK: nothing here may
+				 * ever block while holding xuart1_semaphore. Breaking that is what caused the
+				 * 20 s wakes -- see the UART_DATA case.
+				 *
+				 * The re-peek also settles the old "TODO: another task might have processed the
+				 * queue while we waited" note: with a zero-timeout receive, losing that race now
+				 * costs a wasted wakeup instead of a hang, which is all the guard needs to do. */
+				if((xQueuePeek(uart1_queue, (void *)&event, 0)) == pdTRUE && xQueueReceive(uart1_queue, (void *)&event, 0) == pdTRUE)
 				{
-					switch(event.type) 
+					switch(event.type)
 					{
 						case UART_DATA:
-							elm327_uart_read_bytes(UART_NUM_1, dtmp.ucElement, event.size, portMAX_DELAY);
-							
+						{
+							/* THE DEADLOCK, FIXED. This used to read event.size bytes with
+							 * portMAX_DELAY while holding the lock above.
+							 *
+							 * The IDF driver posts UART_DATA only AFTER copying the bytes into its
+							 * RX ring, so for a genuine event they are already there and a zero
+							 * wait is enough. The one case where they are NOT there is an event
+							 * ORPHANED by a uart_flush_input() that emptied the ring without
+							 * clearing the event queue -- and waiting for bytes that were thrown
+							 * away is exactly the bug: the task then held the UART lock forever.
+							 * Measured in the car 2026-08-17: held across an entire sleep, so the
+							 * wake spent 2 x 10 s failing to take the lock while the LED stayed
+							 * dark and WiFi stayed down.
+							 *
+							 * So: take what is actually there, and DROP a stale event rather than
+							 * wait for it. The flush/reset pairing elsewhere in this file removes
+							 * the orphans at source; this makes them harmless even if one slips
+							 * through. */
+							size_t want = event.size;
+							if(want > sizeof(dtmp.ucElement))
+							{
+								/* Driver-bounded well below this in practice; the clamp removes
+								 * the assumption rather than trusting it. */
+								want = sizeof(dtmp.ucElement);
+							}
+							const int got = elm327_uart_read_bytes(UART_NUM_1, dtmp.ucElement, want, 0);
+							if(got <= 0)
+							{
+								/* Stale/orphaned event. Silent on purpose: this runs per UART
+								 * event, so a log line here could flood. */
+								break;
+							}
+
 							if(elm327_response != NULL)
 							{
-								ESP_LOG_BUFFER_HEXDUMP(TAG, (char*)dtmp.ucElement, event.size, ESP_LOG_INFO);
-								dtmp.usLen = event.size;
-								// ESP_LOG_BUFFER_CHAR(TAG, (char*)dtmp, event.size);
-								elm327_response((char*)dtmp.ucElement, 
-														event.size, 
-														xqueue_elm327_uart_rx, 
+								/* Everything below uses `got`, never event.size. They differ on a
+								 * short read, and passing event.size then handed the client
+								 * uninitialised tail bytes. */
+								ESP_LOG_BUFFER_HEXDUMP(TAG, (char*)dtmp.ucElement, got, ESP_LOG_INFO);
+								dtmp.usLen = got;
+								elm327_response((char*)dtmp.ucElement,
+														got,
+														xqueue_elm327_uart_rx,
 														NULL);
 							}
 							break;
+						}
 						case UART_FIFO_OVF:
 							uart_flush_input(UART_NUM_1);
 							xQueueReset(uart1_queue);
@@ -3360,20 +3639,23 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
 
     static StackType_t *uart1_event_task_stack, *elm327_read_task_stack;
     static StaticTask_t uart1_event_task_buffer, elm327_read_task_buffer;
-    
+
 	// Keep stacks in internal RAM (external/PSRAM stacks can crash if caches are temporarily disabled).
 	uart1_event_task_stack = heap_caps_malloc((2048*2) * sizeof(StackType_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-	elm327_read_task_stack = heap_caps_malloc((2048*2) * sizeof(StackType_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-    
-    if (uart1_event_task_stack == NULL || elm327_read_task_stack == NULL)
+
+    if (uart1_event_task_stack == NULL)
     {
         ESP_LOGE(TAG, "Failed to allocate task stack memory");
-        if (uart1_event_task_stack) heap_caps_free(uart1_event_task_stack);
-        if (elm327_read_task_stack) heap_caps_free(elm327_read_task_stack);
         return;
     }
-    
-    // Create static tasks
+
+	/* uart1_event_task is created in EVERY mode and must stay that way. It executes the chip
+	 * commands queued by obd_init() above -- which write the interpreter chip's own sleep/wake
+	 * voltage thresholds and switch its autonomous sleep OFF. Gate it and those commands sit in
+	 * the queue forever, leaving the chip to sleep or wake on whatever its NVM last held, which
+	 * on a car means mid-drive. It is also harmless to leave running: it blocks on
+	 * elm327_cmd_queue WITHOUT the UART lock, and after boot nothing feeds that queue unless an
+	 * ELM client is actually driving us. */
     TaskHandle_t uart1_event_task_handle = xTaskCreateStatic(
         uart1_event_task,
         "uart1_event_task",
@@ -3383,7 +3665,31 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
         uart1_event_task_stack,
         &uart1_event_task_buffer
     );
-    
+    if (uart1_event_task_handle == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create uart1_event_task");
+        heap_caps_free(uart1_event_task_stack);
+        uart1_event_task_stack = NULL;
+    }
+
+	/* elm327_read_task is the ONLY optional one -- see elm327_set_read_task_enabled() in elm327.h
+	 * for the full story. It forwards unsolicited chip output to a connected ELM327 client, and
+	 * under poll_log/fast_log no client can reach us, so it serves nobody while still taking the
+	 * shared UART lock on every byte the chip emits. Not creating it also gives back its 16 KB of
+	 * internal RAM. */
+	if(!s_read_task_enabled)
+	{
+		ESP_LOGW(TAG, "elm327_read_task NOT started (no ELM client possible in this protocol)");
+		return;
+	}
+
+	elm327_read_task_stack = heap_caps_malloc((2048*2) * sizeof(StackType_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    if (elm327_read_task_stack == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate elm327_read_task stack");
+        return;
+    }
+
     TaskHandle_t elm327_read_task_handle = xTaskCreateStatic(
         elm327_read_task,
         "elm327_read_task",
@@ -3393,12 +3699,12 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
         elm327_read_task_stack,
         &elm327_read_task_buffer
     );
-    
-    if (uart1_event_task_handle == NULL || elm327_read_task_handle == NULL)
+
+    if (elm327_read_task_handle == NULL)
     {
-        ESP_LOGE(TAG, "Failed to create tasks");
-        if (uart1_event_task_handle == NULL) heap_caps_free(uart1_event_task_stack);
-        if (elm327_read_task_handle == NULL) heap_caps_free(elm327_read_task_stack);
+        ESP_LOGE(TAG, "Failed to create elm327_read_task");
+        heap_caps_free(elm327_read_task_stack);
+        elm327_read_task_stack = NULL;
     }
 
 }
