@@ -2344,6 +2344,11 @@ static const httpd_uri_t poll_status_uri = {
  *   uptime_ms   -- proves a wake RESUMED (uptime keeps climbing) rather than rebooted.
  *   fence       -- the #88 sleep fence; must be false while awake or the producers stay parked.
  *   can_enabled -- the bus really came back.
+ *   sys_evt_stack_free
+ *               -- headroom left on the ESP-IDF system event task (#112). Its size is a Kconfig
+ *                  guess, its callers are other people's callbacks, and at 2304 B it overflowed
+ *                  and boot-looped a real device. This is the number that makes "4608 fits" a
+ *                  measurement instead of a hope.
  * ------------------------------------------------------------------------------------------ */
 static esp_err_t wake_probe_handler(httpd_req_t *req)
 {
@@ -2358,17 +2363,29 @@ static esp_err_t wake_probe_handler(httpd_req_t *req)
     const unsigned sleep_hw = sleep_task ? (unsigned)(uxTaskGetStackHighWaterMark(sleep_task) * sizeof(StackType_t))
                                          : 0u;
 
-    char body[320];
+    /* Same reading, for the ESP-IDF system event task (#112). Sized by
+     * CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE -- a number nobody measured until this field existed.
+     * At 2304 it overflowed and boot-looped a device until safe-mode rescue; it is 4608 now, and
+     * this is how anyone checks that is still enough. 0 means the lookup failed, not "no headroom".
+     * The high-water mark is a HISTORIC MINIMUM, so reading it here, long after the deep path ran,
+     * still reports that path's worst case. */
+    const TaskHandle_t evt_task = xTaskGetHandle("sys_evt");        /* IDF's default event loop */
+    const unsigned evt_hw = evt_task ? (unsigned)(uxTaskGetStackHighWaterMark(evt_task) * sizeof(StackType_t))
+                                     : 0u;
+
+    char body[384];
     snprintf(body, sizeof(body),
              "{\"uptime_ms\":%lld,\"chip\":\"%s\",\"fence\":%s,\"can_enabled\":%s,"
-             "\"free_heap\":%u,\"largest_block\":%u,\"sleep_task_stack_free\":%u}",
+             "\"free_heap\":%u,\"largest_block\":%u,\"sleep_task_stack_free\":%u,"
+             "\"sys_evt_stack_free\":%u}",
              esp_timer_get_time() / 1000,
              (chip == ELM327_READY) ? "ready" : "sleep",
              can_sleep_fence_active() ? "true" : "false",
              can_is_enabled() ? "true" : "false",
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             sleep_hw);
+             sleep_hw,
+             evt_hw);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, body);
