@@ -128,13 +128,18 @@ bool event_log_bringup_skipped(void);
 // !! ints, one short buffer, plus the time -- see event_log_emit_at below), hand them to a task
 // !! that owns its own stack, and format there. components/wifi_diag/wifi_diag.c is the worked
 // !! example.
+// !!
+// !! This is ENFORCED, not merely requested: every emit checks its own caller, and a violation
+// !! counts up in GET /event_log/status as "bad_ctx" and prints an ESP_LOGE naming the task and
+// !! the event code. It does not abort -- a diagnostic must never brick the device.
 void event_log_emit(event_log_code_t code, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 // Same as event_log_emit(), but stamped with the time the event HAPPENED instead of the time the
 // line is formatted. For deferred emitters: capture tv (gettimeofday) and up_ms
 // (esp_timer_get_time()/1000) at the event, format later from a task with a real stack. The
 // rendered line is byte-identical in shape to event_log_emit()'s -- same fields, same "unsynced"
-// rule for a pre-SNTP clock. Passing tv == NULL means "now" and is exactly event_log_emit().
+// rule for a pre-SNTP clock. Passing tv == NULL means "now" and is exactly event_log_emit(); the
+// up_ms argument is ignored in that case.
 void event_log_emit_at(event_log_code_t code, const struct timeval *tv, int64_t up_ms,
                        const char *fmt, ...) __attribute__((format(printf, 4, 5)));
 

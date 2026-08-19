@@ -64,8 +64,9 @@ static const char *TAG = "wifi_diag";
 
 // Depth of the fact ring the event hooks write and this task drains (#111). The measured worst
 // burst was 8 attempts + 3 drops + 2 associations in 45 s; the ring only has to survive ONE drain
-// interval (1 s), so 16 covers the real burst rate many times over. 16 x ~100 B is ~1.6 KB of
-// static .bss -- internal RAM, allocated at link time, so it cannot fail to come up.
+// interval (1 s), so 16 covers the real burst rate many times over. A wd_fact_t is ~112 B once
+// padded, so the ring is under 2 KB of static .bss -- internal RAM, allocated at link time, so it
+// cannot fail to come up. The size is pinned by a _Static_assert below rather than trusted.
 #define WD_FACT_RING_N      16
 
 // Re-emitting an identical disconnect reason to the shared event log at most this often. A device
@@ -180,17 +181,16 @@ typedef struct {
 static wd_evt_t s_evt[WD_EVT_RING_N];
 static uint32_t s_evt_head;
 
-// Fact ring (#111).
-//
-// The five wifi_diag_note_* hooks run on the system event task, whose stack this component does
-// not own and which is small. Formatting there overflowed it and boot-looped a device (see the
-// warning above the hooks). So a hook now writes down the BARE FACTS -- an enum, a few ints, one
-// short SSID copy, and the time it happened -- and the sampler task turns them into text later,
-// on a stack sized for the job.
+// Fact ring (#111). A hook writes down the BARE FACTS; the sampler task turns them into text
+// later, on a stack sized for the job. Why this exists at all: see the WARNING above the hooks.
 //
 // Deliberately raw: no string is built here, not even the masked SSID. Every field is either a
 // scalar or a fixed buffer copied with strlcpy/memcpy, so a push costs a struct copy and nothing
 // that reaches into newlib.
+//
+// A ring rather than a FreeRTOS queue because the policy is inverted: a full queue rejects the
+// NEWEST item, and for a forensic trail the newest link event is the one worth keeping. Dropping
+// the oldest also keeps the producer's cost constant, which is the whole point on this stack.
 typedef enum {
     WD_FACT_ATTEMPT, WD_FACT_CONNECTED, WD_FACT_GOT_IP,
     WD_FACT_DISCONNECTED, WD_FACT_BAN
@@ -203,8 +203,10 @@ typedef struct {
     uint8_t  bssid[6];          // CONNECTED
     bool     has_bssid;
     bool     link_was_up;       // DISCONNECTED: rssi_at_drop / held_s are meaningful
-    bool     emit_evl;          // DISCONNECTED: throttle verdict, decided at capture
-    bool     evl_gated;         // ATTEMPT: debug was OFF at capture -> timeline only, no event log
+    bool     emit_evl;          // does this fact ALSO reach the event log? Decided at capture,
+                                // because it depends on when the event happened: the debug flag's
+                                // value for ATTEMPT, the throttle verdict for DISCONNECTED, always
+                                // true for the rest. The report timeline is never gated.
     int8_t   rssi_at_drop;      // DISCONNECTED
     uint32_t held_s;            // DISCONNECTED
     uint32_t suppressed;        // DISCONNECTED: throttle carry-over
@@ -216,10 +218,11 @@ typedef struct {
     int64_t  up_ms;             // uptime AT THE EVENT
 } wd_fact_t;
 
-// head/tail are monotonic counts, never wrapped: head - tail is how many facts are waiting. A
-// drainer CLAIMS a fact by copying it out and advancing the tail inside the lock, so the sampler
-// and an HTTP handler draining at the same time can never format the same fact twice.
+// head/tail are monotonic counts, never wrapped: head - tail is how many facts are waiting.
 static wd_fact_t s_facts[WD_FACT_RING_N];
+/* Keeps the comment above honest and stops a casually-added field from quietly costing kilobytes
+ * of internal RAM -- the same RAM this component's own low-memory finding watches. */
+_Static_assert(sizeof(s_facts) <= 2048, "wifi_diag fact ring outgrew its 2 KB budget");
 static uint32_t  s_fact_head;
 static uint32_t  s_fact_tail;
 static uint32_t  s_fact_dropped;        // facts overwritten before anyone formatted them
@@ -393,15 +396,13 @@ static void wd_evt_push(uint32_t up_s, const char *ssid, const uint8_t *bssid, c
     vsnprintf(text, sizeof(text), fmt, ap);
     va_end(ap);
 
-    uint32_t up = up_s;
-
     portENTER_CRITICAL(&s_lock);
     uint32_t idx = s_evt_head % WD_EVT_RING_N;
     strlcpy(s_evt[idx].text, text, sizeof(s_evt[idx].text));
     strlcpy(s_evt[idx].ssid, (ssid != NULL) ? ssid : "", sizeof(s_evt[idx].ssid));
     s_evt[idx].has_bssid = (bssid != NULL);
     if (bssid != NULL) memcpy(s_evt[idx].bssid, bssid, 6);
-    s_evt[idx].up_s = up;
+    s_evt[idx].up_s = up_s;
     s_evt_head++;
     s_evt[idx].seq = s_evt_head;
     portEXIT_CRITICAL(&s_lock);
@@ -470,16 +471,16 @@ static void wd_tally_add(uint8_t reason)
 
 // ---- Fact capture and drain (#111) ---------------------------------------------------------------
 
-// Start a fact. Called on the system event task, so this is deliberately three stores and two
-// clock reads -- gettimeofday and esp_timer_get_time are cheap syscalls, not newlib formatting.
-// The time is taken HERE so the line that gets written a second later still says when the event
-// happened (event_log_emit_at, wd_evt_push's up_s).
-static void wd_fact_begin(wd_fact_t *f, wd_fact_kind_t kind)
+// Start a fact. Called on the system event task, so: two clock reads and a copy, no formatting.
+// The time is taken HERE so the line written a second later still says when the event happened
+// (event_log_emit_at, wd_evt_push's up_s). `ssid` may be NULL for the kinds that carry none.
+static void wd_fact_begin(wd_fact_t *f, wd_fact_kind_t kind, const char *ssid)
 {
     memset(f, 0, sizeof(*f));
     f->kind = (uint8_t)kind;
     f->up_ms = wd_up_ms();
     gettimeofday(&f->tv, NULL);
+    strlcpy(f->ssid, (ssid != NULL) ? ssid : "", sizeof(f->ssid));
 }
 
 // Queue a fact for the drain. NEVER BLOCKS AND NEVER RETRIES: the caller is the system event task,
@@ -526,17 +527,22 @@ static bool wd_fact_pop(wd_fact_t *out)
 static void wd_fact_format(const wd_fact_t *f)
 {
     const uint32_t up_s = (uint32_t)(f->up_ms / 1000);
+
+    // Masked once, up here, for every kind -- including the ones that carry no SSID (they get
+    // "(none)" and never use it). Costing one snprintf on a 1 Hz task buys the property that a
+    // case added below CANNOT reach the event log with a raw SSID by forgetting a line, which is
+    // the invariant tools/webtest/wifi_diag.test.mjs polices from the outside.
     char m[48];
+    wd_mask_ssid(f->ssid, m, sizeof(m));
 
     switch ((wd_fact_kind_t)f->kind)
     {
         case WD_FACT_ATTEMPT:
             wd_evt_push(up_s, f->ssid, NULL, "attempt  ");
-            // Chatty by nature: a failing device retries every few seconds. Ring-only unless the
-            // debug flag was on when the attempt happened (f->evl_gated, read at capture).
-            if (!f->evl_gated)
+            // Chatty by nature: a failing device retries every few seconds. Timeline-only unless
+            // the debug flag was on when the attempt happened (emit_evl, decided at capture).
+            if (f->emit_evl)
             {
-                wd_mask_ssid(f->ssid, m, sizeof(m));
                 event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "attempt ssid=%s", m);
             }
             break;
@@ -550,9 +556,11 @@ static void wd_fact_format(const wd_fact_t *f)
             // sends people there to read the WIFI lines. Masking only the newer, showier route
             // while the persisted one published the network name in full would make the "safe to
             // paste in public" promise worthless.
-            wd_mask_ssid(f->ssid, m, sizeof(m));
-            event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "associated ssid=%s ch=%u",
-                              m, (unsigned)f->channel);
+            if (f->emit_evl)
+            {
+                event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "associated ssid=%s ch=%u",
+                                  m, (unsigned)f->channel);
+            }
             break;
 
         case WD_FACT_GOT_IP:
@@ -564,13 +572,19 @@ static void wd_fact_format(const wd_fact_t *f)
             {
                 wd_evt_push(up_s, NULL, NULL, "got IP    %s after %u ms",
                             f->ip, (unsigned)f->ttc_ms);
-                event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "got IP %s (connect took %u ms)",
-                                  f->ip, (unsigned)f->ttc_ms);
+                if (f->emit_evl)
+                {
+                    event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "got IP %s (connect took %u ms)",
+                                      f->ip, (unsigned)f->ttc_ms);
+                }
             }
             else
             {
                 wd_evt_push(up_s, NULL, NULL, "got IP    %s", f->ip);
-                event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "got IP %s", f->ip);
+                if (f->emit_evl)
+                {
+                    event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "got IP %s", f->ip);
+                }
             }
             break;
 
@@ -615,17 +629,20 @@ static void wd_fact_format(const wd_fact_t *f)
             // Always logged: a banned SSID is invisible everywhere else and presents to the user
             // as an unexplained refusal to connect. Masked for the same reason as the association
             // line above.
-            wd_mask_ssid(f->ssid, m, sizeof(m));
-            event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms,
-                              "SSID %s banned for %us after repeated auth failures",
-                              m, (unsigned)(f->ban_ms / 1000));
+            if (f->emit_evl)
+            {
+                event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms,
+                                  "SSID %s banned for %us after repeated auth failures",
+                                  m, (unsigned)(f->ban_ms / 1000));
+            }
             break;
     }
 }
 
-// Format everything waiting. Called once per sampler tick and again by each HTTP handler -- the
-// handler call is what keeps the evidence coming if the sampler task failed to start
-// (wifi_diag_init says the hooks work without it, and this is how that stays true).
+// Format everything waiting. Called once per sampler tick, and by the two HTTP handlers ONLY when
+// the sampler failed to start (s_no_sampler) -- that is what keeps wifi_diag_init's promise that
+// the hooks still work without it. Drain latency is therefore WD_SAMPLE_MS: the sampling cadence
+// doing double duty. They coincide today; if either moves, say why.
 static void wd_drain_facts(void)
 {
     wd_fact_t f;
@@ -634,8 +651,9 @@ static void wd_drain_facts(void)
         wd_fact_format(&f);
     }
 
-    // Report losses, at most one line per WD_EVL_REPEAT_MS so a pathological burst cannot flood
-    // events.log with complaints about a flood.
+    // Report losses, at most one line per WD_EVL_REPEAT_MS. The drain already runs at 1 Hz and
+    // only warns when the count CHANGED, so the timer is not what stops a flood -- it stops a
+    // sustained storm reporting itself once a second for as long as it lasts.
     uint32_t dropped;
     bool say = false;
     const int64_t now = wd_up_ms();
@@ -653,7 +671,7 @@ static void wd_drain_facts(void)
 
     if (say)
     {
-        event_log_emit(EVL_WARN, "wifi_diag: %u link events lost before formatting",
+        event_log_emit(EVL_WARN, "wifi_diag: %u link events lost before formatting (total)",
                        (unsigned)dropped);
     }
 }
@@ -687,12 +705,11 @@ static void wd_drain_facts(void)
 void wifi_diag_note_attempt(const char *ssid)
 {
     wd_fact_t f;
-    wd_fact_begin(&f, WD_FACT_ATTEMPT);
-    strlcpy(f.ssid, (ssid != NULL) ? ssid : "", sizeof(f.ssid));
+    wd_fact_begin(&f, WD_FACT_ATTEMPT, ssid);
     // The debug gate is read HERE, not at format time, so the line is gated by what the setting
     // was when the attempt happened -- exactly what EVENT_LOG_DEBUG used to do at this spot. The
     // fact is queued either way: the report timeline was never debug-gated.
-    f.evl_gated = !event_log_debug_enabled();
+    f.emit_evl = event_log_debug_enabled();
 
     portENTER_CRITICAL(&s_lock);
     s_attempt_start_ms = f.up_ms;
@@ -704,8 +721,8 @@ void wifi_diag_note_attempt(const char *ssid)
 void wifi_diag_note_connected(const char *ssid, const uint8_t *bssid, uint8_t channel)
 {
     wd_fact_t f;
-    wd_fact_begin(&f, WD_FACT_CONNECTED);
-    strlcpy(f.ssid, (ssid != NULL) ? ssid : "", sizeof(f.ssid));
+    wd_fact_begin(&f, WD_FACT_CONNECTED, ssid);
+    f.emit_evl = true;
     f.channel = channel;
     if (bssid != NULL)
     {
@@ -723,7 +740,8 @@ void wifi_diag_note_connected(const char *ssid, const uint8_t *bssid, uint8_t ch
 void wifi_diag_note_got_ip(const char *ip)
 {
     wd_fact_t f;
-    wd_fact_begin(&f, WD_FACT_GOT_IP);
+    wd_fact_begin(&f, WD_FACT_GOT_IP, NULL);
+    f.emit_evl = true;
     strlcpy(f.ip, (ip != NULL) ? ip : "?", sizeof(f.ip));
 
     portENTER_CRITICAL(&s_lock);
@@ -748,8 +766,7 @@ void wifi_diag_note_got_ip(const char *ip)
 void wifi_diag_note_disconnected(const char *ssid, uint8_t reason)
 {
     wd_fact_t f;
-    wd_fact_begin(&f, WD_FACT_DISCONNECTED);
-    strlcpy(f.ssid, (ssid != NULL) ? ssid : "", sizeof(f.ssid));
+    wd_fact_begin(&f, WD_FACT_DISCONNECTED, ssid);
     f.reason = reason;
 
     const int64_t now = f.up_ms;
@@ -798,8 +815,8 @@ void wifi_diag_note_disconnected(const char *ssid, uint8_t reason)
 void wifi_diag_note_ban(const char *ssid, uint32_t ms)
 {
     wd_fact_t f;
-    wd_fact_begin(&f, WD_FACT_BAN);
-    strlcpy(f.ssid, (ssid != NULL) ? ssid : "", sizeof(f.ssid));
+    wd_fact_begin(&f, WD_FACT_BAN, ssid);
+    f.emit_evl = true;
     f.ban_ms = ms;
 
     portENTER_CRITICAL(&s_lock);
@@ -840,8 +857,18 @@ static bool         s_sys_evt_stack_warned = false;
 /* This task's own handle, kept for the same reason #112 keeps sys_evt's: WD_TASK_STACK was raised
  * to 4608 by reasoning about what the drain costs, not by measuring it, and #111 would be a poor
  * trade if it moved the overflow from sys_evt onto this task instead. Reported as
- * mem.task_stack_free in the JSON so the guess can be checked on a real device. */
+ * mem.task_stack_free in the JSON so the guess can be checked on a real device.
+ *
+ * Taken from xTaskCreate's out-parameter rather than assigned inside the task, so NULL means
+ * exactly one thing -- the sampler never started -- and not "has not been scheduled yet". */
 static TaskHandle_t s_self = NULL;
+
+/* Set when the sampler failed to start. The two HTTP handlers then drain the fact ring themselves,
+ * which is the ONLY way link events reach the event log on such a boot (see wifi_diag_init). With
+ * a healthy sampler they must not: draining there would spend the formatting cost -- ~800 B of
+ * stack and up to 16 facts' worth of vsnprintf -- on the httpd task, for data that is at most one
+ * second stale anyway. That is the same "work on someone else's stack" habit #111 exists to end. */
+static bool s_no_sampler = false;
 
 /* Read sys_evt's stack headroom and complain ONCE if it is near the edge (#112).
  *
@@ -1007,7 +1034,6 @@ static void wd_sample_once(void)
 static void wd_sampler_task(void *arg)
 {
     (void)arg;
-    s_self = xTaskGetCurrentTaskHandle();
     for (;;)
     {
         wd_drain_facts();   // format what the event task captured, on THIS stack (#111)
@@ -1024,11 +1050,18 @@ void wifi_diag_init(void)
     }
     s_inited = true;
 
-    if (xTaskCreate(wd_sampler_task, "wifi_diag", WD_TASK_STACK, NULL, WD_TASK_PRIO, NULL) != pdPASS)
+    if (xTaskCreate(wd_sampler_task, "wifi_diag", WD_TASK_STACK, NULL, WD_TASK_PRIO, &s_self)
+        != pdPASS)
     {
-        // Not fatal and deliberately not retried: the event hooks (the forensic half) work without
-        // the sampler, so a failure here costs the aggregates, not the disconnect record.
-        ESP_LOGE(TAG, "sampler task create failed - link events still recorded, aggregates disabled");
+        s_no_sampler = true;
+        // Not fatal and deliberately not retried: the event hooks (the forensic half) keep
+        // capturing without the sampler, so a failure here costs the aggregates, not the record.
+        // Since #111 the catch is that captured facts are only FORMATTED by a drainer, and with no
+        // sampler the only drainer left is an HTTP request -- so on this boot the SD event log
+        // gets its Wi-Fi lines when someone opens /wifi_diag, and the 16-deep ring is what
+        // survives until they do.
+        ESP_LOGE(TAG, "sampler task create failed - link events still captured, but only written "
+                      "to the event log when /wifi_diag is opened; aggregates disabled");
         return;
     }
     ESP_LOGI(TAG, "wifi diagnostics started (%d Hz sampler, %d-event ring)",
@@ -1266,7 +1299,7 @@ static char *wd_out_alloc(httpd_req_t *req, size_t *cap_out)
 
 static esp_err_t wd_send_report(httpd_req_t *req)
 {
-    wd_drain_facts();   // so the timeline is current even if the sampler task never started
+    if (s_no_sampler) wd_drain_facts();   // no sampler: this request is the only drainer left
 
     // ?raw=1 unmasks the SSID/BSSID. Masked by default: the entire point of this report is that it
     // gets pasted into a public issue, and a default that leaks the user's network name would be
@@ -1554,7 +1587,7 @@ static void wd_json_str(wd_out_t *o, const char *s)
 
 static esp_err_t wd_send_json(httpd_req_t *req)
 {
-    wd_drain_facts();   // same reason as wd_send_report
+    if (s_no_sampler) wd_drain_facts();   // same reason as wd_send_report
 
     size_t cap;
     char *buf = wd_out_alloc(req, &cap);

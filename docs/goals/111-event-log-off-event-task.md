@@ -441,7 +441,11 @@ exists without its tripwire — the only ordering rules left are *within* the re
   `static` array (no `heap_caps_malloc`/`malloc` in the new mechanism).
 - **AC8 — no other callers touched:** check:
   `git diff --stat` shown in the transcript touches only `components/event_log/*`,
-  `components/wifi_diag/*`, `docs/*`, and (if the JSON field needs it) `main/wifi_mgr.c` —
+  `components/wifi_diag/*`, `docs/*`, `tools/webtest/wifi_diag.test.mjs`, and (if the JSON field
+  needs it) `main/wifi_mgr.c` — the webtest is in the list because it parses `wd_evt_push()` call
+  sites to enforce the privacy invariant, and Stage 2 gives that function an `up_s` first
+  argument; leaving the test unchanged would make it misread which argument is the format string,
+  so updating it is required to KEEP the guard working, not to relax it —
   no csv_logger/poll_log/sleep_mode/can_wake/crash_report changes, and **no diff hunks in
   `main/config_server.c`** (the /wake_probe piece does not move, §2.8).
 - **AC9 — device proof (bench, transcript-visible):** after OTA-flashing the build to the
