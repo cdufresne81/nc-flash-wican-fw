@@ -1720,6 +1720,15 @@
                             <div style="color:#6b7280;margin-top:4px;font-size:12px">Auto logs at the fastest rate your PID list allows: the device measures the real polling round-trip over all PIDs and matches the row rate to it (1&ndash;100 Hz), so every row carries fresh polled values &mdash; no duplicates, no gaps. Broadcast channels update faster than that and are always fresh at any rate.</div>
                         </td>
                     </tr>
+                    <!-- Time zone (issue #91). Options are injected from TZ_TABLE in
+                         main.js so the zone list lives in exactly one place. -->
+                    <tr>
+                        <td>Time Zone:</td>
+                        <td>
+                            <select id="timezone" name="timezone" onchange="submit_enable();"></select>
+                            <div style="color:#6b7280;margin-top:4px;font-size:12px">Sets the local time used for log file names, the timestamps inside the logs, and the file dates on the SD card. Changing it reboots the device. Files written before the change keep their old names, and their date in the file list may look shifted by the time difference.</div>
+                        </td>
+                    </tr>
                 </tbody>
             </table>
             <div id="automate">

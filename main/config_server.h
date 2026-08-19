@@ -172,6 +172,7 @@ typedef struct _device_config
 	char csv_require_engine[16]; // gate CSV logging on engine running (ECU answering): "enable" | "disable"
 	char imu_threshold[16];
 	char led_blink[16];       // activity-LED blink toggle: "enable" (default) blinks while active, "disable" holds a solid color
+	char timezone[64];        // POSIX TZ string for local wall-clock rendering, e.g. "PST8PDT,M3.2.0,M11.1.0" (issue #91)
 	bool debug_enabled;
 }device_config_t;
 

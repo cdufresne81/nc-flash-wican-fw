@@ -13,7 +13,9 @@ esp_err_t rtcm_get_date(uint8_t *year, uint8_t *month, uint8_t *day, uint8_t *we
 esp_err_t rtcm_set_date(uint8_t year, uint8_t month, uint8_t day, uint8_t weekday);
 esp_err_t rtcm_get_device_id(uint8_t *id);
 esp_err_t rtcm_sync_internet_time(void);
-esp_err_t rtcm_get_timezone(int *timezone_offset);
+/* rtcm_get_timezone() removed with issue #91: it was the never-implemented
+ * leftover of the old worldtimeapi.org offset lookup. The zone now comes from
+ * the "timezone" config key, applied in sync_sys_time_apply_tz(). */
 esp_err_t rtcm_get_iso8601_time(char *timestamp, size_t max_len);
 time_t rtcm_bcd_to_unix_timestamp(uint8_t hour, uint8_t min, uint8_t sec, 
 uint8_t year, uint8_t month, uint8_t day);

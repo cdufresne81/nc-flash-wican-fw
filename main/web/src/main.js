@@ -214,7 +214,9 @@ async function checkFirmwareUpdate() {
             return fallback;
         }
 
-        return date.toLocaleString();
+        // Device timestamp, so show it in the device's zone like the file dates
+        // do (issue #91). Falls back to the browser zone when the zone is unknown.
+        return date.toLocaleString(undefined, deviceTzIana ? { timeZone: deviceTzIana } : undefined);
     }
 
     function toggleApStationWarning() {
@@ -2652,10 +2654,31 @@ function filesFmtSize(b) {
     return (b / 1073741824).toFixed(2) + ' GB';
 }
 
+var filesDateFmt = null;   // cached Intl formatter, reset by tzApplyStored()
+// Render file dates in the DEVICE's time zone, not the browser's (issue #91).
+// deviceTzIana is set by Load() from the stored POSIX zone; when it is null
+// (zone not in TZ_TABLE, or config not loaded yet) we fall back to the browser
+// zone, which is the behavior this had before.
 function filesFmtDate(mtime) {
     if (!mtime) return '';
     var d = new Date(mtime * 1000);
     if (isNaN(d.getTime())) return '';
+    if (deviceTzIana) {
+        try {
+            // Built once and cached: the file list re-renders every row on each
+            // sort click, and constructing a DateTimeFormat is ~20x the cost of
+            // using one. tzApplyStored() clears the cache when the zone changes.
+            if (!filesDateFmt) {
+                // 'sv-SE' gives YYYY-MM-DD HH:MM, matching the manual format below.
+                filesDateFmt = new Intl.DateTimeFormat('sv-SE', {
+                    timeZone: deviceTzIana,
+                    year: 'numeric', month: '2-digit', day: '2-digit',
+                    hour: '2-digit', minute: '2-digit', hour12: false
+                });
+            }
+            return filesDateFmt.format(d);
+        } catch (e) { /* unknown zone or old browser: fall through */ }
+    }
     function p(n) { return (n < 10 ? '0' : '') + n; }
     return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
            ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
@@ -3394,6 +3417,10 @@ async function postConfig() {
         ? "auto" : document.getElementById("csv_grid_hz").value;
     obj["csv_require_engine"] = document.getElementById("csv_require_engine").value;
     obj["led_blink"] = document.getElementById("led_blink").checked ? "enable" : "disable";
+    // Local time zone (issue #91): a POSIX TZ string. Not in the live-apply
+    // whitelist, so changing it reboots -- which is what we want, since tzset()
+    // would otherwise race the logger tasks and split an open CSV across zones.
+    obj["timezone"] = document.getElementById("timezone").value || TZ_DEFAULT_POSIX;
 
     // Collect fallback networks (max 5)
     try {
@@ -3821,6 +3848,114 @@ var PASSTHROUGH_KEYS = ["can_datarate", "can_mode", "imu_threshold", "log_period
     "home_ssid", "home_password", "home_security", "home_protocol",
     "drive_ssid", "drive_password", "drive_security", "drive_protocol",
     "drive_connection_type", "drive_mode_timeout"];
+// ---- Time zones (issue #91) -------------------------------------------------
+// The device stores a POSIX TZ string, because ESP-IDF's newlib understands
+// POSIX rules and has no IANA database. This table is the single place the
+// human-readable list lives; `iana` exists only so the browser can render
+// device timestamps with Intl (which understands IANA, not POSIX).
+// Rules are current for 2026. Zones marked UNSTABLE are set by government
+// decree at short notice and may need updating. Zones whose DST follows
+// Ramadan (Morocco, Lebanon, Palestine, Syria) are deliberately absent:
+// POSIX cannot express those rules at all, so a wrong entry is worse than none.
+var TZ_TABLE = [
+    { group: "UTC",              label: "UTC",                                  posix: "UTC0",                                  iana: "UTC" },
+
+    { group: "Americas",         label: "Hawaii",                               posix: "HST10",                                 iana: "Pacific/Honolulu" },
+    { group: "Americas",         label: "Alaska",                               posix: "AKST9AKDT,M3.2.0,M11.1.0",              iana: "America/Anchorage" },
+    { group: "Americas",         label: "US/Canada Pacific",                    posix: "PST8PDT,M3.2.0,M11.1.0",                iana: "America/Los_Angeles" },
+    { group: "Americas",         label: "US/Canada Mountain",                   posix: "MST7MDT,M3.2.0,M11.1.0",                iana: "America/Denver" },
+    { group: "Americas",         label: "Arizona (no DST)",                     posix: "MST7",                                  iana: "America/Phoenix" },
+    { group: "Americas",         label: "US/Canada Central",                    posix: "CST6CDT,M3.2.0,M11.1.0",                iana: "America/Chicago" },
+    { group: "Americas",         label: "Mexico City (no DST)",                 posix: "CST6",                                  iana: "America/Mexico_City" },
+    { group: "Americas",         label: "US/Canada Eastern",                    posix: "EST5EDT,M3.2.0,M11.1.0",                iana: "America/New_York" },
+    { group: "Americas",         label: "Colombia / Peru / Ecuador",            posix: "COT5",                                  iana: "America/Bogota" },
+    { group: "Americas",         label: "Atlantic Canada",                      posix: "AST4ADT,M3.2.0,M11.1.0",                iana: "America/Halifax" },
+    { group: "Americas",         label: "Venezuela",                            posix: "VET4",                                  iana: "America/Caracas" },
+    { group: "Americas",         label: "Bolivia",                              posix: "BOT4",                                  iana: "America/La_Paz" },
+    { group: "Americas",         label: "Newfoundland",                         posix: "NST3:30NDT,M3.2.0,M11.1.0",             iana: "America/St_Johns" },
+    { group: "Americas",         label: "Brazil (Sao Paulo, no DST)",           posix: "BRT3",                                  iana: "America/Sao_Paulo" },
+    { group: "Americas",         label: "Argentina / Uruguay",                  posix: "ART3",                                  iana: "America/Argentina/Buenos_Aires" },
+    { group: "Americas",         label: "Chile (Santiago)",                     posix: "CLT4CLST,M9.1.6/24,M4.1.6/24",          iana: "America/Santiago" }, // UNSTABLE
+
+    { group: "Europe",           label: "Iceland",                              posix: "GMT0",                                  iana: "Atlantic/Reykjavik" },
+    { group: "Europe",           label: "UK / Ireland / Portugal",              posix: "GMT0BST,M3.5.0/1,M10.5.0",              iana: "Europe/London" },
+    { group: "Europe",           label: "Central Europe (Paris, Berlin, Rome)", posix: "CET-1CEST,M3.5.0,M10.5.0/3",            iana: "Europe/Paris" },
+    { group: "Europe",           label: "Eastern Europe (Helsinki, Athens)",    posix: "EET-2EEST,M3.5.0/3,M10.5.0/4",          iana: "Europe/Helsinki" },
+    { group: "Europe",           label: "Turkey (no DST)",                      posix: "TRT-3",                                 iana: "Europe/Istanbul" },
+    { group: "Europe",           label: "Russia (Moscow, no DST)",              posix: "MSK-3",                                 iana: "Europe/Moscow" },
+
+    { group: "Africa / Mid-East", label: "West Africa (Lagos)",                 posix: "WAT-1",                                 iana: "Africa/Lagos" },
+    { group: "Africa / Mid-East", label: "South Africa",                        posix: "SAST-2",                                iana: "Africa/Johannesburg" },
+    { group: "Africa / Mid-East", label: "Egypt (Cairo)",                       posix: "EET-2EEST,M4.5.5/0,M10.5.4/24",         iana: "Africa/Cairo" }, // UNSTABLE
+    { group: "Africa / Mid-East", label: "Israel",                              posix: "IST-2IDT,M3.4.4/26,M10.5.0",            iana: "Asia/Jerusalem" },
+    { group: "Africa / Mid-East", label: "East Africa (Nairobi)",               posix: "EAT-3",                                 iana: "Africa/Nairobi" },
+    { group: "Africa / Mid-East", label: "Gulf (Dubai, Abu Dhabi)",             posix: "GST-4",                                 iana: "Asia/Dubai" },
+    { group: "Africa / Mid-East", label: "Iran (no DST)",                       posix: "IRST-3:30",                             iana: "Asia/Tehran" },
+
+    { group: "Asia",             label: "Pakistan",                             posix: "PKT-5",                                 iana: "Asia/Karachi" },
+    { group: "Asia",             label: "India / Sri Lanka",                    posix: "IST-5:30",                              iana: "Asia/Kolkata" },
+    { group: "Asia",             label: "Nepal",                                posix: "NPT-5:45",                              iana: "Asia/Kathmandu" },
+    { group: "Asia",             label: "Bangladesh",                           posix: "BDT-6",                                 iana: "Asia/Dhaka" },
+    { group: "Asia",             label: "Myanmar",                              posix: "MMT-6:30",                              iana: "Asia/Yangon" },
+    { group: "Asia",             label: "SE Asia (Bangkok, Hanoi, Jakarta)",    posix: "ICT-7",                                 iana: "Asia/Bangkok" },
+    { group: "Asia",             label: "China / Singapore / Hong Kong",        posix: "CST-8",                                 iana: "Asia/Shanghai" },
+    { group: "Asia",             label: "Japan",                                posix: "JST-9",                                 iana: "Asia/Tokyo" },
+    { group: "Asia",             label: "South Korea",                          posix: "KST-9",                                 iana: "Asia/Seoul" },
+
+    { group: "Australia / Pacific", label: "Perth",                             posix: "AWST-8",                                iana: "Australia/Perth" },
+    { group: "Australia / Pacific", label: "Darwin (no DST)",                   posix: "ACST-9:30",                             iana: "Australia/Darwin" },
+    { group: "Australia / Pacific", label: "Adelaide",                          posix: "ACST-9:30ACDT,M10.1.0,M4.1.0/3",        iana: "Australia/Adelaide" },
+    { group: "Australia / Pacific", label: "Brisbane (no DST)",                 posix: "AEST-10",                               iana: "Australia/Brisbane" },
+    { group: "Australia / Pacific", label: "Sydney / Melbourne / Hobart",       posix: "AEST-10AEDT,M10.1.0,M4.1.0/3",          iana: "Australia/Sydney" },
+    { group: "Australia / Pacific", label: "New Zealand",                       posix: "NZST-12NZDT,M9.5.0,M4.1.0/3",           iana: "Pacific/Auckland" },
+    { group: "Australia / Pacific", label: "Fiji (no DST)",                     posix: "FJT-12",                                iana: "Pacific/Fiji" }  // UNSTABLE
+];
+// Matches SYNC_SYS_TIME_DEFAULT_TZ in main/sync_sys_time.h -- keep in sync.
+var TZ_DEFAULT_POSIX = "EST5EDT,M3.2.0,M11.1.0";
+// IANA name of the device's zone, used by filesFmtDate(). null = use browser zone.
+var deviceTzIana = null;
+
+// Fill the <select> from TZ_TABLE, grouped. Called by tzApplyStored(); the guard
+// makes the repeat calls free. NOTE: TZ_TABLE must stay grouped-adjacent -- a new
+// row filed under the wrong heading silently produces a duplicate optgroup.
+function tzPopulateSelect() {
+    var sel = document.getElementById("timezone");
+    if (!sel || sel.options.length) return;
+    var group = null, og = null;
+    TZ_TABLE.forEach(function(z) {
+        if (z.group !== group) {
+            group = z.group;
+            og = document.createElement("optgroup");
+            og.label = group;
+            sel.appendChild(og);
+        }
+        var o = document.createElement("option");
+        o.value = z.posix;
+        o.textContent = z.label;
+        og.appendChild(o);
+    });
+}
+
+// Apply the stored POSIX zone to the select. A value we don't know (hand-edited
+// config, or a zone dropped from a later table) gets its own option so the next
+// Submit re-sends it unchanged instead of silently snapping to Eastern.
+function tzApplyStored(posix) {
+    var sel = document.getElementById("timezone");
+    if (!sel) return;
+    tzPopulateSelect();
+    var tz = posix || TZ_DEFAULT_POSIX;
+    var known = TZ_TABLE.filter(function(z) { return z.posix === tz; })[0];
+    if (!known) {
+        var o = document.createElement("option");
+        o.value = tz;
+        o.textContent = "Custom (" + tz + ")";
+        sel.appendChild(o);
+    }
+    sel.value = tz;
+    deviceTzIana = known ? known.iana : null;
+    filesDateFmt = null;   // zone changed -- rebuild on next use
+}
+
 // Same idea for /store_auto_data (separate endpoint/lifecycle, captured in loadAutoTable):
 var loadedStdPids = [];             // re-sent by storeAutoTableData
 var loadedStandardPids = "disable"; // re-sent by storeAutoTableData
@@ -3940,6 +4075,11 @@ xhttp.onload = async function() {
 
         // Activity-LED blink toggle: default ON when the key is absent (old config).
         document.getElementById("led_blink").checked = (obj.led_blink !== "disable");
+
+        // Local time zone (issue #91): an absent key means firmware older than
+        // this feature, so show the Eastern default it was compiled with. This
+        // also sets deviceTzIana, so file dates render in the device's zone.
+        tzApplyStored(obj.timezone);
 
         const blePowerVal = ("ble_power" in obj) ? obj.ble_power : 9;
         document.getElementById("ble_power").value = blePowerVal;

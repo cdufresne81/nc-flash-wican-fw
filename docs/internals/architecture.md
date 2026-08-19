@@ -212,8 +212,16 @@ Largest files, because size predicts where the work is:
 `app_main()` at `main/main.c:558`. The order is load-bearing and several steps
 carry comments saying why — do not reorder casually.
 
-1. `sync_sys_time_apply_tz()` — **must** precede the RTC restore, `event_log`
-   and the CSV logger.
+1. `filesystem_init()` → `sync_sys_time_apply_tz()` — **must** precede the RTC
+   restore, `event_log` and the CSV logger, and must stay ahead of every task
+   we create (`tzset()` mutates shared newlib state that `localtime_r()` reads).
+   The zone is the `timezone` config key (a POSIX TZ string, issue #91), which
+   is why the internal FS is mounted here: the config server has not started,
+   so `sync_sys_time_apply_tz()` reads that one key out of `config.json` itself
+   and falls back to `SYNC_SYS_TIME_DEFAULT_TZ` (Eastern). Both calls are
+   idempotent — the later `filesystem_init()`s are no-ops. The early read is
+   strictly read-only; repairing a broken `config.json` stays
+   `config_server_load_cfg()`'s job.
 2. `dev_status_init()`, button + SD-detect GPIO, `sd_card_init()`.
    - *if SD mounted **and** button held →* `sdcard_perform_ota_update("/wican.bin")`
      — an **un-brick path** (§11).

@@ -27,15 +27,140 @@
 #include "dev_status.h"
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "cJSON.h"
+#include "hw_config.h"
 #include "sync_sys_time.h"
 #include "rtcm.h"
 
 #define TAG "SYNC_SYS_TIME"
 
+/* A sane config.json is a couple of KB; refuse anything wildly bigger rather
+ * than allocating whatever a corrupt directory entry claims. */
+#define SYNC_SYS_TIME_CFG_MAX_BYTES (16 * 1024)
+
+bool sync_sys_time_tz_is_valid(const char *tz)
+{
+    if (tz == NULL)
+    {
+        return false;
+    }
+
+    size_t len = strnlen(tz, SYNC_SYS_TIME_TZ_MAX);
+    if (len == 0 || len >= SYNC_SYS_TIME_TZ_MAX)
+    {
+        return false;
+    }
+
+    /* A POSIX zone starts with the standard-time abbreviation, either plain
+     * letters (EST5EDT) or the quoted form for numeric names (<-05>5). */
+    if (!isalpha((unsigned char)tz[0]) && tz[0] != '<')
+    {
+        return false;
+    }
+
+    bool has_digit = false;
+    for (size_t i = 0; i < len; i++)
+    {
+        unsigned char c = (unsigned char)tz[i];
+
+        if (isdigit(c))
+        {
+            has_digit = true;
+            continue;
+        }
+        if (isalpha(c) || c == '+' || c == '-' || c == ':' ||
+            c == ',' || c == '.' || c == '/' || c == '<' || c == '>')
+        {
+            continue;
+        }
+        return false;
+    }
+
+    /* Every real zone carries an offset; a letters-only string would parse to
+     * UTC and look like it worked. */
+    return has_digit;
+}
+
+/**
+ * @brief Pull just the "timezone" key out of config.json
+ *
+ * Runs before config_server_init(), so it cannot use device_config. Read-only
+ * by design: a missing or broken file is left exactly as found for
+ * config_server_load_cfg() to deal with later.
+ *
+ * @param out   destination buffer, left untouched unless a valid zone is found
+ *              -- the caller pre-seeds it with the default
+ * @param len   size of out
+ */
+static void sync_sys_time_read_tz_from_config(char *out, size_t len)
+{
+    FILE *f = fopen(FS_MOUNT_POINT"/config.json", "r");
+    if (f == NULL)
+    {
+        ESP_LOGW(TAG, "config.json not readable this early, using default TZ");
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long filesize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (filesize <= 0 || filesize > SYNC_SYS_TIME_CFG_MAX_BYTES)
+    {
+        ESP_LOGW(TAG, "config.json size %ld out of range, using default TZ", filesize);
+        fclose(f);
+        return;
+    }
+
+    /* Same allocation policy as the other reader of this file
+     * (config_server.c): PSRAM is up before app_main, and a failure here only
+     * costs us the configured zone, never the boot. */
+    char *buf = heap_caps_malloc(filesize + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL)
+    {
+        ESP_LOGE(TAG, "No memory to read config.json, using default TZ");
+        fclose(f);
+        return;
+    }
+
+    size_t got = fread(buf, sizeof(char), filesize, f);
+    buf[got] = 0;
+    fclose(f);
+
+    cJSON *root = cJSON_Parse(buf);
+    if (root != NULL)
+    {
+        cJSON *key = cJSON_GetObjectItem(root, "timezone");
+        if (cJSON_IsString(key) && sync_sys_time_tz_is_valid(key->valuestring))
+        {
+            strlcpy(out, key->valuestring, len);
+        }
+        else if (key != NULL)
+        {
+            ESP_LOGW(TAG, "Stored timezone is unusable, falling back to default");
+        }
+        cJSON_Delete(root);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "config.json did not parse, using default TZ");
+    }
+
+    free(buf);
+}
+
 void sync_sys_time_apply_tz(void)
 {
-    setenv("TZ", SYNC_SYS_TIME_LOCAL_TZ, 1);
+    char tz[SYNC_SYS_TIME_TZ_MAX];
+
+    strlcpy(tz, SYNC_SYS_TIME_DEFAULT_TZ, sizeof(tz));
+    sync_sys_time_read_tz_from_config(tz, sizeof(tz));
+
+    setenv("TZ", tz, 1);
     tzset();
+    ESP_LOGI(TAG, "TZ applied: %s", tz);
 }
 
 /**
