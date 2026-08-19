@@ -90,17 +90,17 @@ bool sync_sys_time_tz_is_valid(const char *tz)
  * by design: a missing or broken file is left exactly as found for
  * config_server_load_cfg() to deal with later.
  *
- * @param out   destination buffer, untouched unless a valid zone is found
+ * @param out   destination buffer, left untouched unless a valid zone is found
+ *              -- the caller pre-seeds it with the default
  * @param len   size of out
- * @return true when out now holds a stored, validated zone
  */
-static bool sync_sys_time_read_tz_from_config(char *out, size_t len)
+static void sync_sys_time_read_tz_from_config(char *out, size_t len)
 {
     FILE *f = fopen(FS_MOUNT_POINT"/config.json", "r");
     if (f == NULL)
     {
         ESP_LOGW(TAG, "config.json not readable this early, using default TZ");
-        return false;
+        return;
     }
 
     fseek(f, 0, SEEK_END);
@@ -111,26 +111,24 @@ static bool sync_sys_time_read_tz_from_config(char *out, size_t len)
     {
         ESP_LOGW(TAG, "config.json size %ld out of range, using default TZ", filesize);
         fclose(f);
-        return false;
+        return;
     }
 
+    /* Same allocation policy as the other reader of this file
+     * (config_server.c): PSRAM is up before app_main, and a failure here only
+     * costs us the configured zone, never the boot. */
     char *buf = heap_caps_malloc(filesize + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (buf == NULL)
-    {
-        buf = heap_caps_malloc(filesize + 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
     if (buf == NULL)
     {
         ESP_LOGE(TAG, "No memory to read config.json, using default TZ");
         fclose(f);
-        return false;
+        return;
     }
 
     size_t got = fread(buf, sizeof(char), filesize, f);
     buf[got] = 0;
     fclose(f);
 
-    bool found = false;
     cJSON *root = cJSON_Parse(buf);
     if (root != NULL)
     {
@@ -138,7 +136,6 @@ static bool sync_sys_time_read_tz_from_config(char *out, size_t len)
         if (cJSON_IsString(key) && sync_sys_time_tz_is_valid(key->valuestring))
         {
             strlcpy(out, key->valuestring, len);
-            found = true;
         }
         else if (key != NULL)
         {
@@ -152,7 +149,6 @@ static bool sync_sys_time_read_tz_from_config(char *out, size_t len)
     }
 
     free(buf);
-    return found;
 }
 
 void sync_sys_time_apply_tz(void)
@@ -160,7 +156,7 @@ void sync_sys_time_apply_tz(void)
     char tz[SYNC_SYS_TIME_TZ_MAX];
 
     strlcpy(tz, SYNC_SYS_TIME_DEFAULT_TZ, sizeof(tz));
-    (void)sync_sys_time_read_tz_from_config(tz, sizeof(tz));
+    sync_sys_time_read_tz_from_config(tz, sizeof(tz));
 
     setenv("TZ", tz, 1);
     tzset();

@@ -214,7 +214,9 @@ async function checkFirmwareUpdate() {
             return fallback;
         }
 
-        return date.toLocaleString();
+        // Device timestamp, so show it in the device's zone like the file dates
+        // do (issue #91). Falls back to the browser zone when the zone is unknown.
+        return date.toLocaleString(undefined, deviceTzIana ? { timeZone: deviceTzIana } : undefined);
     }
 
     function toggleApStationWarning() {
@@ -2652,6 +2654,7 @@ function filesFmtSize(b) {
     return (b / 1073741824).toFixed(2) + ' GB';
 }
 
+var filesDateFmt = null;   // cached Intl formatter, reset by tzApplyStored()
 // Render file dates in the DEVICE's time zone, not the browser's (issue #91).
 // deviceTzIana is set by Load() from the stored POSIX zone; when it is null
 // (zone not in TZ_TABLE, or config not loaded yet) we fall back to the browser
@@ -2662,12 +2665,18 @@ function filesFmtDate(mtime) {
     if (isNaN(d.getTime())) return '';
     if (deviceTzIana) {
         try {
-            // 'sv-SE' gives YYYY-MM-DD HH:MM, matching the manual format below.
-            return new Intl.DateTimeFormat('sv-SE', {
-                timeZone: deviceTzIana,
-                year: 'numeric', month: '2-digit', day: '2-digit',
-                hour: '2-digit', minute: '2-digit', hour12: false
-            }).format(d).replace(',', '');
+            // Built once and cached: the file list re-renders every row on each
+            // sort click, and constructing a DateTimeFormat is ~20x the cost of
+            // using one. tzApplyStored() clears the cache when the zone changes.
+            if (!filesDateFmt) {
+                // 'sv-SE' gives YYYY-MM-DD HH:MM, matching the manual format below.
+                filesDateFmt = new Intl.DateTimeFormat('sv-SE', {
+                    timeZone: deviceTzIana,
+                    year: 'numeric', month: '2-digit', day: '2-digit',
+                    hour: '2-digit', minute: '2-digit', hour12: false
+                });
+            }
+            return filesDateFmt.format(d);
         } catch (e) { /* unknown zone or old browser: fall through */ }
     }
     function p(n) { return (n < 10 ? '0' : '') + n; }
@@ -3906,8 +3915,9 @@ var TZ_DEFAULT_POSIX = "EST5EDT,M3.2.0,M11.1.0";
 // IANA name of the device's zone, used by filesFmtDate(). null = use browser zone.
 var deviceTzIana = null;
 
-// Fill the <select> from TZ_TABLE, grouped. Runs once, before Load() applies the
-// stored value.
+// Fill the <select> from TZ_TABLE, grouped. Called by tzApplyStored(); the guard
+// makes the repeat calls free. NOTE: TZ_TABLE must stay grouped-adjacent -- a new
+// row filed under the wrong heading silently produces a duplicate optgroup.
 function tzPopulateSelect() {
     var sel = document.getElementById("timezone");
     if (!sel || sel.options.length) return;
@@ -3943,6 +3953,7 @@ function tzApplyStored(posix) {
     }
     sel.value = tz;
     deviceTzIana = known ? known.iana : null;
+    filesDateFmt = null;   // zone changed -- rebuild on next use
 }
 
 // Same idea for /store_auto_data (separate endpoint/lifecycle, captured in loadAutoTable):
