@@ -1416,7 +1416,7 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
     if(!can_is_enabled())
     {
         ESP_LOGE(TAG, "resume: can_enable() failed -- falling back to reboot");
-        event_log_emit(EVL_INFO, "resume FAILED: can_enable() did not bring the bus back -- rebooting");
+        event_log_emit(EVL_WARN, "resume FAILED: can_enable() did not bring the bus back -- rebooting");
         return false;
     }
 
@@ -1450,7 +1450,7 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
         {
             ESP_LOGE(TAG, "resume: wifi_network_init() failed (%s) -- falling back to reboot",
                      esp_err_to_name(wifi_ret));
-            event_log_emit(EVL_INFO, "resume FAILED: wifi bring-up returned %s -- rebooting",
+            event_log_emit(EVL_WARN, "resume FAILED: wifi bring-up returned %s -- rebooting",
                            esp_err_to_name(wifi_ret));
             return false;
         }
@@ -1630,7 +1630,7 @@ static system_state_t sleep_mode_wake_now(sleep_state_info_t *state_info, float 
     }
 
     ESP_LOGE(TAG, "resume failed -- rebooting instead");
-    event_log_emit(EVL_INFO, "resume FAILED -> falling back to reboot");
+    event_log_emit(EVL_WARN, "resume FAILED -> falling back to reboot");
     /* Let the line reach SD; restart_tracker_restart() calls esp_restart() immediately. */
     vTaskDelay(pdMS_TO_TICKS(SLEEP_EVENT_LOG_FLUSH_MS));
     restart_tracker_restart(reason, RESTART_TRACKER_SOURCE_SLEEP_MODE, RESTART_TRACKER_FLAG_NONE);

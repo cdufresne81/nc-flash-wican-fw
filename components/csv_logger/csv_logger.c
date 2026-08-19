@@ -1648,8 +1648,12 @@ void csv_logger_start_at_boot(void)
         return;
     }
 
-    event_log_emit(EVL_INFO, "datalog writer started");
-
+    /* Deliberately silent on the happy path. There used to be a "datalog writer started" line
+     * here, and it was wrong twice over: it fired BEFORE the init below, so a failed start logged
+     * "started" and then a warning, and it told a reader nothing they could act on. Every way this
+     * path can go wrong still has its own always-on line -- the guard-skip WARN above, the
+     * init-failure WARN below -- and EVL_DATALOG_OPEN records when a file actually opens, which is
+     * the moment that matters. */
     if (csv_logger_init() != ESP_OK)
     {
         // NOT a guard skip -- the guard is armed and will make the next boot skip, which

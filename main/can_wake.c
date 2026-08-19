@@ -342,7 +342,10 @@ can_wake_arm_t can_wake_arm(void)
                 s_stuck_strikes = 0;
                 s_clean_reads   = 0;
                 ESP_LOGW(TAG, "RXD recovered -- arming resumed");
-                event_log_emit(EVL_INFO, "can_wake: RXD recovered, arming resumed");
+                /* EVL_CAN_WAKE, not EVL_INFO: this is the closing half of the "RXD stuck LOW" line
+                 * further down, which already uses that code -- the pair belongs under one label.
+                 * The "can_wake: " prefix goes with it; the label does that job. */
+                event_log_emit(EVL_CAN_WAKE, "RXD recovered, arming resumed");
             }
         }
         else

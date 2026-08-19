@@ -4749,8 +4749,10 @@ function consoleRefresh() {
 
 function consoleEvtSeverity(code) {
     if (code.indexOf('FAIL') !== -1) return 'er';
+    // 'OTA_START' is the pre-UPDATE_* name, kept so lines in already-saved SD logs keep their
+    // colour. Drop it a release after the rename.
     if (code === 'REAPER_RESUME' || code === 'IGNITION_OFF' || code === 'WARN' ||
-        code === 'OTA_START' || code === 'DATALOG_PARK') return 'wn';
+        code === 'UPDATE_START' || code === 'OTA_START' || code === 'DATALOG_PARK') return 'wn';
     return 'ok';
 }
 
