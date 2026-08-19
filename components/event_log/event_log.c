@@ -143,8 +143,13 @@ bool event_log_debug_enabled(void)
     return s_debug_events;
 }
 
-// Shared core for both public emit entries, so the ring critical section exists in one place.
-static void evl_vemit(event_log_code_t code, const char *fmt, va_list ap)
+// Shared core for the public emit entries, so the ring critical section exists in one place.
+//
+// at_tv / at_up_ms carry the time the event HAPPENED, for deferred emitters (see
+// event_log_emit_at). Pass at_tv == NULL for "now", which is what event_log_emit() does and what
+// every direct caller has always had.
+static void evl_vemit(event_log_code_t code, const struct timeval *at_tv, int64_t at_up_ms,
+                      const char *fmt, va_list ap)
 {
     char detail[EVENT_LOG_DETAIL_MAX];
     if (fmt != NULL)
@@ -157,11 +162,20 @@ static void evl_vemit(event_log_code_t code, const char *fmt, va_list ap)
     }
 
     // Wall-clock (when synced) + monotonic uptime, both computed OUTSIDE the critical section.
-    int64_t up_ms = esp_timer_get_time() / 1000;
+    int64_t up_ms;
     char ts[24];
     struct timeval tv;
     struct tm tm_now;
-    gettimeofday(&tv, NULL);
+    if (at_tv != NULL)
+    {
+        tv = *at_tv;                              // the event's time, captured by the emitter
+        up_ms = at_up_ms;
+    }
+    else
+    {
+        up_ms = esp_timer_get_time() / 1000;
+        gettimeofday(&tv, NULL);
+    }
     localtime_r(&tv.tv_sec, &tm_now);
     if ((tm_now.tm_year + 1900) >= 2020)
         strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_now);
@@ -192,7 +206,16 @@ void event_log_emit(event_log_code_t code, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    evl_vemit(code, fmt, ap);
+    evl_vemit(code, NULL, 0, fmt, ap);
+    va_end(ap);
+}
+
+void event_log_emit_at(event_log_code_t code, const struct timeval *tv, int64_t up_ms,
+                       const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    evl_vemit(code, tv, up_ms, fmt, ap);
     va_end(ap);
 }
 
