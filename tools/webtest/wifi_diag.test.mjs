@@ -139,8 +139,12 @@ test('the event timeline cannot leak identifiers into a masked report', () => {
     const pushes = [...c.matchAll(/wd_evt_push\(([^;]*?)\);/gs)].map(m => m[1]);
     assert.ok(pushes.length >= 5, `expected the wd_evt_push() call sites, found ${pushes.length}`);
     for (const args of pushes) {
-        // Everything from the third argument on is the format string and its arguments.
-        const fmt = args.slice(args.indexOf(',', args.indexOf(',') + 1) + 1);
+        // wd_evt_push(up_s, ssid, bssid, fmt, ...): everything from the FOURTH argument on is the
+        // format string and its arguments. up_s came first with #111, when the drain moved off the
+        // event task and the timeline had to be stamped with the event's time, not the drain's.
+        let cut = -1;
+        for (let i = 0; i < 3; i++) cut = args.indexOf(',', cut + 1);
+        const fmt = args.slice(cut + 1);
         assert.ok(!/ssid|bssid/i.test(fmt),
             `a wd_evt_push() format string mentions an identifier: ${fmt.trim().slice(0, 80)}. ` +
             `Pass it as the ssid/bssid argument instead, or it will bypass masking.`);

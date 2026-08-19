@@ -22,6 +22,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/time.h>
 #include "esp_err.h"
 #include "esp_http_server.h"
 
@@ -116,7 +117,33 @@ bool event_log_bringup_skipped(void);
 // Record one event. Non-blocking, variadic detail (printf-style). Safe from any task and before init.
 // Events are fsync'd to SD by the writer task within ~1s of emission, so a reboot a couple of seconds
 // later (the planned-restart timer) keeps them; no synchronous flush is needed on the reset path.
+//
+// !! NEVER CALL THIS FROM THE SYSTEM EVENT TASK (sys_evt), THE esp_timer TASK, OR AN ISR.
+// !! Emitting formats the whole line on the CALLER's stack -- ~800 bytes once vsnprintf,
+// !! localtime_r and strftime are counted. Those two system tasks have small Kconfig-sized stacks
+// !! this firmware does not own, and an ISR has none to spare. Doing it on sys_evt is what
+// !! boot-looped a device in v1.19.1 (issue #111): every boot panicked in vApplicationStack-
+// !! OverflowHook seconds after the Wi-Fi came up, and no amount of retrying recovered it.
+// !! The rule for such callers: capture the bare facts where the event happens (an enum, a few
+// !! ints, one short buffer, plus the time -- see event_log_emit_at below), hand them to a task
+// !! that owns its own stack, and format there. components/wifi_diag/wifi_diag.c is the worked
+// !! example.
+// !!
+// !! This is ENFORCED, not merely requested: every emit checks its own caller, and a violation
+// !! counts up in GET /event_log/status as "bad_ctx". An emit from a banned TASK still goes
+// !! through -- the line may be the only record of what went wrong, and a diagnostic must never
+// !! brick the device. An emit from an ISR is DROPPED, because the path below takes a lock and a
+// !! semaphore in their task forms and cannot legally run there at all.
 void event_log_emit(event_log_code_t code, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+// Same as event_log_emit(), but stamped with the time the event HAPPENED instead of the time the
+// line is formatted. For deferred emitters: capture tv (gettimeofday) and up_ms
+// (esp_timer_get_time()/1000) at the event, format later from a task with a real stack. The
+// rendered line is byte-identical in shape to event_log_emit()'s -- same fields, same "unsynced"
+// rule for a pre-SNTP clock. Passing tv == NULL means "now" and is exactly event_log_emit(); the
+// up_ms argument is ignored in that case.
+void event_log_emit_at(event_log_code_t code, const struct timeval *tv, int64_t up_ms,
+                       const char *fmt, ...) __attribute__((format(printf, 4, 5)));
 
 // ---- Debug-detail gate (#98) -----------------------------------------------------------------
 // This event log has no severity levels: everything emitted lands in the ring, on the SD card and

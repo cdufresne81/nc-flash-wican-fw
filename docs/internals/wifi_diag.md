@@ -160,20 +160,68 @@ and an `.html`:
 - no `wd_evt_push()` format string mentions an SSID or BSSID, which is what keeps the masked report
   honest.
 
+## The event hooks capture; the sampler formats
+
+The five `wifi_diag_note_*` hooks are called from `wifi_mgr`'s event handling, which runs on
+**`sys_evt`** — the ESP-IDF system event task, whose stack this component does not own and cannot
+size. They used to do their formatting right there. One `event_log_emit()` costs roughly 800 B on
+the caller's stack (`evl_vemit()` alone puts `detail[112] + ts[24] + line[192]` on it, then calls
+`vsnprintf`, `localtime_r`, `strftime` and `snprintf`), and at the IDF default of 2304 B that was
+not enough: a device boot-looped every ~13 s until safe-mode rescue, on two different firmware
+versions. `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE` was raised to 4608 as a stopgap; the
+measurement that followed put the deep path at 2548 B used, so 2304 had been 244 B short.
+
+Raising the stack made the desk bigger without reducing the paperwork, so #111 moved the paperwork:
+
+- A hook now fills a **`wd_fact_t`** — an enum, a few ints, one `strlcpy`'d SSID, plus
+  `gettimeofday()` and the uptime **captured at the event** — and pushes it into a static 16-deep
+  ring (`s_facts[]`, ~1.6 KB of `.bss`) under the module's existing lock. Nothing formats. No
+  `snprintf`, no masking, no emit.
+- **`wd_drain_facts()`** pops the facts and does all of it — `wd_evt_push()`, `wd_mask_ssid()`,
+  `event_log_emit_at()` — on a stack that owns itself.
+
+Four things about that are load-bearing:
+
+- **The timestamp travels with the fact.** `event_log_emit_at()` (added by #111) stamps the line
+  with the time the event happened rather than the time it was formatted, and `wd_evt_push()` takes
+  an explicit `up_s` for the same reason. The visible cost is that `events.log` is no longer
+  strictly append-ordered across subsystems — a Wi-Fi line can land after a line from elsewhere
+  that happened later. Sort by timestamp, not by position.
+- **The push never blocks and never retries.** A full ring overwrites its *oldest* fact and counts
+  the loss (`fact_dropped` in the `/wifi_diag` JSON, plus one `EVL_WARN` line per minute). Making
+  the event task wait on anything is the failure class this exists to remove.
+- **Two drainers, no duplicates.** The sampler drains once per tick, and `/wifi_diag` and
+  `/wifi_diag/report` each drain first — so the evidence still appears if the sampler task failed
+  to start, which `wifi_diag_init()` has always promised. A drainer *claims* a fact by copying it
+  out and advancing the tail inside the same critical section, so no fact is ever formatted twice.
+- **The gate and the throttle are decided at capture.** Whether the attempt line is debug-gated,
+  and whether a `DROP` beats the `WD_EVL_REPEAT_MS` throttle, depend on when the event happened —
+  so the hook decides and the verdict rides in the fact.
+
+The one accepted loss: a fact captured but not yet drained (up to ~1 s) disappears if the device
+crashes in that window. Before, the line reached the event log's RAM ring synchronously — when it
+did not panic the device outright. A one-second forensic gap beats a boot loop. The crash reporter
+itself is unaffected; it emits after reboot from RTC data.
+
 ## The sampler also watches someone else's stack
 
-Every `event_log_emit()` in this file runs on **`sys_evt`**, the ESP-IDF system event task — a stack
-this component does not own and cannot size. One emit costs roughly 800 B there. At the IDF default
-of 2304 B that was not enough: a device whose Wi-Fi was retrying constantly boot-looped every ~13 s
-until safe-mode rescue. `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE` is 4608 now.
+Since #111 nothing in this file formats on `sys_evt` — but the capture hooks still *run* there, and
+"just one quick emit here" is exactly how the boot loop happened the first time. So the check stays
+in `wifi_diag`: the component that owns the temptation owns the alarm. It is not wifi_diag-specific
+in what it watches — anything anyone hangs on `sys_evt` trips it. (The alternative, a general
+`task_health` component, buys a new task and its stack to run one comparison per second against a
+one-row table. The rule for later: the day a *second* task earns a floor check, build it then.)
 
-4608 was doubled and rounded, not measured, so two things watch it (#112):
+`CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE` is 4608, doubled and rounded rather than measured, so two
+things watch it (#112):
 
 - **`GET /wake_probe` reports `sys_evt_stack_free`** — bytes still free at that task's worst moment,
   read via `xTaskGetHandle("sys_evt")` exactly like the neighbouring `sleep_task_stack_free`.
   Worst-case use is `4608 − N`. A `0` means the handle lookup failed, not "no headroom left".
 - **`wd_check_sys_evt_stack()` warns once per boot** below `WD_SYS_EVT_STACK_WARN_MIN_FREE`
-  (1024 B), as `EVL_WARN` in the event log. Not debug-gated — the bad case is never hidden.
+  (1024 B), as `EVL_WARN` in the event log. Not debug-gated — the bad case is never hidden. It is
+  the last action of each sampler tick, which since #111 reads as one story: format what the event
+  task captured, somewhere safe, then check that the unsafe place stayed cheap.
 
 Two things about that are load-bearing:
 
@@ -187,13 +235,24 @@ Two things about that are load-bearing:
 
 ⚠️ **A boot-and-idle soak does not measure the real worst case.** `event_log_set_debug()` runs late
 in `app_main`, so the *first* connection attempt after any boot is treated as gated-off. Only a
-*later* reconnect walks the full path down to the emit in `wifi_diag_note_attempt()`. To get the
-honest number: flash a build with the 4608 stack, set `debug=enabled`, then force a real
-disconnect/reconnect before reading `/wake_probe`.
+*later* reconnect walks the deep path. To get the honest number: set `debug=enabled`, then force a
+real disconnect/reconnect burst before reading `/wake_probe`.
 
-The floor is 1024 rather than the sleep task's 2048 because one more emit is ~800 B plus interrupt
-context-save margin — below 1024 the honest statement is "the next log line no longer fits". The
-sleep task's resume path is expected to grow; this one's job is meant to shrink (#111).
+**The floor is 2048, and it is measured.** F — `sys_evt_stack_free` after a forced burst of 13
+disconnects with debug on — is **2588 B free of 4608**. The same procedure gave **2060** before
+#111, so moving the formatting off this stack returned **528 B**.
+
+1024 was right before #111 and became decoration after it: with 2588 free, one re-added ~800 B emit
+lands near 1788 — still far above 1024, so the tripwire could not fire on the regression it exists
+to catch. The rule for the replacement is a round number in `(F − 800, F − 512]`: above the lower
+bound so a single re-added emit trips it, at or below the upper so deep `sys_evt` paths the bench
+burst never exercised cannot false-alarm. That window is `(1788, 2076]`, giving **2048**. Re-measure
+and re-apply the rule if the stack size or the cost of an emit ever changes.
+
+The stack stays at 4608. Measured worst-case use is now **2020 B** (4608 − 2588), so the IDF
+default of 2304 would leave under 300 B free — below any sane floor. The reclaimable RAM is 1–2 KB
+against ~32 KB free, and the failure mode of guessing short is the boot loop this whole effort
+exists to bury.
 
 ## Gotchas
 
@@ -210,3 +269,6 @@ sleep task's resume path is expected to grow; this one's job is meant to shrink 
   priority-2 task that is negligible — but it is why the sampler must never move onto a hot path.
 - Everything here covers the **current uptime only**. The reboot-surviving record is in the event
   log: `GET /event_log`, look for `WIFI` lines.
+- A `wifi_diag_note_*` hook may **capture facts and nothing else**. No `snprintf`, no masking, no
+  `wd_evt_push()`, no `event_log_emit()`. They run on `sys_evt`; see the section above for what
+  happened the last time they did more.
