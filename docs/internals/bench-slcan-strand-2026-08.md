@@ -103,3 +103,41 @@ That 08-11 was this. Only Stage 0 makes the next occurrence attributable.
 ## Process note
 
 Per the standing rule, the fix design goes to Fable before any of it is implemented.
+
+## Where the code is
+
+So a fresh session does not have to re-derive any of this. Symbols, not line numbers — lines
+drift.
+
+**NC Flash — `C:\Users\dufre\Projets\nc-rom-editor`** (this is where Stage 1 happens):
+
+| What | Where |
+|---|---|
+| The probe, and the fallback comment that says ANY failure takes the legacy path | `src/ecu/session.py` → `_try_open_coexist_port()` |
+| The connect path that chooses coexist vs legacy | `src/ecu/session.py` → `connect_ecu()`, the `_wican_auto_config and not self._slcan_switched` branch |
+| Writes the breadcrumb then switches the device to slcan | `src/ecu/session.py` → `_enter_slcan_durable()` |
+| Restore on disconnect — **clears the breadcrumb in a `finally`, even when restore throws** | `src/ecu/session.py` → `_restore_wican_protocol()` |
+| Same defect in the context-manager form | `src/ecu/wican_config.py` → `slcan_session()` |
+| Breadcrumb read / write / delete, and its OS-temp, IP-keyed path | `src/ecu/wican_config.py` → `read_recovery()`, `_write_recovery()`, `clear_recovery()`, `_host_keyed_temp_path()` |
+| The one-token config edit that persists the mode | `src/ecu/wican_config.py` → `set_protocol()`, `set_top_level_protocol()` |
+| The 1500 ms probe timeout, the port, the min firmware rev | `src/ecu/constants.py` → `COEXIST_PROBE_TIMEOUT_MS`, `WICAN_DEDICATED_SLCAN_PORT`, `COEXIST_MIN_FW_REV` |
+| Test runner (PATH python lacks PySide6) | `venv-windows\Scripts\python.exe -m pytest` |
+
+**Firmware — this repo:**
+
+| What | Where |
+|---|---|
+| Mode resolved once at boot; the SmartConnect override | `main/main.c`, the `config_server_protocol()` call and the `SMARTCONNECT_MODE` block after it |
+| Mode is not live-appliable, so a change always reboots | `main/config_server.c` → `LIVE_APPLY_WHITELIST` |
+| Status reports the **stored** mode, not the running one | `main/config_server.c` → `config_server_get_status_json()` |
+| Failed OTA leaves the bus off (#69) | `main/config_server.c` → `upload_post_handler()`, every `return ESP_FAIL` after its `can_disable()` |
+| The reaper and its four preconditions | `main/datalog_lease_task.c` |
+| Lease/flag primitives, and the idle clock behind #70 | `main/can.c`, `main/can.h` → the `COEXIST_*` constants |
+| Hidden mode selector that round-trips its value | `main/web/src/main.js` → the `checkStatus()` populate and the `postConfig()` re-send (never hand-edit the built page) |
+
+**Evidence files:**
+
+- NC Flash logs: `~/.nc-flash/nc-flash.log` and `~/.nc-flash/logs/*.log`. The decisive greps are
+  `legacy reboot path`, `coexistence firmware NCFRv`, and `protocol restore failed`.
+- The device log for #92 is attached to the issue itself; fetch it with `gh` rather than trusting
+  any local copy.

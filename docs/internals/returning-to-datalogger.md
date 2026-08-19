@@ -10,6 +10,11 @@ App**, **Bench SLCAN**. "It went to Bench SLCAN and will not go back" is one of 
 different failures that all look the same from that chip, so the first job is to work out which
 layer is holding it.
 
+> **Investigation in progress.** Issue #92 is a real occurrence of this and is not yet explained.
+> See [bench-slcan-strand-2026-08.md](bench-slcan-strand-2026-08.md) for the hypothesis, what the
+> logs do and do not prove, and the plan to reproduce it. Do not treat the cause named in Trap 4
+> below as settled — the mechanism is proven to exist, but the incident is unattributed.
+
 ## There are three layers, and each can strand the logger on its own
 
 ```mermaid
