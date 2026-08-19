@@ -837,6 +837,12 @@ void wifi_diag_note_ban(const char *ssid, uint32_t ms)
 static TaskHandle_t s_sys_evt = NULL;
 static bool         s_sys_evt_stack_warned = false;
 
+/* This task's own handle, kept for the same reason #112 keeps sys_evt's: WD_TASK_STACK was raised
+ * to 4608 by reasoning about what the drain costs, not by measuring it, and #111 would be a poor
+ * trade if it moved the overflow from sys_evt onto this task instead. Reported as
+ * mem.task_stack_free in the JSON so the guess can be checked on a real device. */
+static TaskHandle_t s_self = NULL;
+
 /* Read sys_evt's stack headroom and complain ONCE if it is near the edge (#112).
  *
  * WHY THIS LIVES IN wifi_diag, AFTER #111. Not because wifi_diag spends the bytes -- it barely
@@ -1001,6 +1007,7 @@ static void wd_sample_once(void)
 static void wd_sampler_task(void *arg)
 {
     (void)arg;
+    s_self = xTaskGetCurrentTaskHandle();
     for (;;)
     {
         wd_drain_facts();   // format what the event task captured, on THIS stack (#111)
@@ -1664,10 +1671,16 @@ static esp_err_t wd_send_json(httpd_req_t *req)
     }
     wd_pf(&o, "]}");
 
-    wd_pf(&o, ",\"mem\":{\"int_free\":%u,\"int_block\":%u,\"int_block_min\":%u}",
+    // task_stack_free: bytes still free at this task's deepest moment, out of WD_TASK_STACK. 0
+    // means the sampler never started. Worst-case use is WD_TASK_STACK - the value.
+    wd_pf(&o, ",\"mem\":{\"int_free\":%u,\"int_block\":%u,\"int_block_min\":%u"
+              ",\"task_stack\":%u,\"task_stack_free\":%u}",
           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-          (iblock_min == UINT32_MAX) ? 0u : (unsigned)iblock_min);
+          (iblock_min == UINT32_MAX) ? 0u : (unsigned)iblock_min,
+          (unsigned)WD_TASK_STACK,
+          (s_self != NULL)
+              ? (unsigned)(uxTaskGetStackHighWaterMark(s_self) * sizeof(StackType_t)) : 0u);
 
     wd_pf(&o, ",\"findings\":[");
     {
