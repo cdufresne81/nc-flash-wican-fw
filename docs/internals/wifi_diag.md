@@ -238,20 +238,21 @@ in `app_main`, so the *first* connection attempt after any boot is treated as ga
 *later* reconnect walks the deep path. To get the honest number: set `debug=enabled`, then force a
 real disconnect/reconnect burst before reading `/wake_probe`.
 
-⚠️ **The 1024 floor is loose since #111 and is meant to be retightened.** It means "one more ~800 B
-emit no longer fits" — but #111 took roughly that same 800 B off the stack, so a re-added emit would
-no longer push the reading under 1024 and the tripwire could not fire on the regression it exists to
-catch. A floor that cannot fire is decoration. Retightening needs a measured post-#111 number **F**
-(from `/wake_probe`, same forced-reconnect procedure that produced the pre-#111 **2060 free of
-4608**): pick a round floor in `(F − 800, F − 512]` — above the lower bound so one re-added emit
-trips it, below the upper so deep `sys_evt` paths the bench never exercised do not. It belongs in
-its own commit, citing F. If F is not materially above 2060, #111 did not remove what we think it
-did; investigate rather than tune.
+**The floor is 2048, and it is measured.** F — `sys_evt_stack_free` after a forced burst of 13
+disconnects with debug on — is **2588 B free of 4608**. The same procedure gave **2060** before
+#111, so moving the formatting off this stack returned **528 B**.
 
-The stack stays at 4608. Lowering it toward the IDF default is now discussable but not advisable:
-predicted post-#111 worst-case use is ~1750–1900, so 2304 would leave less than any sane floor, and
-the reclaimable RAM is 1–2 KB against ~32 KB free. The failure mode of guessing short is the boot
-loop this whole effort exists to bury.
+1024 was right before #111 and became decoration after it: with 2588 free, one re-added ~800 B emit
+lands near 1788 — still far above 1024, so the tripwire could not fire on the regression it exists
+to catch. The rule for the replacement is a round number in `(F − 800, F − 512]`: above the lower
+bound so a single re-added emit trips it, at or below the upper so deep `sys_evt` paths the bench
+burst never exercised cannot false-alarm. That window is `(1788, 2076]`, giving **2048**. Re-measure
+and re-apply the rule if the stack size or the cost of an emit ever changes.
+
+The stack stays at 4608. Measured worst-case use is now **2020 B** (4608 − 2588), so the IDF
+default of 2304 would leave under 300 B free — below any sane floor. The reclaimable RAM is 1–2 KB
+against ~32 KB free, and the failure mode of guessing short is the boot loop this whole effort
+exists to bury.
 
 ## Gotchas
 

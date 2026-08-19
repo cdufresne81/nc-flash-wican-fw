@@ -835,17 +835,21 @@ void wifi_diag_note_ban(const char *ssid, uint32_t ms)
  * task's stack before switching to the interrupt stack, which needs a couple hundred more. Below
  * 1024 free, one added emit plus an ill-timed interrupt is a panic.
  *
- * ⚠️ THIS NUMBER IS NOW LOOSE AND IS MEANT TO BE RETIGHTENED. #111 took the formatting off this
- * stack, so the measured free space goes up by roughly that same ~800 B -- which means a
- * re-added emit would no longer push it under 1024, and the check would sit there unable to fire
- * on the exact regression it exists to catch. The retighten needs a MEASURED post-#111 number (F,
- * from /wake_probe's sys_evt_stack_free after a forced multi-attempt reconnect with debug on) and
- * belongs in its own commit: pick a round floor in (F - 800, F - 512], and cite F here. Pre-#111,
- * F was 2060 free of 4608.
+ * MEASURED, not guessed. F = 2588 B free, read from /wake_probe's sys_evt_stack_free on
+ * v1.19.1-13 after a forced burst of 13 disconnects with debug on (2026-08-18). Pre-#111 the same
+ * procedure gave 2060, so moving the formatting off this stack returned 528 B.
  *
- * Deliberately tighter than the sleep task's 2048 (sleep_mode.c:768). That task's resume path runs
- * the whole WiFi bring-up and is expected to grow; this one's job only shrinks. */
-#define WD_SYS_EVT_STACK_WARN_MIN_FREE 1024
+ * 1024 was correct before #111 and became decoration after it: with 2588 free, one re-added emit
+ * lands at ~1788, still comfortably above 1024, so the check could no longer fire on the exact
+ * regression it exists to catch. The rule for choosing the replacement is floor in
+ * (F - 800, F - 512] -- above the lower bound so a single re-added emit trips it, at or below the
+ * upper so deep sys_evt paths the bench burst did not exercise cannot false-alarm. That window is
+ * (1788, 2076], and 2048 is the round number inside it. Re-measure and re-apply the rule if the
+ * stack size or the emit cost ever changes.
+ *
+ * Now equal to the sleep task's 2048 (sleep_mode.c:768) by arithmetic rather than by imitation --
+ * that one is a different task with a different budget; do not couple them. */
+#define WD_SYS_EVT_STACK_WARN_MIN_FREE 2048
 
 /* Looked up once and cached, so the healthy case costs a pointer read rather than a task-list walk
  * every second. The default event loop task is created during startup and never exits, so the
