@@ -130,8 +130,10 @@ bool event_log_bringup_skipped(void);
 // !! example.
 // !!
 // !! This is ENFORCED, not merely requested: every emit checks its own caller, and a violation
-// !! counts up in GET /event_log/status as "bad_ctx" and prints an ESP_LOGE naming the task and
-// !! the event code. It does not abort -- a diagnostic must never brick the device.
+// !! counts up in GET /event_log/status as "bad_ctx". An emit from a banned TASK still goes
+// !! through -- the line may be the only record of what went wrong, and a diagnostic must never
+// !! brick the device. An emit from an ISR is DROPPED, because the path below takes a lock and a
+// !! semaphore in their task forms and cannot legally run there at all.
 void event_log_emit(event_log_code_t code, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 // Same as event_log_emit(), but stamped with the time the event HAPPENED instead of the time the

@@ -147,52 +147,63 @@ bool event_log_debug_enabled(void)
 // ---- Caller-context tripwire (#111) ------------------------------------------------------------
 
 /* Emitting formats the whole line on the CALLER's stack -- ~800 bytes once vsnprintf, localtime_r
- * and strftime are counted (see the rule in event_log.h). Two contexts cannot afford that: the
- * system event task, whose stack is Kconfig-sized and small, and an ISR, which has none to spare
- * and cannot safely take the semaphore below either. Doing it on sys_evt boot-looped a device.
+ * and strftime are counted (see the rule in event_log.h). Three contexts cannot afford that: the
+ * system event task and the esp_timer task, whose stacks are Kconfig-sized and small, and an ISR,
+ * which has none to spare. Doing it on sys_evt boot-looped a device.
  *
  * That rule used to live only in a header comment, which catches nobody. This is the mechanism:
- * one pointer compare per emit, on a path that runs at milestone rate. It names the OFFENDER (the
- * task, and the event code being emitted) rather than the victim, and it fires on the first
+ * a couple of pointer compares per emit, on a path that runs at milestone rate. It names the
+ * OFFENDER (the task, and the event code) rather than the victim, and it fires on the first
  * offending call instead of waiting for a stack floor to be crossed -- which is what the sibling
  * check in wifi_diag can no longer reliably do, now that #111 freed up the headroom it watched.
  *
- * IT DOES NOT ABORT, ON PURPOSE. A diagnostic facility must never be the thing that takes the
- * device down; that is the failure it exists to report. The offending line is still emitted, and
- * on sys_evt it may well be the emit that overflows -- but if it does, the crash reporter now has
- * an ESP_LOGE naming the culprit, which is exactly what was missing in v1.19.1.
+ * Returns false when the caller must NOT proceed. That is the ISR case only, and it is not a
+ * judgement call: the emit path below takes a portMUX in its task form and calls xSemaphoreGive,
+ * neither of which is legal from an ISR, so continuing means an assert or corrupted state. A line
+ * that cannot survive being written is not preserved by attempting to write it.
  *
- * Reported as "bad_ctx" by GET /event_log/status. Non-zero there means someone broke the rule. */
-static void evl_check_caller(event_log_code_t code)
+ * A bad TASK proceeds, on purpose. It might be the emit that overflows -- but the line may also be
+ * the only forensic record of whatever went wrong, and a diagnostic facility must never be the
+ * thing that takes the device down. ESP_EARLY_LOGE, not ESP_LOGE: it goes through the ROM printf
+ * and is far shallower, which matters when the whole complaint is that this stack is nearly full.
+ *
+ * Do not expect to READ either log line: this board has no serial console anyone can attach (its
+ * USB-C port is a USB host at runtime), and the crash reporter captures the RTC panic backtrace,
+ * not console output. The durable signal is "bad_ctx" in GET /event_log/status -- non-zero there
+ * means someone broke the rule and the device lived to report it. If it did not live, the
+ * backtrace is still the evidence, exactly as in v1.19.1. */
+static bool evl_caller_may_format(event_log_code_t code)
 {
     if (xPortInIsrContext())
     {
         s_bad_ctx++;
-        ESP_DRAM_LOGE(TAG, "event_log_emit from an ISR (code %d) -- capture and defer instead",
+        ESP_DRAM_LOGE(TAG, "event_log_emit from an ISR (code %d) dropped -- capture and defer",
                       (int)code);
-        return;
+        return false;
     }
 
-    /* Looked up once and cached. xTaskGetHandle walks the task list, so it must not run per emit
-     * forever -- but it is also illegal from an ISR, hence the order of these two checks. Until
-     * the event loop exists there is nothing to compare against, which is correct, not an error. */
+    /* Looked up once each and cached. xTaskGetHandle suspends the scheduler to walk the task
+     * lists, so it must not run per emit forever -- and it is illegal from an ISR, which is why
+     * that check comes first. A task that does not exist yet leaves its handle NULL and is simply
+     * not compared against; that is normal early in boot, not an error. */
     static TaskHandle_t s_sys_evt = NULL;
-    if (s_sys_evt == NULL)
-    {
-        s_sys_evt = xTaskGetHandle("sys_evt");   /* the IDF default event loop task's real name */
-        if (s_sys_evt == NULL)
-        {
-            return;
-        }
-    }
+    static TaskHandle_t s_esp_timer = NULL;
+    if (s_sys_evt == NULL)   s_sys_evt = xTaskGetHandle("sys_evt");     /* IDF default event loop */
+    if (s_esp_timer == NULL) s_esp_timer = xTaskGetHandle("esp_timer"); /* IDF timer dispatch     */
 
-    if (xTaskGetCurrentTaskHandle() == s_sys_evt)
+    const TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    const char *who = (self == s_sys_evt && s_sys_evt != NULL)       ? "sys_evt"
+                    : (self == s_esp_timer && s_esp_timer != NULL)   ? "esp_timer"
+                    : NULL;
+    if (who != NULL)
     {
         s_bad_ctx++;
-        ESP_LOGE(TAG, "event_log_emit on sys_evt (code %d) -- this is what boot-looped v1.19.1; "
-                      "capture the facts there and format on your own task "
-                      "(components/wifi_diag/wifi_diag.c is the worked example)", (int)code);
+        ESP_EARLY_LOGE(TAG, "event_log_emit on %s (code %d) -- this is what boot-looped v1.19.1; "
+                            "capture the facts there and format on a task that owns its stack "
+                            "(components/wifi_diag/wifi_diag.c is the worked example)",
+                       who, (int)code);
     }
+    return true;
 }
 
 // Shared core for the public emit entries, so the ring critical section exists in one place.
@@ -203,7 +214,10 @@ static void evl_check_caller(event_log_code_t code)
 static void evl_vemit(event_log_code_t code, const struct timeval *at_tv, int64_t at_up_ms,
                       const char *fmt, va_list ap)
 {
-    evl_check_caller(code);
+    if (!evl_caller_may_format(code))
+    {
+        return;   /* ISR only: proceeding would be illegal, not merely expensive */
+    }
 
     char detail[EVENT_LOG_DETAIL_MAX];
     if (fmt != NULL)
@@ -616,8 +630,8 @@ static esp_err_t evl_send_status(httpd_req_t *req)
              s_sd_ok ? "true" : "false",
              (unsigned)s_file_bytes, (unsigned)s_rotations,
              (unsigned)head, (unsigned)ring_count, (unsigned)s_dropped,
-             /* #111: non-zero means somebody emitted from sys_evt or an ISR. See
-              * evl_check_caller(); the console line names which task and which code. */
+             /* #111: non-zero means somebody emitted from a context that must not format --
+              * sys_evt, esp_timer, or an ISR. See evl_caller_may_format(). */
              (unsigned)s_bad_ctx,
              /* #98: the ONLY way to confirm the debug-detail gate over WiFi on a device with no
               * readable serial console. */
