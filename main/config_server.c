@@ -2326,6 +2326,18 @@ static const httpd_uri_t poll_status_uri = {
     .user_ctx  = NULL
 };
 
+/* Bytes still free on a named task's stack at its worst moment, or 0 if the task was not found.
+ *
+ * Two things this hides, both easy to get wrong when open-coded per task: uxTaskGetStackHighWaterMark
+ * reports WORDS, not bytes, and the value is a HISTORIC MINIMUM -- the closest that task has ever
+ * come to the end of its stack -- not a live reading. So a caller may read it at any convenient
+ * moment and still get the worst case. */
+static unsigned task_stack_free_b(const char *name)
+{
+    const TaskHandle_t t = xTaskGetHandle(name);
+    return t ? (unsigned)(uxTaskGetStackHighWaterMark(t) * sizeof(StackType_t)) : 0u;
+}
+
 /* ------------------------------------------------------------------------------------------
  * PERMANENT diagnostic endpoint:  GET /wake_probe
  *
@@ -2344,6 +2356,11 @@ static const httpd_uri_t poll_status_uri = {
  *   uptime_ms   -- proves a wake RESUMED (uptime keeps climbing) rather than rebooted.
  *   fence       -- the #88 sleep fence; must be false while awake or the producers stay parked.
  *   can_enabled -- the bus really came back.
+ *   sys_evt_stack_free
+ *               -- headroom left on the ESP-IDF system event task (#112). Its size is a Kconfig
+ *                  guess, its callers are other people's callbacks, and at 2304 B it overflowed
+ *                  and boot-looped a real device. This is the number that makes "4608 fits" a
+ *                  measurement instead of a hope.
  * ------------------------------------------------------------------------------------------ */
 static esp_err_t wake_probe_handler(httpd_req_t *req)
 {
@@ -2354,21 +2371,25 @@ static esp_err_t wake_probe_handler(httpd_req_t *req)
      * that used to happen only in app_main because waking always rebooted. If this trends toward
      * zero across wake cycles, the task is overflowing its static stack -- which corrupts whatever
      * sits next to it and panics with a jump to a nonsense address. */
-    const TaskHandle_t sleep_task = xTaskGetHandle("sleep_task");   /* the task's real name */
-    const unsigned sleep_hw = sleep_task ? (unsigned)(uxTaskGetStackHighWaterMark(sleep_task) * sizeof(StackType_t))
-                                         : 0u;
+    const unsigned sleep_hw = task_stack_free_b("sleep_task");   /* the task's real name */
 
-    char body[320];
+    /* The same reading for the ESP-IDF system event task (#112). Why it is worth watching is in
+     * the field list above; the mechanics are in task_stack_free_b(). */
+    const unsigned evt_hw = task_stack_free_b("sys_evt");        /* IDF's default event loop */
+
+    char body[384];
     snprintf(body, sizeof(body),
              "{\"uptime_ms\":%lld,\"chip\":\"%s\",\"fence\":%s,\"can_enabled\":%s,"
-             "\"free_heap\":%u,\"largest_block\":%u,\"sleep_task_stack_free\":%u}",
+             "\"free_heap\":%u,\"largest_block\":%u,\"sleep_task_stack_free\":%u,"
+             "\"sys_evt_stack_free\":%u}",
              esp_timer_get_time() / 1000,
              (chip == ELM327_READY) ? "ready" : "sleep",
              can_sleep_fence_active() ? "true" : "false",
              can_is_enabled() ? "true" : "false",
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             sleep_hw);
+             sleep_hw,
+             evt_hw);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, body);

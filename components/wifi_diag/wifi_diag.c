@@ -433,6 +433,7 @@ static void wd_tally_add(uint8_t reason)
  * So: before adding another emit here, or making any of these fire more often, check the headroom.
  * If this ever needs to be cheap, the fix is to defer the formatting off this task, not to shave
  * the buffers. */
+
 void wifi_diag_note_attempt(const char *ssid)
 {
     const char *s = (ssid != NULL) ? ssid : "";
@@ -597,6 +598,76 @@ void wifi_diag_note_ban(const char *ssid, uint32_t ms)
 
 // ---- Sampler -----------------------------------------------------------------------------------
 
+/* The floor under that headroom, in BYTES still free on sys_evt's stack (#112).
+ *
+ * 1024 is justified, not picked for comfort. One more event_log_emit() on this stack costs roughly
+ * 800 B (see the WARNING block in "Event hooks" above), and interrupt entry saves context on the
+ * RUNNING task's stack before switching to the interrupt stack, which needs a couple hundred more.
+ * So below 1024 B free the honest statement is "the next log line no longer fits": one added emit
+ * plus an ill-timed interrupt is a panic. Above it there is still room to react before the cliff.
+ *
+ * Deliberately tighter than the sleep task's 2048 (sleep_mode.c:768). That task's resume path runs
+ * the whole WiFi bring-up and is expected to grow; this task's job is supposed to SHRINK (#111). */
+#define WD_SYS_EVT_STACK_WARN_MIN_FREE 1024
+
+/* Looked up once and cached, so the healthy case costs a pointer read rather than a task-list walk
+ * every second. The default event loop task is created during startup and never exits, so the
+ * handle stays valid for the whole boot. NULL until the lookup succeeds -- on the first sampler
+ * ticks the loop may not exist yet, which is normal, not an error. */
+static TaskHandle_t s_sys_evt = NULL;
+static bool         s_sys_evt_stack_warned = false;
+
+/* Read sys_evt's stack headroom and complain ONCE if it is near the edge (#112).
+ *
+ * This runs on the sampler task and never inside the hooks above, and that placement IS the
+ * design. uxTaskGetStackHighWaterMark() returns a HISTORIC MINIMUM -- the closest the task has
+ * ever come to the end of its stack, recovered by scanning the untouched fill pattern -- so
+ * reading it a second later from another task yields exactly the same worst case as reading it at
+ * the deepest moment.
+ *
+ * Reading is cheap but not free: the mark is recovered by scanning the untouched fill pattern one
+ * BYTE at a time (tasks.c:4807), so a call costs about as many iterations as there are free bytes
+ * -- roughly 2 KB, near 50 us, once a second. It takes no lock and disables no interrupts, so it
+ * cannot delay sys_evt or anything else, and it gets cheaper as the stack fills. If that ever
+ * needs trimming, check every 30th tick: a historic minimum is worth the same read 30 s later.
+ *
+ * WARNING is the expensive part: emitting from inside a wifi_diag_note_* hook would spend ~800 B
+ * on the very stack that just proved short, so the warning could cause the overflow it warns
+ * about.
+ *
+ * Latched for one boot for the same reason documented at sleep_mode.c:1479-1484: the mark only
+ * ever shrinks, so within one uptime the condition can never clear, and re-emitting would repeat
+ * the same number every second forever. It re-arms on any reboot.
+ *
+ * NOT debug-gated, matching the sleep floor check (sleep_mode.c:1472-1475): a line reporting the
+ * bad case must never be hidden behind a setting. This box has no serial console to confess on. */
+static void wd_check_sys_evt_stack(void)
+{
+    if (s_sys_evt_stack_warned)
+    {
+        return;   // already said it; the number cannot improve within this boot
+    }
+
+    if (s_sys_evt == NULL)
+    {
+        s_sys_evt = xTaskGetHandle("sys_evt");   // the IDF default event loop task's real name
+        if (s_sys_evt == NULL)
+        {
+            return;   // not up yet: try again next tick, no complaint
+        }
+    }
+
+    const unsigned free_b =
+        (unsigned)(uxTaskGetStackHighWaterMark(s_sys_evt) * sizeof(StackType_t));
+
+    if (free_b < WD_SYS_EVT_STACK_WARN_MIN_FREE)
+    {
+        s_sys_evt_stack_warned = true;
+        event_log_emit(EVL_WARN, "sys_evt stack low: %u B free (floor %u B)",
+                       free_b, (unsigned)WD_SYS_EVT_STACK_WARN_MIN_FREE);
+    }
+}
+
 static void wd_sample_once(void)
 {
     wifi_mode_t mode;
@@ -689,6 +760,10 @@ static void wd_sample_once(void)
         s_session_current_s = 0;
     }
     portEXIT_CRITICAL(&s_lock);
+
+    /* Outside the critical section on purpose: this can emit, and an event_log_emit() inside a
+     * portENTER_CRITICAL block would hold a spinlock across the formatting. */
+    wd_check_sys_evt_stack();
 }
 
 static void wd_sampler_task(void *arg)

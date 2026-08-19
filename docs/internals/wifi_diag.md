@@ -160,6 +160,41 @@ and an `.html`:
 - no `wd_evt_push()` format string mentions an SSID or BSSID, which is what keeps the masked report
   honest.
 
+## The sampler also watches someone else's stack
+
+Every `event_log_emit()` in this file runs on **`sys_evt`**, the ESP-IDF system event task — a stack
+this component does not own and cannot size. One emit costs roughly 800 B there. At the IDF default
+of 2304 B that was not enough: a device whose Wi-Fi was retrying constantly boot-looped every ~13 s
+until safe-mode rescue. `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE` is 4608 now.
+
+4608 was doubled and rounded, not measured, so two things watch it (#112):
+
+- **`GET /wake_probe` reports `sys_evt_stack_free`** — bytes still free at that task's worst moment,
+  read via `xTaskGetHandle("sys_evt")` exactly like the neighbouring `sleep_task_stack_free`.
+  Worst-case use is `4608 − N`. A `0` means the handle lookup failed, not "no headroom left".
+- **`wd_check_sys_evt_stack()` warns once per boot** below `WD_SYS_EVT_STACK_WARN_MIN_FREE`
+  (1024 B), as `EVL_WARN` in the event log. Not debug-gated — the bad case is never hidden.
+
+Two things about that are load-bearing:
+
+- **`uxTaskGetStackHighWaterMark()` is a historic minimum**, not a live reading. That is why reading
+  it a second later from another task is just as good as reading it at the deepest moment, and why
+  the warning is latched: within one uptime the number can only shrink, so re-emitting would repeat
+  itself every second forever.
+- **The check runs on the sampler task, never in a `wifi_diag_note_*` hook.** Emitting from a hook
+  would spend ~800 B on the very stack that just proved short — the warning could cause the overflow
+  it warns about.
+
+⚠️ **A boot-and-idle soak does not measure the real worst case.** `event_log_set_debug()` runs late
+in `app_main`, so the *first* connection attempt after any boot is treated as gated-off. Only a
+*later* reconnect walks the full path down to the emit in `wifi_diag_note_attempt()`. To get the
+honest number: flash a build with the 4608 stack, set `debug=enabled`, then force a real
+disconnect/reconnect before reading `/wake_probe`.
+
+The floor is 1024 rather than the sleep task's 2048 because one more emit is ~800 B plus interrupt
+context-save margin — below 1024 the honest statement is "the next log line no longer fits". The
+sleep task's resume path is expected to grow; this one's job is meant to shrink (#111).
+
 ## Gotchas
 
 - `wifi_diag` is a **leaf**: it requires only base IDF plus `event_log`. `main` depends on

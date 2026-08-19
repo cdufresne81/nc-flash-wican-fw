@@ -48,6 +48,8 @@ python tools/check_docs.py
 | [rewrite-vs-evolve-2026-07.md](rewrite-vs-evolve-2026-07.md) | Decision brief: keep evolving, trim, rebuild, or extract-then-grow-v2-beside-v1 — provenance, flash/RAM budget, four costed paths, an adversarial review that overturned the first recommendation, and what evidence would change the current one |
 | [poll_log.md](poll_log.md) | The Datalogger protocol: free-running PID polling, hybrid broadcast capture, engine-off quiesce, sweep-rate measurement, `/poll_status` |
 | [csv_logger.md](csv_logger.md) | The wide-CSV trip logger: the fixed-rate grid, the Auto (fastest) rate, registration patterns, RTC crash guard |
+| [sleep-wake-cycle.md](sleep-wake-cycle.md) | The full parked-to-parked cycle in plain words, no code names: the 2 s sleep loop, wake-on-CAN confirmation, resume-in-place, ignition and engine detection, trip recording, quiesce, the sleep countdown and the teardown order |
+| [returning-to-datalogger.md](returning-to-datalogger.md) | Why a device stops running the Datalogger and what brings it back: the stored mode read once at boot (Bench SLCAN, the hidden selector, the SmartConnect override), the park/claim/flash coexistence flags and every reason the dead-man reaper refuses, the recording gates, plus a diagnosis and recovery runbook |
 | [web_ui.md](web_ui.md) | Web UI build pipeline, lint gates, and the hidden-feature (streamline) pattern |
 | [wifi_diag.md](wifi_diag.md) | Wi-Fi link diagnostics: the 1 Hz sampler, disconnect-reason capture, the findings rules, the standalone diagnostic page, and what gets masked in the report |
 
