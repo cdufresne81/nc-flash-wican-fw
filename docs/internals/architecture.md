@@ -73,13 +73,17 @@ two are the real "hide, don't delete" residue.
   keeping; if you find some, it is upstream residue.
 - **One board.** `CMakeLists.txt:54` hardcodes `set(HARDWARE_VER ${WICAN_PRO})`.
   The V210 / V300 / USB_V100 lines above it are commented out.
-- **One protocol, in practice — but not out of the box.** A configured device
-  runs `poll_log`. The **factory default is `elm327`** (`"protocol":"elm327"` in
-  `device_config_default[]`, `config_server.c:197`), so a freshly flashed or
-  factory-reset device runs the legacy front-end until someone configures it.
-  Worth knowing before you conclude a bench device is broken. Other
-  protocols still exist behind the `protocol` config key for bench use; the
-  selector is hidden in the UI.
+- **One protocol, in practice — and out of the box too.** A configured device
+  runs `poll_log`, and so does a factory-reset one: the **live**
+  `device_config_default[]` in `config_server.c` carries `"protocol":"poll_log"`.
+  Two older defaults naming `elm327` sit just below it, commented out — this doc
+  previously cited one of those and claimed the factory default was `elm327`,
+  which was wrong. Note that `config_server_protocol()` falls back to
+  `OBD_ELM327` for an *unrecognised* string, while a *missing* `protocol` key
+  makes the whole config load fail, so corrupt and absent behave differently.
+  Other protocols still exist behind the `protocol` config key for bench use;
+  the selector is hidden in the UI. A device's actual boot mode is now recorded
+  on the `MODE` event-log line, and readable over HTTP at `/host_caps`.
 - **No serial console.** The USB-C port is a USB **host** at runtime. You cannot
   attach a PC and read logs the normal way. Every diagnostic has to arrive over
   Wi-Fi — which is why `/poll_status`, `/event_log` and the crash-report

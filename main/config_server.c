@@ -104,6 +104,7 @@
 #include "restart_tracker.h"
 #include "restart_tracker_http.h"
 #include "led_indicator.h"
+#include "ncflash_fastread.h"   /* NCFLASH_FASTREAD_REV, reported by /host_caps */
 
 
 #define WIFI_CONNECTED_BIT			BIT0
@@ -465,6 +466,24 @@ wifi_security_t config_server_get_drive_security_type(void)
 		return WIFI_WPA3_PSK;
 	}
 	return WIFI_WPA3_PSK; // Default to WPA3
+}
+
+const char *config_server_protocol_str(void)
+{
+	return device_config.protocol;
+}
+
+const char *config_server_protocol_name(int8_t protocol)
+{
+	switch(protocol)
+	{
+		case SLCAN:       return "slcan";
+		case OBD_ELM327:  return "elm327";
+		case AUTO_PID:    return "auto_pid";
+		case FAST_LOG:    return "fast_log";
+		case POLL_LOG:    return "poll_log";
+		default:          return "unknown";
+	}
 }
 
 int8_t config_server_protocol(void)
@@ -1688,8 +1707,56 @@ static esp_err_t check_status_handler(httpd_req_t *req)
 	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
 
     free((void *)resp_str);
-    
+
     return ESP_OK;
+}
+
+/* GET /host_caps -- the narrow capability probe NC Flash uses (issue #92).
+ *
+ * Deliberately tiny and free of secrets. It exists so a host tool can settle
+ * "does this device support no-reboot flashing, and what mode will it be in
+ * after a reboot?" by reading two values, instead of inferring capability from
+ * which socket error arrived first on a marginal link -- an inference that was
+ * measured wrong (on Windows a REFUSED connect takes ~2 s to surface, past the
+ * host's 1.5 s probe budget, so old firmware looked like a network fault).
+ *
+ * Two contracts a future editor must not break:
+ *   * "protocol" is the STORED mode (device_config.protocol), NOT the resolved
+ *     running one. The host's stranded-device sweep asks "what will this device
+ *     be after a reboot", and under SmartConnect the two differ -- reporting the
+ *     running mode would make it judge a stranded device healthy.
+ *   * "ncfr_rev" derives from NCFLASH_FASTREAD_REV, the same number the NCFRv
+ *     wire marker is built from, so the two can never disagree.
+ *
+ * Its ABSENCE is not evidence: the shipped host treats a 404 as "unknown" and
+ * falls back, because every build before this one answers 404.
+ */
+static esp_err_t host_caps_handler(httpd_req_t *req)
+{
+	cJSON *root = cJSON_CreateObject();
+	if(root == NULL)
+	{
+		httpd_resp_send_500(req);
+		return ESP_FAIL;
+	}
+	cJSON_AddNumberToObject(root, "ncfr_rev", NCFLASH_FASTREAD_REV);
+	/* cJSON rather than snprintf: the stored string is parser-bounded but not
+	 * charset-restricted, and this escapes it for free. */
+	cJSON_AddStringToObject(root, "protocol", device_config.protocol);
+
+	char *resp_str = cJSON_PrintUnformatted(root);
+	cJSON_Delete(root);
+	if(resp_str == NULL)
+	{
+		httpd_resp_send_500(req);
+		return ESP_FAIL;
+	}
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+	cJSON_free(resp_str);
+
+	return ESP_OK;
 }
 
 typedef struct {
@@ -2234,6 +2301,12 @@ static const httpd_uri_t check_status_uri = {
     .handler   = check_status_handler,
     /* Let's pass response string in user
      * context to demonstrate it's usage */
+    .user_ctx  = NULL
+};
+static const httpd_uri_t host_caps_uri = {
+    .uri       = "/host_caps",
+    .method    = HTTP_GET,
+    .handler   = host_caps_handler,
     .user_ctx  = NULL
 };
 static const httpd_uri_t load_config_uri = {
@@ -3434,6 +3507,7 @@ static void register_server_uris(void)
 	httpd_register_uri_handler(server, &index_uri);
 	httpd_register_uri_handler(server, &store_config_uri);
 	httpd_register_uri_handler(server, &check_status_uri);
+	httpd_register_uri_handler(server, &host_caps_uri);
 	httpd_register_uri_handler(server, &load_config_uri);
 	httpd_register_uri_handler(server, &logo_uri);
 	httpd_register_uri_handler(server, &file_upload);

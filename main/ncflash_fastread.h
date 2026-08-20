@@ -37,7 +37,17 @@
  * 35001). v6 means ONLY "the dedicated port exists + routes the protocol-agnostic codecs"; the
  * REST /datalog endpoint (36.C) is a SEPARATE capability the host soft-detects (404 degrades, never
  * aborts a flash). Keep this in lockstep with COEXIST_MIN_FW_REV. */
-#define NCFLASH_FASTREAD_VERSION   "NCFRv6\n"   /* v6: no-reboot SLCAN coexistence (dedicated port 35001); v5: clean-teardown + live SD fastwrite */
+/* Bump ONLY this number. Both the wire marker below and the "ncfr_rev" field of
+ * GET /host_caps derive from it, so the rev a host reads over HTTP can never
+ * disagree with the one it reads off the port -- which is precisely the
+ * confusion /host_caps exists to end (issue #92). */
+#define NCFLASH_FASTREAD_REV       6
+#define NCFLASH_STR2(x)            #x
+#define NCFLASH_STR(x)             NCFLASH_STR2(x)
+/* Byte-identical to the hand-written "NCFRv6\n" it replaces: adjacent string
+ * literals are concatenated at compile time, so every existing use -- including
+ * sizeof() on the streamed marker -- is unchanged. */
+#define NCFLASH_FASTREAD_VERSION   "NCFRv" NCFLASH_STR(NCFLASH_FASTREAD_REV) "\n"   /* v6: no-reboot SLCAN coexistence (dedicated port 35001); v5: clean-teardown + live SD fastwrite */
 
 /* Sync preamble streamed once, right after CAN forwarding is suspended and
  * before the first ROM byte. Any CAN frames already queued/in-flight toward the
