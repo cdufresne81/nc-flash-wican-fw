@@ -3481,6 +3481,129 @@ async function postConfig() {
     xhttp.send(configJSON);
 }
 
+// --- Restore Datalogger mode (issue #92) -------------------------------------
+//
+// A device left in Bench SLCAN stops datalogging and, before this, the only way
+// out was downloading config.json, hand-editing one key, and uploading it back.
+// The banner above now carries a button instead.
+//
+// The button is only safe because of this check. That banner is ALSO visible
+// during every legitimate NC Flash session on older firmware -- which switches
+// the device to slcan on purpose for the duration of a flash. Clicking it then
+// would reboot the adapter out from under a live ECU write and can leave the
+// car's PCM half-written. So we ask the firmware what is going on first, and
+// refuse while anything is holding the bus.
+
+/**
+ * Decide what the restore button may do, given GET /datalog.
+ *
+ * Pure and side-effect free so the gating can be tested without a browser --
+ * this is the part that must never be wrong.
+ *
+ * @param d parsed /datalog body, or null when it is unreachable or absent
+ *          (older firmware has no such endpoint). null means "cannot confirm",
+ *          NEVER "nothing is running".
+ * @returns {{action: 'refuse'|'confirm'|'proceed', message: string}}
+ */
+function strandRestoreDecision(d) {
+    if (d && (d.flash_active || d.host_bus_claimed)) {
+        return {
+            action: 'refuse',
+            message: 'An NC Flash session or an ECU flash is active on this device. ' +
+                     'Restoring now would reboot it and could interrupt a write to the ' +
+                     'car\'s ECU. Close NC Flash first, then try again.'
+        };
+    }
+    if (d && d.stuck_flash_alarm) {
+        return {
+            action: 'refuse',
+            message: 'This device reports a flash that never finished. Rebooting will ' +
+                     'not clear it. Power-cycle the device, then try again.'
+        };
+    }
+    if (!d) {
+        return {
+            action: 'confirm',
+            message: 'The device could not confirm that no ECU flash is running ' +
+                     '(older firmware?). Continue ONLY if you are certain NC Flash is ' +
+                     'not flashing or reading the ECU right now.\n\nRestore Datalogger ' +
+                     'mode and reboot?'
+        };
+    }
+    if (d.datalog_parked) {
+        // Soft, not hard: a park can be left behind by a dead host socket, and a
+        // permanent refusal here would push the user back to hand-editing -- the
+        // exact thing this button exists to replace.
+        return {
+            action: 'confirm',
+            message: 'A host tool has paused the datalogger and may still be mid-session. ' +
+                     'Restore Datalogger mode and reboot anyway?'
+        };
+    }
+    return {
+        action: 'proceed',
+        message: 'Restore Datalogger (poll_log) mode? The device will reboot, which takes ' +
+                 'about 6 seconds.'
+    };
+}
+
+async function restoreDataloggerMode() {
+    const btn = document.getElementById("restore_datalogger_btn");
+    if (btn) btn.disabled = true;
+    try {
+        // Ask the firmware what is happening. Any failure -- network, 404 on
+        // firmware that predates /datalog, unparseable body -- becomes null,
+        // which the decision treats as "cannot confirm", not as "all clear".
+        let state = null;
+        try {
+            const r = await fetch("/datalog", { cache: "no-store" });
+            if (r.ok) state = await r.json();
+        } catch (e) {
+            state = null;
+        }
+
+        const decision = strandRestoreDecision(state);
+        if (decision.action === 'refuse') {
+            showNotification(decision.message, "red", 12000);
+            return;
+        }
+        if (!confirm(decision.message)) return;
+
+        // The designed round-trip: /load_config serves the stored file with
+        // secrets swapped for the placeholder and /store_config swaps them back,
+        // so changing one key here changes exactly one key on the device.
+        const cfgResp = await fetch("/load_config", { cache: "no-store" });
+        if (!cfgResp.ok) {
+            showNotification("Could not read the device configuration (HTTP " +
+                             cfgResp.status + "). Restore it by hand from the System page.",
+                             "red", 12000);
+            return;
+        }
+        const cfg = await cfgResp.json();
+        cfg.protocol = "poll_log";
+
+        const saveResp = await fetch("/store_config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(cfg)
+        });
+        if (!saveResp.ok) {
+            showNotification("Could not save the configuration (HTTP " + saveResp.status +
+                             "). Restore it by hand from the System page.", "red", 12000);
+            return;
+        }
+
+        // protocol is not live-appliable, so the device reboots itself.
+        showNotification("Restoring Datalogger mode. The device is rebooting...", "yellow", 9000);
+        setTimeout(function() { window.location.reload(); }, 8000);
+    } catch (e) {
+        console.error("restoreDataloggerMode failed", e);
+        showNotification("Could not restore Datalogger mode: " + e, "red", 12000);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
 function toggleApSsid() {
     const enEl = document.getElementById("ap_ssid_enable");
     const valEl = document.getElementById("ap_ssid_value");
