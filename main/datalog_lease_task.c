@@ -53,7 +53,12 @@ static void datalog_lease_task(void *arg)
         can_coexist_snapshot_t s;
         can_coexist_snapshot(&s);
 
-        const bool bus_idle = (s.bus_idle_ms >= COEXIST_BUS_IDLE_QUIESCE_MS);
+        /* Gate on DIAGNOSTIC idle, not raw bus idle (#131/#70). Raw bus idle is ~0 forever on a
+         * running car -- the PCM broadcasts ~2000 frames/s -- so the old gate could never open
+         * and neither reap could ever fire, exactly when a stranded datalogger matters most.
+         * What both reaps actually need to know is "is a diagnostic conversation in flight",
+         * which is what can_diag_idle_ms() measures (our TX + ECU responses). */
+        const bool diag_idle = (s.diag_idle_ms >= COEXIST_BUS_IDLE_QUIESCE_MS);
 
         /* --- Stuck-flash ALARM (INV-7) ------------------------------------------------
          * A flash that holds FLASH_ACTIVE_BIT past the ceiling is wedged (host vanished
@@ -92,7 +97,7 @@ static void datalog_lease_task(void *arg)
         {
             const bool teardown_elapsed =
                 s.claim_armed && (s.now_us > s.claim_deadline_us + COEXIST_TEARDOWN_GRACE_US);
-            if (s.claim_expired && !s.claim_owner_alive && bus_idle && teardown_elapsed &&
+            if (s.claim_expired && !s.claim_owner_alive && diag_idle && teardown_elapsed &&
                 can_host_bus_claim_reap(s.claim_token, s.claim_deadline_us))
             {
                 s.host_bus_claimed = false;  /* allow the datalog-reap below this tick */
@@ -107,23 +112,23 @@ static void datalog_lease_task(void *arg)
 
         /* --- DATALOG-REAP (INV-4) -----------------------------------------------------
          * Resume the datalogger ONLY when it is parked, no flash, no claim, the host is
-         * provably gone (park lease expired AND its owning socket gone) and the bus is
-         * provably idle. Same compare-and-act guard: can_park_lease_reap() lowers the park
+         * provably gone (park lease expired AND its owning socket gone) and no diagnostic
+         * exchange is in flight. Same compare-and-act guard: can_park_lease_reap() lowers the park
          * flag only if the lease is still the sampled (token,deadline); a fresh op=pause in
          * the gap aborts. Only THEN restore the pre-pause mode. Never touches BIT1. */
-        if (s.datalog_parked && s.park_expired && !s.park_owner_alive && bus_idle &&
+        if (s.datalog_parked && s.park_expired && !s.park_owner_alive && diag_idle &&
             can_park_lease_reap(s.park_token, s.park_deadline_us))
         {
             datalog_restore_mode();
-            ESP_LOGW(TAG, "NCDLAUTORESUME datalogger auto-resumed (host gone, bus idle)");
+            ESP_LOGW(TAG, "NCDLAUTORESUME datalogger auto-resumed (host gone, no diagnostics)");
             // Highest-value observability line (Task #12): the brick-safe dead-man recovery. Records
             // that the firmware -- not the host -- resumed the datalogger, and the host-gone signals
-            // that fired (park lease TTL expired AND its owning socket dropped; the bus then went
-            // idle). claim_reaped distinguishes "host vanished mid bus-claim/flash" from a plain
+            // that fired (park lease TTL expired AND its owning socket dropped; the diagnostics then
+            // gone quiet). claim_reaped distinguishes "host vanished mid bus-claim/flash" from a plain
             // parked-then-gone. event_log_emit is non-blocking, safe from this prio-2 task.
             event_log_emit(EVL_REAPER_RESUME,
-                           "auto-resume: host gone (ttl_expired socket_dropped) bus_idle=%ums%s",
-                           (unsigned)s.bus_idle_ms, claim_reaped ? " mid_claim" : "");
+                           "auto-resume: host gone (ttl_expired socket_dropped) diag_idle=%ums%s",
+                           (unsigned)s.diag_idle_ms, claim_reaped ? " mid_claim" : "");
         }
     }
 }

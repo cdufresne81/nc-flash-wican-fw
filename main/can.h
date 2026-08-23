@@ -95,6 +95,10 @@ bool can_sleep_fence_active(void);
 #define COEXIST_HOST_CLAIM_LEASE_TTL_US  (75ULL  * 1000000ULL)  /* > worst-case 60s 7F..78 auth + margin */
 #define COEXIST_HOST_CLAIM_LEASE_TTL_MS  (75000U)
 #define COEXIST_BUS_IDLE_QUIESCE_MS      (300U)                 /* SD flash drives blocks ~211ms apart */
+/* NOTE (#131/#70): the reaper applies COEXIST_BUS_IDLE_QUIESCE_MS to the DIAGNOSTIC-idle clock
+ * (can_diag_idle_ms), not to raw bus idle. The value and the host-side name are unchanged --
+ * 300 ms still comfortably exceeds the ~211 ms inter-block gap of an SD-driven flash, which is
+ * diagnostic traffic and must keep holding the reaps off. */
 #define COEXIST_TEARDOWN_GRACE_US        (3ULL   * 1000000ULL)  /* wait after claim-expiry before resume */
 #define COEXIST_STUCK_FLASH_CEILING_US   (180ULL * 1000000ULL)  /* alarm only -- NEVER clears BIT1 */
 #define COEXIST_REAPER_TICK_MS           (1000U)                /* dead-man reaper poll period */
@@ -122,8 +126,15 @@ bool     can_park_lease_release(uint32_t token);     /* token-matched clear (0 =
 bool     can_park_lease_reap(uint32_t token, uint64_t deadline_us);       /* reaper compare-and-clear */
 uint32_t can_park_token(void);                        /* 0 = disarmed */
 
-/* Bus-idle evidence: ms since the last TWAI TX or RX (whichever is later). */
+/* Bus-idle evidence: ms since the last TWAI TX or RX (whichever is later).
+ * OBSERVABILITY ONLY since #131 -- on a running car this is ~0 forever (the PCM broadcasts
+ * constantly), which is exactly why the reaper stopped being able to fire. */
 uint32_t can_bus_idle_ms(void);
+
+/* Diagnostic-idle evidence: ms since the last TX by us, or the last RX frame in the OBD
+ * diagnostic ID range. "No diagnostic conversation is in flight" -- this is what the dead-man
+ * reaper gates on. */
+uint32_t can_diag_idle_ms(void);
 
 /* Stuck-flash alarm (reported in /datalog state JSON; NEVER clears FLASH_ACTIVE_BIT). */
 void can_set_stuck_flash_alarm(bool on);
@@ -148,7 +159,8 @@ typedef struct {
     uint32_t park_token;
     uint64_t park_deadline_us;
     bool     park_owner_alive;
-    uint32_t bus_idle_ms;
+    uint32_t bus_idle_ms;   /* raw TWAI idle -- observability only */
+    uint32_t diag_idle_ms;  /* diagnostic idle -- what the reaps gate on */
 } can_coexist_snapshot_t;
 void can_coexist_snapshot(can_coexist_snapshot_t *out);
 

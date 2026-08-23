@@ -1270,6 +1270,9 @@ static char *datalog_state_json(void)
     cJSON_AddNumberToObject(root, "lease_ttl_ms", COEXIST_PARK_LEASE_TTL_MS);
     cJSON_AddNumberToObject(root, "claim_ttl_ms", COEXIST_HOST_CLAIM_LEASE_TTL_MS);
     cJSON_AddNumberToObject(root, "bus_idle_ms", can_bus_idle_ms());
+    /* #131: what the reaper actually gates on. bus_idle_ms stays for compatibility, but on a
+     * running car it reads ~0 forever and tells you nothing about whether a reap can fire. */
+    cJSON_AddNumberToObject(root, "diag_idle_ms", can_diag_idle_ms());
     cJSON_AddBoolToObject(root, "stuck_flash_alarm", can_stuck_flash_alarm());
     char *out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
