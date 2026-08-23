@@ -52,8 +52,10 @@
  *
  * 60 s is not a guess: the legacy host path gave every request a cumulative 60 s silent budget
  * (TIMEOUT_RESPONSE_PENDING_MAX, nc-flash src/ecu/constants.py:158, commented "generous, to ride
- * out a slow flash erase"). Nobody has ever measured a real erase on this ECU -- the edge wait is
- * now logged so we finally get the number.
+ * out a slow flash erase"). And it is now backed by measurement: a full-ROM erase on a live NC
+ * PCM took 12.6 s (bench, 2026-08-23, logged by the emit below), so 60 s is ~4.7x headroom rather
+ * than a round number. Do not shrink it toward the measurement -- a colder or older ECU has no
+ * reason to match, and the cost of being wrong is a bricked one.
  *
  * This is ONE budget for the WHOLE edge: the Flow-Control wait and the ACK wait share it. They are
  * two separate stalls and a silently-erasing ECU can hit either, so budgeting them separately
@@ -591,12 +593,27 @@ int ncflash_fast_write(const uint8_t *buf, int len, QueueHandle_t *tx_queue)
                 }
                 if (erase_edge)
                 {
-                    /* The number nobody has ever measured: how long this ECU really takes to
-                     * answer at the erase edge. Two lines per live flash, and the first real data
-                     * for sizing RESP_ERASE_TIMEOUT_MS instead of guessing at it. */
-                    event_log_emit(EVL_INFO,
-                                   "flash erase edge: ECU answered after %lu ms (region %d)",
-                                   (unsigned long)((esp_timer_get_time() - edge_t0) / 1000), r);
+                    /* How long this ECU really takes to erase -- the number that sizes
+                     * RESP_ERASE_TIMEOUT_MS instead of guessing at it. Measured 2026-08-23 on a
+                     * live PCM: 12.6 s for a full ROM, 1.4 s for a 134-block image, and 46 ms at
+                     * the region-1 edge (this ECU erases once, at the region-0 edge, and the
+                     * region-1 wait is a non-event).
+                     *
+                     * Only waits of a second or more are logged. Below that nothing stalled and
+                     * the line is noise -- but the threshold is the ONLY filter, so an ECU that
+                     * ever did erase at region 1 would still show up here. Message is in seconds
+                     * and carries no region label, by owner request: it is read by the person
+                     * watching a progress bar sit still, not by the flash code. */
+                    const uint32_t edge_ms =
+                        (uint32_t)((esp_timer_get_time() - edge_t0) / 1000);
+                    if (edge_ms >= 1000)
+                    {
+                        const uint32_t r10 = edge_ms + 50; /* round to a tenth, not truncate */
+                        event_log_emit(EVL_INFO,
+                                       "waited %lu.%lu s while the ECU cleared its memory for the new ROM",
+                                       (unsigned long)(r10 / 1000),
+                                       (unsigned long)((r10 % 1000) / 100));
+                    }
                 }
             }
 
