@@ -207,6 +207,13 @@ char *config_server_get_ap_pass(void);
 int8_t config_server_get_ap_ssid_en(void);
 char *config_server_get_ap_ssid(void);
 int8_t config_server_protocol(void);
+/* The STORED protocol string, verbatim. config_server_protocol() above maps it to an
+ * enum and coerces unknown values to OBD_ELM327, which is the right thing for dispatch
+ * but hides what is actually on disk -- and what is on disk is the thing that strands a
+ * device in Bench SLCAN (issue #92). Used by the boot MODE line and /host_caps. */
+const char *config_server_protocol_str(void);
+/* Name of a resolved protocol enum value, for logging. Never NULL. */
+const char *config_server_protocol_name(int8_t protocol);
 int config_server_ble_pass(void);
 int8_t config_server_get_sleep_config(void);
 int8_t config_server_get_can_wake(void);

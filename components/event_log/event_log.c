@@ -101,6 +101,7 @@ static const char *evl_code_str(event_log_code_t code)
     switch (code)
     {
         case EVL_BOOT:          return "BOOT";
+        case EVL_MODE:          return "MODE";
         case EVL_IGNITION_ON:   return "IGNITION_ON";
         case EVL_IGNITION_OFF:  return "IGNITION_OFF";
         case EVL_ENGINE_ON:     return "ENGINE_ON";

@@ -58,6 +58,11 @@ extern "C" {
 // Event categories. Keep the set small and debugging-focused.
 typedef enum {
     EVL_BOOT = 0,        // power-on / reset (reason + firmware version)
+    // The operating mode this boot resolved to. It CANNOT ride on EVL_BOOT: that line is
+    // emitted before config.json is parsed, so the mode there would always be the fallback.
+    // Carries the stored AND the running mode because they legitimately differ under
+    // SmartConnect -- which also makes that discrepancy visible in the log for free.
+    EVL_MODE,            // resolved protocol at boot (stored vs running)
     // #98: "ignition", not "engine". The evidence is that the ECU answers, and it answers at
     // key-on with the engine not turning too -- so these can never mean "the crank is spinning".
     EVL_IGNITION_ON,     // poll_log: ECU answering again (bus resume)

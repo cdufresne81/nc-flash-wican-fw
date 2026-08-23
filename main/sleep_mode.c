@@ -648,6 +648,14 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
  * call, 2026-08-06: give up after 30 minutes. */
 #define SLEEP_FLASH_STUCK_CEILING_MS  (30 * 60 * 1000)
 
+/* Gap after which a refusal belongs to a NEW streak rather than continuing the last one. Three
+ * retry periods: long enough that an ordinary 60 s retry cadence never splits one flash into
+ * several streaks, short enough that a streak abandoned when the countdown was cancelled cannot
+ * still be "running" the next time a flash arrives. Without this the stuck-flash ceiling can be
+ * armed by a stale timestamp and fire on a flash seconds old -- see the reset in
+ * sleep_mode_teardown for why that is a brick-direction failure. */
+#define SLEEP_FLASH_STREAK_GAP_MS     (3 * SLEEP_FLASH_RETRY_MS)
+
 /* Issue #88: how long to wait after raising the sleep fence for the CAN producers to notice it
  * and park. Sized to cover one poll_log loop iteration for a task that was already past its
  * park check when the fence went up; proven sufficient by the #89 spike, which used the same
@@ -1034,6 +1042,7 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
      * asks again shortly; a flash is finite, so this postpones sleep, it never cancels it. */
     static bool    postpone_logged  = false;  /* one line per flash session, not per retry */
     static int64_t postpone_start_us = 0;     /* when this refusal streak began */
+    static int64_t postpone_last_us  = 0;     /* last pass that REFUSED -- see the streak reset */
 
     /* A firmware OTA is the same hazard against a different resource. The teardown's
      * wifi_mgr_deinit() pulls the network stack out from under a live HTTP upload; on the bench
@@ -1045,10 +1054,74 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
      * case below, so a stuck upload can never hold sleep off forever and flatten the battery. */
     const bool busy_flashing = can_flash_active() || config_server_ota_active();
 
-    if (busy_flashing && !force)
+    /* Issue #92 -- a host session that is NOT a flash. NC Flash raises the bus-claim lease for
+     * the whole of any ECU conversation (DTC reads, RAM operations, the authentication window),
+     * and only some of those raise FLASH_ACTIVE_BIT. Sleeping through one tears the bus and the
+     * network out from under a live session for no reason.
+     *
+     * Gate on the LEASE, never on can_host_bus_claim_active(): the raw flag stays set until the
+     * dead-man reaper clears it, and the reaper is gated on the bus going idle -- which, key-on,
+     * does not happen until the key turns off (#70). Holding sleep off on the raw flag would
+     * therefore be unbounded, trading a rare cut session for a flat battery. The lease is
+     * self-bounding instead -- but read the bound precisely. The host renews every 4 s against a
+     * 75 s TTL, so once the owning 35001 socket is GONE this drops within the TTL. The socket
+     * dying is what every real host death looks like: a crash, a suspend, a WiFi drop or an
+     * unplugged cable all surface as a closed or dead socket within ~20 s (TCP keepalive on
+     * 35001 is 5 s idle / 5 s interval / 3 probes), and the owner_alive term exists to cover
+     * exactly that tail, where the lease has expired but the socket is still retransmitting.
+     *
+     * What this is NOT is a hard 75 s ceiling. owner_alive stays true for as long as that same
+     * socket stays open, so a host application that FREEZES while its machine stays awake and
+     * connected -- renewals stopped, socket never closed -- holds sleep off for as long as it
+     * sits there, not for 75 s. Left overnight in a parked car that flattens the battery. It is
+     * accepted knowingly: before #92 the same situation cut a live flash instead, which is the
+     * worse of the two. Do not design anything new against a TTL bound that is not there.
+     *
+     * This consults no reaper output at all, so a stuck reaper cannot extend it. */
+    can_coexist_snapshot_t coexist;
+    can_coexist_snapshot(&coexist);
+    const bool session_live = (coexist.host_bus_claimed &&
+                               (!coexist.claim_expired || coexist.claim_owner_alive)) ||
+                              /* A park being actively RENEWED is a live session too, and must be
+                               * caught here as well as by the veto -- otherwise a park-only session
+                               * that slipped through the sub-pass race would sleep, which is the one
+                               * hole this backstop exists to close. Lease-validity again, never the
+                               * raw flag: a park a dead host left behind goes stale in 12 s and must
+                               * NOT hold sleep off. */
+                              (coexist.datalog_parked &&
+                               (!coexist.park_expired || coexist.park_owner_alive));
+
+    if ((busy_flashing || session_live) && !force)
     {
         const int64_t now = esp_timer_get_time();
-        if (postpone_start_us == 0) postpone_start_us = now;
+
+        /* Start a NEW streak whenever the last refusal is too old to belong to this one.
+         *
+         * The reset at the bottom of this block only runs when teardown is called again AND the
+         * refusal condition has gone false -- and most streaks never end that way. A backstop
+         * refusal leaves the machine in LOW_VOLTAGE, and the very next pass the #92 veto cancels
+         * it back to NORMAL, so teardown is never re-entered and postpone_start_us would keep a
+         * stale timestamp indefinitely. (Pre-existing form of the same leak: the voltage recovers
+         * mid-postpone and LOW_VOLTAGE exits without another teardown call.)
+         *
+         * That is dangerous in the BRICK direction, which is why the gap test is here rather than
+         * left as tidy-up: a later, claim-less busy_flashing case -- an in-car OTA at 12.5 V, or a
+         * curl-driven fastwrite -- would compute elapsed from the stale stamp, read it as hours,
+         * and fire the "assume it is stuck, sleep anyway" ceiling on a flash that started seconds
+         * ago. That tears down WiFi under a live upload and the CAN bus under a live ECU write:
+         * exactly the PCM brick #86 exists to prevent.
+         *
+         * Deliberate tradeoff: a genuinely stuck flash whose postpones are broken up by voltage
+         * flapping across the threshold now restarts its 30-min clock per streak instead of
+         * accumulating across them. Every streak is still ceiling-bounded, so the cost is a slower
+         * battery drain in a rare case -- taken knowingly over a misfire in the brick direction. */
+        if (postpone_start_us == 0 ||
+            (now - postpone_last_us) > ((int64_t)SLEEP_FLASH_STREAK_GAP_MS * 1000))
+        {
+            postpone_start_us = now;
+            postpone_logged   = false;   /* a new streak earns its own line */
+        }
+        postpone_last_us = now;
 
         /* The postpone MUST be bounded. FLASH_ACTIVE_BIT is codec-owned with no reaper, so a
          * codec that crashes or hangs with it raised would refuse sleep forever and flatten the
@@ -1056,7 +1129,13 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
          * minutes. Past the ceiling we assume it is stuck and sleep anyway: the PCM risk from
          * cutting a flash that has been frozen for half an hour is already realised -- that
          * transfer is dead either way -- whereas the battery is still savable. */
-        if ((now - postpone_start_us) > (int64_t)SLEEP_FLASH_STUCK_CEILING_MS * 1000)
+        /* The ceiling exists for the FLASH/OTA causes only, and a live claim still vetoes it.
+         * A claim needs no ceiling of its own -- its 75 s TTL already is one -- so if the claim
+         * is still live here, the host is genuinely renewing and cutting it is exactly the bug
+         * this guard was added for. Sleeping anyway is only ever the lesser evil against a bit
+         * that nothing will ever lower. */
+        if (busy_flashing && !session_live &&
+            (now - postpone_start_us) > (int64_t)SLEEP_FLASH_STUCK_CEILING_MS * 1000)
         {
             ESP_LOGE(TAG, "flash active %d min -- assuming stuck, sleeping anyway (#86)",
                      SLEEP_FLASH_STUCK_CEILING_MS / 60000);
@@ -1075,10 +1154,18 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
                     ESP_LOGW(TAG, "sleep postponed: ECU flash active on the bus (#86)");
                     event_log_emit(EVL_INFO, "sleep postponed -- ECU flash active (would have cut the bus mid-write)");
                 }
-                else
+                else if (config_server_ota_active())
                 {
                     ESP_LOGW(TAG, "sleep postponed: firmware OTA upload in progress");
                     event_log_emit(EVL_INFO, "sleep postponed -- firmware OTA in progress (would have cut the upload)");
+                }
+                else
+                {
+                    /* Session postpone. Bounded by the lease once the host's socket is gone --
+                     * TTL plus one retry -- but not while that socket stays open; see the gate
+                     * comment above for the frozen-host case this deliberately does not bound. */
+                    ESP_LOGW(TAG, "sleep postponed: host session active -- claim/park lease held (#92)");
+                    event_log_emit(EVL_INFO, "sleep postponed -- host session active (claim/park lease held)");
                 }
             }
             return false;
@@ -1603,6 +1690,11 @@ void light_sleep_task(void *pvParameters)
 	 * five separate times. That clearing is also what guarantees the cancel line can never be
 	 * swallowed; the proof is at the call site. */
 	static bool ecu_veto_logged = false;
+	/* #92: the same latch for the host-claim veto. DELIBERATELY separate from ecu_veto_logged --
+	 * the two causes are independent episodes, and sharing one latch would swallow whichever line
+	 * came second whenever both vetoes overlapped. Cleared every pass the claim is not live, for
+	 * the same resume-in-place reason as above. */
+	static bool claim_veto_logged = false;
 	/* Rate limit for the "sleep countdown started" line. Entering LOW_VOLTAGE is a genuinely new
 	 * countdown every time, so a per-episode latch would be wrong -- but a battery sitting exactly
 	 * on the threshold (a tender, or a cycling key-off load) can cross it every ~2.5 s, which would
@@ -1804,6 +1896,45 @@ void light_sleep_task(void *pvParameters)
             ecu_veto_logged = false;   /* re-arm the one-line-per-episode latch */
         }
 
+        /* ---- #92 sleep veto: "NC Flash is using the device right now" -------------------
+         * Sampled ONCE per pass on the same rule as the ECU veto above, so the entry veto, the
+         * cancel and the log line cannot disagree within one iteration.
+         *
+         * This is NOT redundant with the ECU veto -- it is the veto the ECU one gives up. The
+         * instant a host claims the bus, can_should_park() goes true (can.c:255) and therefore
+         * poll_log_ecu_answering() goes FALSE even with the engine running and the ECU answering
+         * normally (poll_log.c:1826). That is deliberate -- poll_log.c:1815-1818 says it "hands
+         * the decision back to the teardown's own bounded interlock instead" -- but before #92
+         * that interlock only covered flash and OTA, so a plain bus claim (DTC reads, RAM ops,
+         * the pre-flash auth window) fell through it and the device could sleep mid-session.
+         *
+         * Read the LEASE, never can_host_bus_claim_active(): the raw flag stays set until the
+         * dead-man reaper clears it, and that reap waits for the bus to go idle -- which, key-on,
+         * means key-off (#70). Vetoing on the raw flag would hide a device that never sleeps
+         * behind a UI reporting NORMAL. The lease self-bounds, with the caveat spelled out at the
+         * teardown gate: the host renews every 4 s against a 75 s TTL, so this drops within the
+         * TTL once the owning 35001 socket is gone (~20 s of TCP keepalive covers every way the
+         * host machine dies) -- but for as long as that socket stays open it holds. */
+        can_coexist_snapshot_t sleep_coexist;
+        can_coexist_snapshot(&sleep_coexist);
+        const bool claim_live = sleep_coexist.host_bus_claimed &&
+                                (!sleep_coexist.claim_expired || sleep_coexist.claim_owner_alive);
+        /* The park counts too, on the same lease-validity rule and for the same reason: a park
+         * being RENEWED means a host is working right now, and sleeping would cut its connection.
+         * Note this is not the "do not block sleep on a park" rule from the teardown design -- that
+         * was about the RAW flag, which a dead host leaves raised until the reaper clears it. The
+         * park TTL is only 12 s (can.h:94) against the same 4 s host keepalive, so a dead host's
+         * park goes stale FASTER than its claim does: this tightens the battery bound rather than
+         * loosening it. */
+        const bool park_live  = sleep_coexist.datalog_parked &&
+                                (!sleep_coexist.park_expired || sleep_coexist.park_owner_alive);
+        const bool session_live = claim_live || park_live;
+
+        if (!session_live)
+        {
+            claim_veto_logged = false;   /* independent episode from the ECU latch */
+        }
+
         /* The same credit the voltage path gives just above, on the other proof. Deliberately
          * OUTSIDE the ADC-success block: an answering ECU shows the wake led somewhere whether or
          * not this pass managed to read the battery, and tying it to a good ADC read would let a
@@ -1837,6 +1968,19 @@ void light_sleep_task(void *pvParameters)
                              * that IGNITION_ON and /sleep_status do not already say. */
                             sleep_log_ecu_veto(battery_voltage, &ecu_veto_logged);
                         }
+                        else if (session_live)
+                        {
+                            /* #92: same reasoning, other cause -- serial only, because nothing was
+                             * started and /datalog already reports the claim. Touch NO cd fields
+                             * here: no countdown exists, cd.armed_us is already 0, and the arm
+                             * below assigns the whole struct in one go. */
+                            if (!claim_veto_logged)
+                            {
+                                claim_veto_logged = true;
+                                ESP_LOGW(TAG, "Battery low (%.2fV) but NC Flash is using the device "
+                                              "-- sleep countdown not started (#92)", battery_voltage);
+                            }
+                        }
                         else
                         {
                             ESP_LOGW(TAG, "Battery voltage low (%.2fV), starting low voltage timer", battery_voltage);
@@ -1859,9 +2003,22 @@ void light_sleep_task(void *pvParameters)
                      * Abandon the countdown and go back to NORMAL. Re-entering later re-arms the
                      * FULL sleep_time, which is deliberate: "sleep N minutes after the car goes
                      * quiet", counted from ECU silence rather than from the voltage dipping. */
-                    if (ecu_answering)
+                    /* #92 shares this exact exit rather than adding a second one. The comment on
+                     * the countdown struct warns that the next person to add an exit path from
+                     * STATE_LOW_VOLTAGE would clear one of three fields and leave the others
+                     * stale -- one shared path with two labels cannot drift that way. */
+                    if (ecu_answering || session_live)
                     {
-                        sleep_log_ecu_veto(battery_voltage, &ecu_veto_logged);
+                        if (ecu_answering)
+                        {
+                            sleep_log_ecu_veto(battery_voltage, &ecu_veto_logged);
+                        }
+                        else if (!claim_veto_logged)
+                        {
+                            claim_veto_logged = true;
+                            ESP_LOGW(TAG, "NC Flash claimed the bus mid-countdown (%.2fV) "
+                                          "-- cancelling the sleep countdown (#92)", battery_voltage);
+                        }
 
                         /* An ARMED countdown is being thrown away -- worth an event line (#98).
                          * This is the counterpart of "sleep countdown started" and the only proof
@@ -1875,9 +2032,18 @@ void light_sleep_task(void *pvParameters)
                             (esp_timer_get_time() - cd.armed_us) >=
                                 ((int64_t)SLEEP_COUNTDOWN_REAL_MS * 1000))
                         {
-                            event_log_emit(EVL_INFO,
-                                           "sleep countdown cancelled -- ECU answering at %.2fV (ignition on)",
-                                           (double)battery_voltage);
+                            if (ecu_answering)
+                            {
+                                event_log_emit(EVL_INFO,
+                                               "sleep countdown cancelled -- ECU answering at %.2fV (ignition on)",
+                                               (double)battery_voltage);
+                            }
+                            else
+                            {
+                                event_log_emit(EVL_INFO,
+                                               "sleep countdown cancelled -- host session active at %.2fV (bus claim held)",
+                                               (double)battery_voltage);
+                            }
                         }
                         current_state      = STATE_NORMAL;
                         volt_recover_count = 0;
@@ -2114,6 +2280,10 @@ void light_sleep_task(void *pvParameters)
              * through into esp_light_sleep_start() there would freeze a half-built WiFi stack
              * (beacons stop, the station association dies) and park poll_log mid-RX. On a device
              * in the car with no serial console that is an unreachable unit. */
+            /* This recurring sleep needs NO flash/claim interlock, by invariant: the teardown has
+             * already run, so WiFi is down (no HTTP, so no new bus-claim or OTA can arrive) and
+             * CAN is disabled (so no flash can start). The only entry into this state is through
+             * sleep_mode_teardown(), which is where both guards live. */
             if(current_state == STATE_SLEEPING)
             {
                 esp_sleep_enable_timer_wakeup(2*1000000);

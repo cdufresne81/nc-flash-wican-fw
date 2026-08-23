@@ -891,6 +891,22 @@ void app_main(void)
 		}
 	}
 
+	/* Record which mode this boot actually came up in (issue #92). Until now
+	 * nothing in the device's own log said what mode it was running, so when a
+	 * unit was found stuck in Bench SLCAN with its datalogger dead there was no
+	 * way to date the flip or attribute it. This line makes the next one
+	 * datable.
+	 *
+	 * It cannot be folded into the BOOT line: that is emitted before config.json
+	 * is parsed, so the mode there would always read as the fallback. Both
+	 * values are logged because SmartConnect makes them legitimately differ -- a
+	 * device can be STORED as slcan while RUNNING elm327, which is its own trap
+	 * and is now visible here rather than having to be inferred. */
+	event_log_emit(EVL_MODE, "stored=%s running=%s smartconnect=%d",
+				   config_server_protocol_str(),
+				   config_server_protocol_name(protocol),
+				   (wifi_mode == SMARTCONNECT_MODE) ? 1 : 0);
+
 	#if HARDWARE_VER == WICAN_PRO
 	// xmsg_obd_rx_queue = xQueueCreate(32, sizeof( twai_message_t) );
 	// static uint8_t* elm327_uart_rx_queue_storage;

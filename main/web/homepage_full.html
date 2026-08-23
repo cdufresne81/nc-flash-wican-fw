@@ -1776,7 +1776,9 @@
             <div style="margin:8px 0;display:none" id="autopid_warning_div">
                 <div style="background:linear-gradient(135deg,#fef3c7 0%,#fde68a 100%);border:1px solid #f59e0b;border-radius:8px;padding:12px;box-shadow:0 2px 4px #0000001a">
                     <div style="align-items:center;margin-bottom:6px;display:flex"><span data-lucide="alert-triangle" style="margin-right:8px;font-size:16px"></span><strong style="color:#92400e;font-size:14px">PID Polling Inactive</strong></div>
-                    <div style="color:#78350f;font-size:13px;line-height:1.4">The current protocol does not poll PIDs, so nothing can be recorded. Restore the Datalogger (poll_log) protocol by downloading the configuration on the System page, setting "protocol" to "poll_log", and uploading it back.</div>
+                    <div style="color:#78350f;font-size:13px;line-height:1.4">The current protocol does not poll PIDs, so nothing can be recorded. Use the button below to put the device back into Datalogger (poll_log) mode. You can still do it by hand instead: download the configuration on the System page, set "protocol" to "poll_log", and upload it back.</div>
+                    <div style="margin-top:10px"><button type="button" class="primary-button" id="restore_datalogger_btn" onclick="restoreDataloggerMode()">Restore Datalogger mode</button></div>
+                    <div style="color:#78350f;font-size:12px;margin-top:6px">Checks first that no ECU flash is running, then reboots the device (about 6 seconds).</div>
                 </div>
             </div>
             <div>
