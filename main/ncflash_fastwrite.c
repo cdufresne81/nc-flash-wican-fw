@@ -35,8 +35,39 @@
 #define ECU_ID 0x7E8u
 #define FRAME_TIMEOUT_MS 200
 #define FC_TIMEOUT_MS 2000        /* ECU may be slow to Flow-Control while busy (e.g. SBL init/erase) */
-#define RESP_FIRST_TIMEOUT_MS 5000 /* a block's first response can lag seconds (erase after the SBL) */
+#define RESP_FIRST_TIMEOUT_MS 5000 /* ordinary mid-region block: keep TIGHT, see below */
 #define RESP_PENDING_TIMEOUT_MS 5000
+/* The ECU erases its application region as soon as the SBL starts running, and it can answer
+ * NOTHING at all while it does -- an erase here takes well over 5 s. RESP_FIRST_TIMEOUT_MS used to
+ * cover that case too, and it does not: on 2026-08-23 a real flash timed out on the LAST SBL block
+ * with FWSUB_ACK_TO and walked away from an ECU that was mid-erase (issue #126).
+ *
+ * Aborting there does not un-erase anything. It abandons an ECU that would have finished, leaving
+ * it with no valid application until someone re-flashes it. So at the erase edge the safe move is
+ * to WAIT, and the ceiling exists only so a truly dead ECU cannot hang the task forever.
+ *
+ * Deliberately asymmetric with RESP_FIRST_TIMEOUT_MS: mid-region a missing ACK really is fatal
+ * (TransferData carries no sequence counter, so there is no resend -- see the header), and failing
+ * fast is correct there. Only the erase edge gets the long ceiling.
+ *
+ * 60 s is not a guess: the legacy host path gave every request a cumulative 60 s silent budget
+ * (TIMEOUT_RESPONSE_PENDING_MAX, nc-flash src/ecu/constants.py:158, commented "generous, to ride
+ * out a slow flash erase"). And it is now backed by measurement: a full-ROM erase on a live NC
+ * PCM took 12.6 s (bench, 2026-08-23, logged by the emit below), so 60 s is ~4.7x headroom rather
+ * than a round number. Do not shrink it toward the measurement -- a colder or older ECU has no
+ * reason to match, and the cost of being wrong is a bricked one.
+ *
+ * This is ONE budget for the WHOLE edge: the Flow-Control wait and the ACK wait share it. They are
+ * two separate stalls and a silently-erasing ECU can hit either, so budgeting them separately
+ * would allow 60+60 s of firmware silence and re-open the host race below. The deadline is taken
+ * once, before the block is sent, and both waits count against it.
+ *
+ * MUST stay comfortably under the host fast-write idle timer (_FAST_WRITE_IDLE_MS, nc-flash
+ * src/ecu/wican_transport.py). If the host gives up first it closes the socket, our next progress
+ * write fails, and the flash aborts via host_gone -- abandoning the ECU right after the erase,
+ * the exact outcome this change exists to prevent. That host constant was 30 s, the same as our
+ * old ceiling, so the host ALWAYS fired first; it goes to 90 s with this change. Change together. */
+#define RESP_ERASE_TIMEOUT_MS 60000
 #define MAX_PENDING 24            /* ~ host TIMEOUT_RESPONSE_PENDING_MAX budget for 0x78 retries */
 
 /* Granular ISO-TP sub-failure codes surfaced in the FWERR nrc field so a flash
@@ -212,7 +243,18 @@ static int recv_matching(twai_message_t *msg, int timeout_ms)
 /* Send an ISO-TP message (single- or multi-frame) of `total` payload bytes,
  * honoring the ECU's Flow Control. NO resend on error. Returns 0 on success or a
  * negative FWSUB_* sub-code so the caller can report exactly where it failed. */
-static int fw_isotp_send(const uint8_t *payload, uint32_t total)
+/* Milliseconds left until an absolute deadline. deadline_us == 0 means "no edge deadline in
+ * force", so the caller's ordinary timeout applies unchanged. Past the deadline this returns 1
+ * rather than 0 so the recv fails naturally on its next pass instead of needing a second exit
+ * path. */
+static int fw_ms_left(int64_t deadline_us, int fallback_ms)
+{
+    if (deadline_us == 0) return fallback_ms;
+    int64_t left = (deadline_us - esp_timer_get_time()) / 1000;
+    return (left < 1) ? 1 : (int)left;
+}
+
+static int fw_isotp_send(const uint8_t *payload, uint32_t total, int64_t deadline_us)
 {
     twai_message_t tx = {0};
     tx.identifier = TESTER_ID;
@@ -235,7 +277,11 @@ static int fw_isotp_send(const uint8_t *payload, uint32_t total)
 
     /* Flow Control (expect Clear-To-Send 0x30; BS/STmin honored). */
     twai_message_t fc;
-    if (recv_matching(&fc, FC_TIMEOUT_MS) != 0) return -FWSUB_FC_TO;
+    /* An ECU too busy erasing to ACK is also too busy to Flow-Control, and that stall lands HERE,
+     * before fw_await_positive ever runs. Without the deadline this aborts at FC_TIMEOUT_MS = 2 s
+     * and the long ACK ceiling never applies -- which made the "first program block" edge a false
+     * promise. */
+    if (recv_matching(&fc, fw_ms_left(deadline_us, FC_TIMEOUT_MS)) != 0) return -FWSUB_FC_TO;
     if ((fc.data[0] & 0xF0) != 0x30 || (fc.data[0] & 0x0F) != 0x00) return -FWSUB_FC_BAD;
     uint8_t stmin = fc.data[2];
 
@@ -257,13 +303,17 @@ static int fw_isotp_send(const uint8_t *payload, uint32_t total)
 
 /* Await a positive UDS response with SID `expect`, riding out 7F xx 78. Sets
  * *out_nrc to the real ECU NRC, or an FWSUB_ACK_* code, on failure. */
-static int fw_await_positive(uint8_t expect, int *out_nrc)
+static int fw_await_positive(uint8_t expect, int *out_nrc, int64_t deadline_us)
 {
     int pending = 0;
     for (;;)
     {
         twai_message_t rx;
-        int to = pending ? RESP_PENDING_TIMEOUT_MS : RESP_FIRST_TIMEOUT_MS;
+        /* With an edge deadline in force this also caps the PENDING path. Without it, one 0x78
+         * followed by a silent erase would drop back to RESP_PENDING_TIMEOUT_MS and abort at 5 s
+         * despite the long ceiling -- while 24 pendings at the long value would blow the host 600 s
+         * total the other way. The deadline bounds both ends. */
+        int to = fw_ms_left(deadline_us, pending ? RESP_PENDING_TIMEOUT_MS : RESP_FIRST_TIMEOUT_MS);
         if (recv_matching(&rx, to) != 0) { *out_nrc = FWSUB_ACK_TO; return -1; }
         if ((rx.data[0] >> 4) != 0x0) { *out_nrc = FWSUB_ACK_PCI; return -1; } /* want SF reply */
         uint8_t l = rx.data[0] & 0x0F;
@@ -285,33 +335,41 @@ static int fw_request_download(uint32_t addr, uint32_t size, int *nrc)
     uint8_t p[9] = {0x34,
                     (uint8_t)(addr >> 24), (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr,
                     (uint8_t)(size >> 24), (uint8_t)(size >> 16), (uint8_t)(size >> 8), (uint8_t)size};
-    int s = fw_isotp_send(p, sizeof(p));
+    int s = fw_isotp_send(p, sizeof(p), 0);
     if (s != 0) { *nrc = -s; return -1; }
-    return fw_await_positive(0x74, nrc);
+    /* Ordinary timeout is correct here: the SBL is the code that erases and it is delivered by
+     * TransferData AFTER this, so nothing can be erasing yet -- and a 0x34 failure is pre-erase,
+     * hence safely retryable. */
+    return fw_await_positive(0x74, nrc, 0);
 }
 
 /* TransferData [0x36]+block (NO sequence counter), then await 0x76. s_fw_msg[0]
  * is preset to 0x36 by the caller; block bytes live at s_fw_msg[1..blen]. */
-static int fw_transfer_data(uint32_t blen, int *nrc)
+static int fw_transfer_data(uint32_t blen, int *nrc, int64_t deadline_us)
 {
     s_fw_msg[0] = 0x36;
-    int s = fw_isotp_send(s_fw_msg, blen + 1);
+    int s = fw_isotp_send(s_fw_msg, blen + 1, deadline_us);
     if (s != 0) { *nrc = -s; return -1; }
-    return fw_await_positive(0x76, nrc);
+    return fw_await_positive(0x76, nrc, deadline_us);
 }
 
+/* TransferExit also gets the long ceiling: the ECU may verify or finalise here, and a 5 s timeout
+ * on a finalising ECU declares failure, skips the ECU reset, and pushes the user into a needless
+ * extra flash cycle of a probably-fine ECU. The legacy host gave 0x37 the same 60 s budget as
+ * everything else. Costs nothing when the ECU answers promptly. */
 static int fw_transfer_exit(int *nrc)
 {
     uint8_t p[1] = {0x37};
-    int s = fw_isotp_send(p, 1);
+    const int64_t deadline = esp_timer_get_time() + (int64_t)RESP_ERASE_TIMEOUT_MS * 1000;
+    int s = fw_isotp_send(p, 1, deadline);
     if (s != 0) { *nrc = -s; return -1; }
-    return fw_await_positive(0x77, nrc);
+    return fw_await_positive(0x77, nrc, deadline);
 }
 
 static void fw_ecu_reset(void)
 {
     uint8_t p[2] = {0x11, 0x01};
-    (void)fw_isotp_send(p, 2); /* best-effort; no/late response is expected */
+    (void)fw_isotp_send(p, 2, 0); /* best-effort; no/late response is expected */
 }
 
 /* ---- command entry --------------------------------------------------------*/
@@ -492,11 +550,70 @@ int ncflash_fast_write(const uint8_t *buf, int len, QueueHandle_t *tx_queue)
             if (live)
             {
                 int nrc = 0;
-                if (fw_transfer_data(take, &nrc) != 0)
+                /* The erase edge (#126). The ECU jumps into the SBL once the SBL region is fully
+                 * transferred, and the SBL erases before it answers, so the stall lands on the ACK
+                 * of the LAST SBL block or on the FIRST program block depending on how the ECU
+                 * sequences it. Cover both -- guessing wrong costs an abandoned mid-erase ECU. */
+                const bool erase_edge = (r == 0 && rem == take) ||
+                                        (r == 1 && off == regions[1][0]);
+                if (erase_edge)
+                {
+                    /* Reset the host's idle clock at the START of this stall.
+                     *
+                     * Both edge blocks arm their OWN RESP_ERASE_TIMEOUT_MS, so an ECU that splits
+                     * its erase across the two can lawfully keep us silent for 60 + 60 s. The
+                     * host gives up after _FAST_WRITE_IDLE_MS (90 s) of no bytes, and when it does
+                     * it closes the socket -- slcan_port_tx_task then parks on PORT_OPEN and stops
+                     * draining, our next NCFWPROG fills the queue, tx_send times out, and the
+                     * flash aborts via host_gone with the ECU freshly erased. Exactly the outcome
+                     * this whole change exists to prevent.
+                     *
+                     * One line here bounds EVERY silent window to one edge budget (~62 s) instead
+                     * of two, whichever way the ECU splits the erase, and each edge keeps its full
+                     * 60 s. Off-cadence NCFWPROG lines are harmless to the host parser -- worst
+                     * case the progress callback repeats a count -- and any bytes reset its clock.
+                     *
+                     * Raising the host timeout instead would only make a genuinely dead firmware
+                     * take longer to notice. If this emit fails the host is already gone, and
+                     * aborting HERE is pre-erase for the first edge: strictly safer than today. */
+                    char eline[40];
+                    snprintf(eline, sizeof(eline), "NCFWPROG %lu/%lu\n",
+                             (unsigned long)done, (unsigned long)total_blocks);
+                    if (fw_emit(tx_queue, eline) != 0) { host_gone = 1; rc = -3; goto cleanup; }
+                }
+                /* Taken AFTER the emit above, so the budget covers only the ECU's stall. */
+                const int64_t edge_t0 = esp_timer_get_time();
+                const int64_t edge_deadline =
+                    erase_edge ? edge_t0 + (int64_t)RESP_ERASE_TIMEOUT_MS * 1000 : 0;
+                if (fw_transfer_data(take, &nrc, edge_deadline) != 0)
                 {
                     fw_emit_err(tx_queue, off, r == 0 ? 11 : 12, nrc);
                     rc = -2;
                     goto cleanup;
+                }
+                if (erase_edge)
+                {
+                    /* How long this ECU really takes to erase -- the number that sizes
+                     * RESP_ERASE_TIMEOUT_MS instead of guessing at it. Measured 2026-08-23 on a
+                     * live PCM: 12.6 s for a full ROM, 1.4 s for a 134-block image, and 46 ms at
+                     * the region-1 edge (this ECU erases once, at the region-0 edge, and the
+                     * region-1 wait is a non-event).
+                     *
+                     * Only waits of a second or more are logged. Below that nothing stalled and
+                     * the line is noise -- but the threshold is the ONLY filter, so an ECU that
+                     * ever did erase at region 1 would still show up here. Message is in seconds
+                     * and carries no region label, by owner request: it is read by the person
+                     * watching a progress bar sit still, not by the flash code. */
+                    const uint32_t edge_ms =
+                        (uint32_t)((esp_timer_get_time() - edge_t0) / 1000);
+                    if (edge_ms >= 1000)
+                    {
+                        const uint32_t r10 = edge_ms + 50; /* round to a tenth, not truncate */
+                        event_log_emit(EVL_INFO,
+                                       "waited %lu.%lu s while the ECU cleared its memory for the new ROM",
+                                       (unsigned long)(r10 / 1000),
+                                       (unsigned long)((r10 % 1000) / 100));
+                    }
                 }
             }
 
