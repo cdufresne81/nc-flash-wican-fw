@@ -326,19 +326,22 @@ bench-test-before-merge rule already requires). What would change that: if no li
 PCM is available any more, then merge only with the owner's explicit acceptance that the
 armed-wait path ships code-read-only, stated in the PR.
 
-**Ship ruling, updated 2026-08-23 after the live runs.** Item 2 has passed against the genuine
-NC Flash 2.12.0, with the heartbeat firing twice through a 12.9 s erase — the feature's whole
-reason for existing is now proven on hardware. Item 3 has not been run, so the point-of-no-return
-half ships code-read-only and adversarially-reviewed, but never executed. The honest split:
+**Ship ruling, FINAL — 2026-08-23, both live gates passed.** Items 2 and 3 have both run against
+the genuine NC Flash 2.12.0 on a live PCM:
 
-* **The regression this branch was written to prevent is closed and proven.** An old NC Flash can
-  no longer time out during an erase, because it is fed through the silence.
-* **The additional protection is unproven.** If `s_ponr` is wrong in a way that four review passes
-  and the build did not catch, the failure mode is the same brick this branch prevents elsewhere —
-  it would simply happen on host-disconnect instead of on erase-timeout. That is not a *new* risk
-  (today's shipped firmware aborts on that disconnect anyway, which is itself the brick), so
-  merging without item 3 leaves users no worse off than v1.22.0 and strictly better on the erase
-  path. It does mean the branch does not deliver everything it claims until item 3 passes.
+* **Item 2 (erase timeout):** heartbeat fired twice through a 12.9 s erase; the old tool stayed
+  connected. The regression this branch exists to prevent is closed and proven.
+* **Item 3 (point of no return):** host killed at 69%; the firmware finished the remaining 318
+  blocks alone and logged the drop line with the correct block and the success wording. The
+  additional protection is proven, not merely reviewed.
+
+No part of this branch now ships unexecuted. The remaining checklist entries are optional
+(2.13.0 regression run) or housekeeping (bench sleep config). **Cleared for the owner's car**, and
+cleared for merge under the bench-test-before-merge rule.
+
+One unrelated defect surfaced during item 3 and is filed as **#131** (dead-man reaper never fires
+while the bus is busy, so the datalogger stays parked after an abandoned flash). It is in the
+cleanup path, not the flash path, and does not gate this branch.
 
 Manual checklist:
 
@@ -359,12 +362,31 @@ Manual checklist:
       The 12.9 s also corroborates the 12.6 s figure recorded in §2.4 — erase timing on this PCM
       is stable run to run.
 
-- [ ] **Live bench flash, host killed post-erase — NOT DONE. This is the remaining gap.** Nothing
-      in the 2026-08-23 runs exercised the point-of-no-return: the host never stopped listening,
-      so `s_ponr`, `fw_ka_note_drop()`, the `dropped`/`drop_blk` counters and the outcome-worded
-      `EVL_INFO` line have still never executed on hardware. Expect: firmware finishes alone,
-      `PC tool stopped listening at block N/M -- the flash finished without it`, then `FLASH_OK`,
-      and the PCM boots.
+- [x] **Live bench flash, host killed post-erase — PASSED 2026-08-23.** Full ROM, NC Flash 2.12.0
+      killed at **block 704 of 1022 (69%)**, well past the erase. The firmware wrote the remaining
+      318 blocks with no host attached:
+
+      ```
+      17:44:39  FLASH_START  ..._1744.bin LIVE blocks=1022
+      17:44:52  INFO         waited 13.0 s while the ECU cleared its memory for the new ROM
+      17:45:42  FLASH_OK     ..._1744.bin LIVE blocks=1022 elapsed=62040ms
+      17:45:42  INFO         PC tool stopped listening at block 704/1022 -- the flash finished without it
+      ```
+
+      This is the first execution of `s_ponr`, `fw_ka_note_drop()`, the `dropped`/`drop_blk`
+      counters and the outcome-worded `EVL_INFO` line on hardware. The drop line reports the
+      correct block and the success wording ("the flash finished without it"), which is the
+      branch the review's finding 3 rewrote. Elapsed 62040 ms against 62349 ms for the run where
+      the host stayed connected — losing the host mid-write cost 0.3 s. On shipped v1.22.0 the
+      same action aborts the flash and leaves the PCM unbootable.
+
+      **Side finding, not a defect in this branch — filed as #131.** The host was killed, so it
+      never sent `op=bus_release`, and the firmware dead-man reaper did NOT reap the abandoned
+      claim within ~210 s (spec: 78 s). `bus_idle_ms` measured 0-9 ms continuously against the
+      300 ms `COEXIST_BUS_IDLE_QUIESCE_MS` gate at datalog_lease_task.c:55, because the ECU was
+      chattering after the abandoned flash. The datalogger stayed parked and silent until NC Flash
+      was restarted and its own `reconcile()` released the claim. The flash path behaved
+      correctly; this is the cleanup path afterwards.
 - [ ] Optional: live flash with 2.13.0 unmodified — confirms no regression for the matched pair.
 - [ ] Confirm bench sleep config still on test values afterwards, per the standing bench-config
       note.
