@@ -62,12 +62,35 @@
  * would allow 60+60 s of firmware silence and re-open the host race below. The deadline is taken
  * once, before the block is sent, and both waits count against it.
  *
- * MUST stay comfortably under the host fast-write idle timer (_FAST_WRITE_IDLE_MS, nc-flash
- * src/ecu/wican_transport.py). If the host gives up first it closes the socket, our next progress
- * write fails, and the flash aborts via host_gone -- abandoning the ECU right after the erase,
- * the exact outcome this change exists to prevent. That host constant was 30 s, the same as our
- * old ceiling, so the host ALWAYS fired first; it goes to 90 s with this change. Change together. */
+ * This ceiling is NO LONGER coupled to any host version. It used to be: the host gives up after
+ * _FAST_WRITE_IDLE_MS of silence (nc-flash src/ecu/wican_transport.py), closes the socket, our
+ * next progress write fails, and the flash aborted via host_gone -- abandoning the ECU right
+ * after the erase. That constant is 30 s in NC Flash 2.12.0 and older, the same as our old
+ * ceiling, so the old host ALWAYS fired first. The KEEPALIVE below now feeds the host during the
+ * stall, so its idle clock never expires however long the ECU erases, on EVERY host version.
+ * This number is therefore sized on ECU evidence alone: "how long before a silent ECU is dead",
+ * 60 s against a measured 12.6 s erase.
+ *
+ * The one host-side wall a keepalive does NOT push back is the host's absolute wall-clock budget
+ * for the whole write (FAST_WRITE_TIMEOUT_MS = 600 s, wican_transport.py:185), which no traffic
+ * resets. Transfer plus 60 s per edge plus 60 s at TransferExit is comfortably inside it -- but
+ * anyone growing these ceilings must re-check that. */
 #define RESP_ERASE_TIMEOUT_MS 60000
+
+/* Heartbeat sent while we are waiting on a silently-erasing ECU (#126 follow-up).
+ *
+ * The binding constraint is NC Flash 2.12.0 and older, which declare the firmware dead after
+ * 30 s with no bytes (_FAST_WRITE_IDLE_MS = 30000, nc-flash src/ecu/wican_transport.py:189 at
+ * 575b3c0~1; 2.13.0 raised it to 90 s). The host resets that clock on ANY bytes received, before
+ * it parses anything, so a small line every 5 s keeps every host version alive -- 6x margin, so
+ * five consecutive beats can be lost or delayed (host GC, its 1 s select granularity, a WiFi
+ * retry burst) before the oldest host gives up.
+ *
+ * Do not drift this upward toward 30 s: the margin is there to absorb exactly the hiccups we
+ * cannot schedule. The assert names the old host constant so nobody can. */
+#define KEEPALIVE_MS 5000
+_Static_assert(3 * KEEPALIVE_MS < 30000,
+               "keepalive must beat NC Flash 2.12.0's 30 s _FAST_WRITE_IDLE_MS several times over");
 #define MAX_PENDING 24            /* ~ host TIMEOUT_RESPONSE_PENDING_MAX budget for 0x78 retries */
 
 /* Granular ISO-TP sub-failure codes surfaced in the FWERR nrc field so a flash
@@ -103,6 +126,41 @@ static volatile int s_fwbusy;
 static int s_fw_err_stage;
 static int s_fw_err_nrc;
 
+/* POINT OF NO RETURN (#126 follow-up). Set the instant the ECU can have started erasing -- just
+ * before the LAST SBL block goes out -- and cleared only at the top of the next op.
+ *
+ * Past this line the ECU has no valid application until we finish, and NOTHING the host does may
+ * make us walk away: the host is an observer that cannot abort a flash (see the fast_write
+ * docstring in nc-flash src/ecu/wican_transport.py), the image, manifest and CRC all live on the
+ * SD card, so the firmware can and must finish alone. Before it, an emit failure still aborts,
+ * which is correct -- the ECU's application is untouched until the SBL runs, and stopping there
+ * costs nothing.
+ *
+ * Enforced centrally in tx_send() rather than at each call site, so an emit added later inherits
+ * the rule instead of having to remember it. */
+static volatile int s_ponr;
+
+/* Keepalive context. One task owns a fast-op (can_tx_task, guarded by s_fwbusy), so no locking.
+ * A file-scope struct rather than a parameter threaded through fw_isotp_send / fw_await_positive
+ * / fw_transfer_data: same behaviour, four fewer signature changes in ECU-touching code -- the
+ * same reasoning as the s_fw_err_* stash above. */
+static struct {
+    bool armed;
+    QueueHandle_t *tx_queue;
+    int64_t next_beat_us;
+    uint32_t done, total;   /* numbers the beat reports; done tracks the block loop */
+    uint32_t dropped;       /* lines the host could not be given -- counted, never fatal */
+    uint32_t drop_blk;      /* block reached when the FIRST line went undelivered */
+} s_ka;
+
+/* One undelivered line. Records where the host stopped listening the first time, which is the
+ * number worth reporting -- by cleanup the block counter has run on to the end. */
+static void fw_ka_note_drop(void)
+{
+    if (s_ka.dropped == 0) s_ka.drop_blk = s_ka.done;
+    s_ka.dropped++;
+}
+
 typedef struct {
     int manifest_version;
     uint32_t download_addr, download_size, block_size;
@@ -128,6 +186,22 @@ static uint32_t fw_crc32_step(uint32_t crc, const uint8_t *data, size_t len)
  * portMAX_DELAY — a host disconnect must time out into the clean teardown). */
 static int tx_send(QueueHandle_t *tx_queue)
 {
+    /* Past the point of no return every line becomes a 0-tick try-send whose failure is counted
+     * and IGNORED -- it returns 0, so the existing
+     *     if (fw_emit(...) != 0) { host_gone = 1; rc = -3; goto cleanup; }
+     * sites become no-ops instead of abandoning a freshly-erased ECU. This is the hole that
+     * existed with matched versions too: a 2 s WiFi stall on any post-erase progress line used to
+     * brick the ECU.
+     *
+     * 0 ticks, not a shorter block: with the drain task alive, a full queue means the socket has
+     * not accepted a line in ~32 tries, so the host is unreachable and the bytes would not land
+     * anyway -- while blocking inside an armed wait would eat the ECU's erase budget. The 32-deep
+     * queue is itself the tolerance for ordinary WiFi jitter. */
+    if (s_ponr)
+    {
+        if (xQueueSend(*tx_queue, &s_out, 0) != pdTRUE) fw_ka_note_drop();
+        return 0;
+    }
     return (xQueueSend(*tx_queue, &s_out, pdMS_TO_TICKS(TX_QUEUE_SEND_TIMEOUT_MS)) == pdTRUE)
                ? 0
                : -1;
@@ -160,6 +234,56 @@ static void fw_emit_err(QueueHandle_t *tx_queue, uint32_t addr, int stage, int n
         (void)tx_send(tx_queue);
     }
     ESP_LOGE(TAG, "FWERR a=%06lX st=%d nrc=%02X", (unsigned long)addr, stage, nrc & 0xFF);
+}
+
+/* ---- erase-edge keepalive -------------------------------------------------*/
+
+/* Arm the heartbeat for one wait on a possibly-erasing ECU. `done`/`total` are the numbers the
+ * beat reports; they do not move while a single block is in flight. */
+static void fw_ka_arm(QueueHandle_t *tx_queue, uint32_t done, uint32_t total)
+{
+    s_ka.tx_queue     = tx_queue;
+    s_ka.done         = done;
+    s_ka.total        = total;
+    s_ka.next_beat_us = esp_timer_get_time() + (int64_t)KEEPALIVE_MS * 1000;
+    s_ka.armed        = true;
+}
+
+static void fw_ka_disarm(void)
+{
+    s_ka.armed = false;
+}
+
+/* One beat if one is due. Called from inside the receive loop.
+ *
+ * The line is a plain repeat of NCFWPROG, deliberately: every deployed host parses an unknown
+ * line by ignoring it, so a new marker word would be safe but would buy nothing -- while
+ * NCFWPROG additionally re-feeds the host's progress callback, so the user's progress bar stays
+ * visibly alive through the stall instead of freezing. A repeated done/total is harmless (the
+ * host re-reports the same count; a malformed one is swallowed by its own except).
+ *
+ * It MUST NOT start with FWERR or NCFWDONE -- both are terminal at the host, so a beat carrying
+ * either prefix would end the very session it exists to keep alive.
+ *
+ * Never blocks: 0-tick send, failure counted only. Nothing inside an armed wait may block on
+ * anything except can_receive(), or the ECU loses erase budget to it. */
+static void fw_ka_tick(void)
+{
+    if (!s_ka.armed) return;
+    int64_t now = esp_timer_get_time();
+    if (now < s_ka.next_beat_us) return;
+    /* Next beat measured from NOW, so a late one never bursts to catch up. */
+    s_ka.next_beat_us = now + (int64_t)KEEPALIVE_MS * 1000;
+
+    char line[40];
+    int n = snprintf(line, sizeof(line), "NCFWPROG %lu/%lu\n",
+                     (unsigned long)s_ka.done, (unsigned long)s_ka.total);
+    if (n <= 0) return;
+    if (n > (int)DEV_BUFFER_LENGTH) n = DEV_BUFFER_LENGTH;
+    s_out.usLen = n;
+    s_out.dev_channel = DEV_WIFI;
+    memcpy(s_out.ucElement, line, (size_t)n);
+    if (xQueueSend(*s_ka.tx_queue, &s_out, 0) != pdTRUE) fw_ka_note_drop();
 }
 
 /* Reject anything but a simple leaf filename with an extension. */
@@ -234,6 +358,22 @@ static int recv_matching(twai_message_t *msg, int timeout_ms)
     {
         int64_t rem_ms = (deadline - esp_timer_get_time()) / 1000;
         if (rem_ms < 1) rem_ms = 1;
+        /* Keepalive slicing (#126 follow-up). UNARMED -- every ordinary wait, the whole
+         * fast-read path, and all of dry-run -- fw_ka_tick() returns at once and rem_ms is
+         * exactly what it was before, so those paths are unchanged.
+         *
+         * Armed, the wait is capped at the next beat so the heartbeat can go out mid-erase. This
+         * cannot lose or delay the ECU's answer: a frame arriving on a slice boundary sits in the
+         * TWAI driver's RX queue (96-100 deep, can.c:123) and is returned by the very next
+         * can_receive(); and `deadline` is an absolute esp_timer value, so slicing cannot drift
+         * the edge budget. */
+        fw_ka_tick();
+        if (s_ka.armed)
+        {
+            int64_t beat_ms = (s_ka.next_beat_us - esp_timer_get_time()) / 1000;
+            if (beat_ms < 1) beat_ms = 1;
+            if (beat_ms < rem_ms) rem_ms = beat_ms;
+        }
         if (can_receive(msg, pdMS_TO_TICKS(rem_ms)) == ESP_OK)
             if (msg->identifier == ECU_ID && msg->rtr == 0) return 0;
     }
@@ -430,6 +570,11 @@ int ncflash_fast_write(const uint8_t *buf, int len, QueueHandle_t *tx_queue)
     uint32_t done = 0;            /* blocks completed; on FAIL this is "where it died" */
     s_fw_err_stage = 0;
     s_fw_err_nrc = 0;
+    /* Per-op keepalive/PONR state. Cleared HERE, not at cleanup, so a previous op's counters can
+     * still be read by its own cleanup, and so a crash mid-op cannot leave s_ponr latched into
+     * the next one. */
+    s_ponr = 0;
+    memset(&s_ka, 0, sizeof(s_ka));
 
     char img_path[160];
     char man_path[160];
@@ -581,11 +726,33 @@ int ncflash_fast_write(const uint8_t *buf, int len, QueueHandle_t *tx_queue)
                              (unsigned long)done, (unsigned long)total_blocks);
                     if (fw_emit(tx_queue, eline) != 0) { host_gone = 1; rc = -3; goto cleanup; }
                 }
+
+                /* POINT OF NO RETURN. Set before the LAST SBL block leaves, because the ECU may
+                 * start erasing on that block's ACK or on the next one (see the comment above),
+                 * and taking it any later leaves a window where an abort abandons an erasing ECU.
+                 * The pre-edge emit above still runs pre-PONR for this first edge, where aborting
+                 * is genuinely free; at the region-1 edge s_ponr is already set, so that same
+                 * emit can no longer cost us the ECU.
+                 *
+                 * Keyed on erase_edge, NOT on (r == 0 && rem == take): a manifest declaring
+                 * sbl_len = 0 skips region 0 entirely -- the block-size gate allows it -- so the
+                 * narrower test would never fire, yet region 1's first block still arms the
+                 * keepalive below. Every post-edge emit would then be a blocking send whose
+                 * failure aborts, which is precisely the brick this change removes. This form
+                 * also makes "armed implies past the point of no return" true at all three arm
+                 * sites. (No assert on that invariant: a panic mid-flash is itself a brick.) */
+                if (erase_edge) s_ponr = 1;
+
                 /* Taken AFTER the emit above, so the budget covers only the ECU's stall. */
                 const int64_t edge_t0 = esp_timer_get_time();
                 const int64_t edge_deadline =
                     erase_edge ? edge_t0 + (int64_t)RESP_ERASE_TIMEOUT_MS * 1000 : 0;
-                if (fw_transfer_data(take, &nrc, edge_deadline) != 0)
+                /* Feed the host through the silence so its idle clock never fires (#126
+                 * follow-up). Armed only at the edge: ordinary blocks answer in milliseconds. */
+                if (erase_edge) fw_ka_arm(tx_queue, done, total_blocks);
+                int tdrc = fw_transfer_data(take, &nrc, edge_deadline);
+                fw_ka_disarm();
+                if (tdrc != 0)
                 {
                     fw_emit_err(tx_queue, off, r == 0 ? 11 : 12, nrc);
                     rc = -2;
@@ -620,6 +787,7 @@ int ncflash_fast_write(const uint8_t *buf, int len, QueueHandle_t *tx_queue)
             off += take;
             rem -= take;
             done++;
+            s_ka.done = done;   /* keeps fw_ka_note_drop()'s "where did we lose them" honest */
             if ((done % PROG_EVERY_N) == 0 || done == total_blocks)
             {
                 char line[40];
@@ -634,7 +802,14 @@ int ncflash_fast_write(const uint8_t *buf, int len, QueueHandle_t *tx_queue)
     if (live)
     {
         int nrc = 0;
-        if (fw_transfer_exit(&nrc) != 0)
+        /* Third arm site: TransferExit carries the same 60 s ceiling, and the ECU may verify or
+         * finalise there in silence. Without a beat, a finalise past 30 s makes an NC Flash
+         * 2.12.0 host report failure on a flash that actually succeeded, sending the user into a
+         * needless second flash of a healthy ECU. */
+        fw_ka_arm(tx_queue, total_blocks, total_blocks);
+        int terc = fw_transfer_exit(&nrc);
+        fw_ka_disarm();
+        if (terc != 0)
         {
             fw_emit_err(tx_queue, 0, 13, nrc);
             rc = -2;
@@ -662,11 +837,44 @@ cleanup:
         uint32_t alerts = 0;
         (void)twai_read_alerts(&alerts, 0);
     }
+    /* Drain only when nobody can still be waiting for a good line.
+     *
+     * NOT on dropped alone: a dropped line does not mean the host is dead NOW. A host that
+     * stalled and recovered, or a client that reconnected mid-flash, is alive and waiting for
+     * NCFWDONE -- and DONE is queued just above, so draining here would swallow it and report
+     * failure for a flash that worked, pushing the user into a needless re-flash of a healthy
+     * ECU. host_gone is provably pre-PONR now (past it, no emit failure sets it), so on that
+     * path DONE was never queued and there is nothing to lose.
+     *
+     * Not on dropped at all, even when the flash failed: a host that stalled and recovered is
+     * still waiting for the FWERR naming WHY it failed, and draining would replace that with a
+     * bare idle timeout. Stale lines left for a genuinely dead host cost nothing -- the next op
+     * drains the queue before it starts, and version_ping ignores lines it does not know. */
     if (host_gone)
     {
         xdev_buffer leftover;
         while (xQueueReceive(*tx_queue, &leftover, 0) == pdTRUE) { /* discard */ }
-        ESP_LOGW(TAG, "fast write aborted: host stopped draining TCP (clean teardown)");
+        if (host_gone)
+            ESP_LOGW(TAG, "fast write aborted: host stopped draining TCP (clean teardown)");
+    }
+    /* The host stopped taking our lines while we were past the point of no return. Without this
+     * line the flash just looks successful and nobody can explain why the PC tool reported a
+     * stall. Word it by outcome: on rc == 0 we really did finish the ECU alone; on a failure the
+     * ECU is why we stopped, and claiming we "carried on" would be a lie. Report the block where
+     * the FIRST line went undelivered -- `done` at cleanup equals total_blocks on success and
+     * would always read N/N. */
+    if (s_ka.dropped)
+    {
+        ESP_LOGW(TAG, "fast write: %lu progress lines undelivered (host stopped listening)",
+                 (unsigned long)s_ka.dropped);
+        if (rc == 0)
+            event_log_emit(EVL_INFO,
+                           "PC tool stopped listening at block %lu/%lu -- the flash finished without it",
+                           (unsigned long)s_ka.drop_blk, (unsigned long)total_blocks);
+        else
+            event_log_emit(EVL_INFO,
+                           "PC tool stopped listening at block %lu/%lu before the flash failed",
+                           (unsigned long)s_ka.drop_blk, (unsigned long)total_blocks);
     }
     /* Operational milestone (Task #12): any non-zero rc is an aborted/failed flash. One sparse
      * line naming WHERE it died -- the fw_emit_err stage + the FWSUB_* or NRC sub-code + the block
@@ -684,6 +892,11 @@ cleanup:
     /* Release the bus LAST (task #36 / plan §5.2): only now -- after can_rx_task is
      * resumed and the bus drained -- does the poll task un-park, so the single-CAN-
      * owner invariant holds on EVERY exit path (success / host-gone / abort). */
+    /* Drop the point-of-no-return here as well as at op start. It is latched for the whole
+     * post-erase phase, and leaving it set past cleanup would make the NEXT op's early errors --
+     * the unsafe-name FWERR, which runs before the op-start reset -- go out as droppable 0-tick
+     * sends and vanish silently. */
+    s_ponr = 0;
     can_flash_active_clear();
     s_fwbusy = 0;
     return rc;
