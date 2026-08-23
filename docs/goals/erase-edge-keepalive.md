@@ -336,6 +336,29 @@ Manual checklist:
 - [ ] Confirm bench sleep config still on test values afterwards, per the standing bench-config
       note.
 
+## 5b. As built — where the code differs from this design
+
+Three deltas, all from the adversarial review of the first cut. The design above is otherwise
+implemented as written.
+
+1. **The cleanup drain runs on `host_gone` alone**, not on `host_gone || dropped > 0` as §2.3 says.
+   Draining on `dropped` would swallow the `NCFWDONE` (or the `FWERR`) that a host which stalled
+   and then recovered is still waiting for — reporting failure for a flash that worked, which is
+   the same needless re-flash of a healthy ECU that §2.8.5 exists to prevent. Stale lines left for
+   a genuinely dead host cost nothing: the next op drains the queue before it starts, and
+   `version_ping` ignores lines it does not recognise.
+2. **The point of no return is keyed on `erase_edge`**, not on `r == 0 && rem == take` as §2.3
+   says. A manifest declaring `sbl_len = 0` skips region 0 entirely — the block-size gate allows
+   it — so the narrower test would never fire, yet region 1's first block still armed the
+   keepalive, leaving every post-edge emit a blocking send that aborts on failure. Keying on
+   `erase_edge` is behaviour-identical for real manifests and makes "armed implies past the point
+   of no return" true at all three arm sites. No assert guards that invariant: a panic mid-flash
+   is itself a brick path.
+3. **The lost-host event line is worded by outcome and reports the first drop.** `done` at cleanup
+   equals `total_blocks` on success, so the design's wording would always have read "block N/N",
+   and "the flash carried on without it" is false when the ECU is what failed. A `drop_blk` field
+   records the block at the first undelivered line, and `rc == 0` picks the wording.
+
 ## 6. Ready-to-paste `/goal` line
 
 ```
