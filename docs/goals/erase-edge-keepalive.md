@@ -326,12 +326,45 @@ bench-test-before-merge rule already requires). What would change that: if no li
 PCM is available any more, then merge only with the owner's explicit acceptance that the
 armed-wait path ships code-read-only, stated in the PR.
 
+**Ship ruling, updated 2026-08-23 after the live runs.** Item 2 has passed against the genuine
+NC Flash 2.12.0, with the heartbeat firing twice through a 12.9 s erase — the feature's whole
+reason for existing is now proven on hardware. Item 3 has not been run, so the point-of-no-return
+half ships code-read-only and adversarially-reviewed, but never executed. The honest split:
+
+* **The regression this branch was written to prevent is closed and proven.** An old NC Flash can
+  no longer time out during an erase, because it is fed through the silence.
+* **The additional protection is unproven.** If `s_ponr` is wrong in a way that four review passes
+  and the build did not catch, the failure mode is the same brick this branch prevents elsewhere —
+  it would simply happen on host-disconnect instead of on erase-timeout. That is not a *new* risk
+  (today's shipped firmware aborts on that disconnect anyway, which is itself the brick), so
+  merging without item 3 leaves users no worse off than v1.22.0 and strictly better on the erase
+  path. It does mean the branch does not deliver everything it claims until item 3 passes.
+
 Manual checklist:
 
-- [ ] Live bench flash, host forced to idle_ms=30000: completes, no "fast write stalled", progress
-      bar moves during the erase.
-- [ ] Live bench flash, host killed post-erase: firmware finishes alone; event log shows FLASH_OK
-      + dropped-lines INFO; PCM boots.
+- [x] **Live bench flash against a real, unmodified NC Flash 2.12.0 — PASSED 2026-08-23.** Done
+      with the genuine old tool rather than the planned patched-host simulation, which is the
+      stronger evidence: the 30 s `_FAST_WRITE_IDLE_MS` came from the shipping 2.12.0 build, not
+      from a local edit. Two flashes were run:
+
+      * 134-block image — `waited 1.5 s while the ECU cleared its memory`, `FLASH_OK ... elapsed=7569ms`.
+        Erase shorter than one 5 s interval, so **zero beats fired**. Proves no regression only.
+      * **Full ROM, 1022 blocks — `waited 12.9 s`, `FLASH_OK ... elapsed=62349ms`.** The erase
+        spanned two 5 s intervals, so **the armed wait emitted 2 heartbeats and 2.12.0 stayed
+        connected through the silence.** This is the first execution of the feature on hardware.
+
+      Health after both: no `stopped listening` and no `undelivered` line anywhere in the log, so
+      the old host drained every progress line; boot count unchanged (no reboot during either
+      flash); 0 unexpected resets; SD mounted; protocol still `poll_log`; bus released cleanly.
+      The 12.9 s also corroborates the 12.6 s figure recorded in §2.4 — erase timing on this PCM
+      is stable run to run.
+
+- [ ] **Live bench flash, host killed post-erase — NOT DONE. This is the remaining gap.** Nothing
+      in the 2026-08-23 runs exercised the point-of-no-return: the host never stopped listening,
+      so `s_ponr`, `fw_ka_note_drop()`, the `dropped`/`drop_blk` counters and the outcome-worded
+      `EVL_INFO` line have still never executed on hardware. Expect: firmware finishes alone,
+      `PC tool stopped listening at block N/M -- the flash finished without it`, then `FLASH_OK`,
+      and the PCM boots.
 - [ ] Optional: live flash with 2.13.0 unmodified — confirms no regression for the matched pair.
 - [ ] Confirm bench sleep config still on test values afterwards, per the standing bench-config
       note.
