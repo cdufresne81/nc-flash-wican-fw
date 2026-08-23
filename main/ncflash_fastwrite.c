@@ -554,6 +554,32 @@ int ncflash_fast_write(const uint8_t *buf, int len, QueueHandle_t *tx_queue)
                  * sequences it. Cover both -- guessing wrong costs an abandoned mid-erase ECU. */
                 const bool erase_edge = (r == 0 && rem == take) ||
                                         (r == 1 && off == regions[1][0]);
+                if (erase_edge)
+                {
+                    /* Reset the host's idle clock at the START of this stall.
+                     *
+                     * Both edge blocks arm their OWN RESP_ERASE_TIMEOUT_MS, so an ECU that splits
+                     * its erase across the two can lawfully keep us silent for 60 + 60 s. The
+                     * host gives up after _FAST_WRITE_IDLE_MS (90 s) of no bytes, and when it does
+                     * it closes the socket -- slcan_port_tx_task then parks on PORT_OPEN and stops
+                     * draining, our next NCFWPROG fills the queue, tx_send times out, and the
+                     * flash aborts via host_gone with the ECU freshly erased. Exactly the outcome
+                     * this whole change exists to prevent.
+                     *
+                     * One line here bounds EVERY silent window to one edge budget (~62 s) instead
+                     * of two, whichever way the ECU splits the erase, and each edge keeps its full
+                     * 60 s. Off-cadence NCFWPROG lines are harmless to the host parser -- worst
+                     * case the progress callback repeats a count -- and any bytes reset its clock.
+                     *
+                     * Raising the host timeout instead would only make a genuinely dead firmware
+                     * take longer to notice. If this emit fails the host is already gone, and
+                     * aborting HERE is pre-erase for the first edge: strictly safer than today. */
+                    char eline[40];
+                    snprintf(eline, sizeof(eline), "NCFWPROG %lu/%lu\n",
+                             (unsigned long)done, (unsigned long)total_blocks);
+                    if (fw_emit(tx_queue, eline) != 0) { host_gone = 1; rc = -3; goto cleanup; }
+                }
+                /* Taken AFTER the emit above, so the budget covers only the ECU's stall. */
                 const int64_t edge_t0 = esp_timer_get_time();
                 const int64_t edge_deadline =
                     erase_edge ? edge_t0 + (int64_t)RESP_ERASE_TIMEOUT_MS * 1000 : 0;
