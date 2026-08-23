@@ -231,6 +231,39 @@ device. Confirm `build_web.py` actually regenerated the file; do not trust lint 
    because the queue is never cleared. Fixing that needs a timestamp beside the float.
    **Out of scope for #82**; record it in the issue.
 
+## 5.5 Build environment — read this before attempting AC10
+
+`idf.py build` will NOT work from a fresh Claude Code PowerShell session without this
+fix-up. The failure is misleading: it surfaces as `check-python-dependencies FAILED`,
+which looks like a Python problem even when the real cause is `MSYSTEM`.
+
+Two things are wrong by default:
+
+1. **Python version.** ESP-IDF v5.5.3 is installed at `C:\esp\esp-idf-v5.5.3` with a
+   Python 3.10 venv (`idf5.5_py3.10_env`). The system default `python` is 3.14, and
+   `export.ps1` derives the venv name from the active Python, so it hunts for a
+   nonexistent `idf5.5_py3.14_env`. Prepend 3.10 to `PATH`; do not reinstall anything.
+2. **`MSYSTEM=MINGW64`.** Inherited from the Git Bash toolchain, along with
+   `C:\Program Files\Git\{mingw64,usr}\*` on `PATH`. `idf_tools.py` hard-refuses with
+   *"MSys/Mingw is not supported"*. Clear the variable **and** strip those `PATH` entries.
+
+Run this in PowerShell, from the worktree root:
+
+```powershell
+$env:MSYSTEM = $null
+$env:PATH = (($env:PATH -split ';' | Where-Object { $_ -and ($_ -notmatch 'Program Files\Git\(mingw64|usr)') }) -join ';')
+$env:PATH = "C:\Users\dufre\AppData\Local\Programs\Python\Python310;C:\Users\dufre\AppData\Local\Programs\Python\Python310\Scripts;" + $env:PATH
+. C:\esp\esp-idf-v5.5.3\export.ps1
+idf.py build
+```
+
+Do **not** run `idf.py set-target` — `sdkconfig` is committed and the target is already
+`esp32s3`. v5.5.3 is the version CI pins in `.github/workflows/build-firmware.yml`; an
+older v5.1 also exists at `C:\esp\esp-idf` and must not be used.
+
+The app image lands in `build/`. Building is all AC10 asks for — **do not flash it.**
+See section 9.
+
 ## 6. Acceptance criteria (each verifiable from the transcript)
 
 - **AC1 — the endpoint no longer reads the gated queue.**
