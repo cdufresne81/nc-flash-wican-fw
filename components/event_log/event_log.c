@@ -108,9 +108,9 @@ static const char *evl_code_str(event_log_code_t code)
         case EVL_ENGINE_OFF:    return "ENGINE_OFF";
         case EVL_DATALOG_OPEN:  return "DATALOG_OPEN";
         case EVL_DATALOG_CLOSE: return "DATALOG_CLOSE";
-        case EVL_OTA_START:     return "OTA_START";
-        case EVL_OTA_OK:        return "OTA_OK";
-        case EVL_OTA_FAIL:      return "OTA_FAIL";
+        case EVL_UPDATE_START:  return "UPDATE_START";
+        case EVL_UPDATE_DONE:   return "UPDATE_DONE";
+        case EVL_UPDATE_FAIL:   return "UPDATE_FAIL";
         case EVL_FLASH_START:   return "FLASH_START";
         case EVL_FLASH_OK:      return "FLASH_OK";
         case EVL_FLASH_FAIL:    return "FLASH_FAIL";

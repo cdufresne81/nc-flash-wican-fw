@@ -202,12 +202,14 @@ typedef struct {
     uint8_t  channel;           // CONNECTED
     uint8_t  bssid[6];          // CONNECTED
     bool     has_bssid;
-    bool     link_was_up;       // DISCONNECTED: rssi_at_drop / held_s are meaningful
+    bool     link_was_up;       // DISCONNECTED: rssi / held_s are meaningful
     bool     emit_evl;          // does this fact ALSO reach the event log? Decided at capture,
                                 // because it depends on when the event happened: the debug flag's
                                 // value for ATTEMPT, the throttle verdict for DISCONNECTED, always
                                 // true for the rest. The report timeline is never gated.
-    int8_t   rssi_at_drop;      // DISCONNECTED
+    int8_t   rssi;              // DISCONNECTED (at the drop) and GOT_IP (of the new link).
+                                // 0 means "not known" and the field is omitted rather than
+                                // printed: 0 dBm is not a real reading (real ones are -30..-95).
     uint32_t held_s;            // DISCONNECTED
     uint32_t suppressed;        // DISCONNECTED: throttle carry-over
     uint32_t ttc_ms;            // GOT_IP: 0 = no attempt stopwatch was running
@@ -367,12 +369,30 @@ static const char *wd_hist_label(int i)
 // Mask an SSID for a report that will be pasted in public: keep the first and last character so the
 // owner can still recognise which network it was, hide the middle, and state the true length (a
 // length mismatch is how a trailing-space or homoglyph SSID typo gets spotted).
-static void wd_mask_ssid(const char *ssid, char *out, size_t cap)
+//
+// `with_len` decides whether that length suffix is printed, and the two readers want opposite
+// things. The /wifi_diag REPORT is the artifact people paste in public to get help, where a
+// stranger cannot see the real SSID and the length is the only way a typo shows up -- it keeps the
+// suffix. The EVENT LOG is the owner reading his own device, where he already knows how long his
+// own network name is; there the suffix is noise on every association line, so it is dropped.
+static void wd_mask_ssid_ex(const char *ssid, char *out, size_t cap, bool with_len)
 {
     size_t n = strlen(ssid);
     if (n == 0)      { strlcpy(out, "(none)", cap); return; }
-    if (n <= 2)      { snprintf(out, cap, "** (%u chars)", (unsigned)n); return; }
-    snprintf(out, cap, "%c***%c (%u chars)", ssid[0], ssid[n - 1], (unsigned)n);
+    if (n <= 2)
+    {
+        if (with_len) snprintf(out, cap, "** (%u chars)", (unsigned)n);
+        else          strlcpy(out, "**", cap);
+        return;
+    }
+    if (with_len) snprintf(out, cap, "%c***%c (%u chars)", ssid[0], ssid[n - 1], (unsigned)n);
+    else          snprintf(out, cap, "%c***%c", ssid[0], ssid[n - 1]);
+}
+
+// The report form. Every masking call outside wd_fact_format() goes through this one.
+static void wd_mask_ssid(const char *ssid, char *out, size_t cap)
+{
+    wd_mask_ssid_ex(ssid, out, cap, true);
 }
 
 // Keep the OUI (first three octets): it identifies the AP's chipset vendor, which is genuinely
@@ -532,8 +552,12 @@ static void wd_fact_format(const wd_fact_t *f)
     // "(none)" and never use it). Costing one snprintf on a 1 Hz task buys the property that a
     // case added below CANNOT reach the event log with a raw SSID by forgetting a line, which is
     // the invariant tools/webtest/wifi_diag.test.mjs polices from the outside.
+    //
+    // Short form (no "(N chars)"): this buffer feeds ONLY the event_log_emit_at calls below, and
+    // the event log is the owner reading his own device. The report path masks separately at render
+    // time in wd_evt_render() and keeps the length -- see wd_mask_ssid_ex().
     char m[48];
-    wd_mask_ssid(f->ssid, m, sizeof(m));
+    wd_mask_ssid_ex(f->ssid, m, sizeof(m), false);
 
     switch ((wd_fact_kind_t)f->kind)
     {
@@ -568,22 +592,35 @@ static void wd_fact_format(const wd_fact_t *f)
             // user's own router and says nothing about who or where they are, while being one of
             // the more useful things in a report (a 169.254 address is a whole diagnosis on its
             // own).
-            if (f->ttc_ms != 0)
+            //
+            // Signal strength is on this line because it is what turns "the connect was slow" into
+            // a reason. Captured at the event (see wifi_diag_note_got_ip); an unknown reading is 0
+            // and leaves the field out entirely rather than printing a fake "0dBm".
             {
-                wd_evt_push(up_s, NULL, NULL, "got IP    %s after %u ms",
-                            f->ip, (unsigned)f->ttc_ms);
-                if (f->emit_evl)
+                char rs[16] = "";
+                if (f->rssi != 0)
                 {
-                    event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "got IP %s (connect took %u ms)",
-                                      f->ip, (unsigned)f->ttc_ms);
+                    snprintf(rs, sizeof(rs), " rssi=%ddBm", (int)f->rssi);
                 }
-            }
-            else
-            {
-                wd_evt_push(up_s, NULL, NULL, "got IP    %s", f->ip);
-                if (f->emit_evl)
+
+                if (f->ttc_ms != 0)
                 {
-                    event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "got IP %s", f->ip);
+                    wd_evt_push(up_s, NULL, NULL, "got IP    %s after %u ms",
+                                f->ip, (unsigned)f->ttc_ms);
+                    if (f->emit_evl)
+                    {
+                        event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms,
+                                          "got IP %s%s (connect took %u ms)",
+                                          f->ip, rs, (unsigned)f->ttc_ms);
+                    }
+                }
+                else
+                {
+                    wd_evt_push(up_s, NULL, NULL, "got IP    %s", f->ip);
+                    if (f->emit_evl)
+                    {
+                        event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms, "got IP %s%s", f->ip, rs);
+                    }
                 }
             }
             break;
@@ -592,7 +629,7 @@ static void wd_fact_format(const wd_fact_t *f)
             if (f->link_was_up)
             {
                 wd_evt_push(up_s, f->ssid, NULL, "DROP      reason=%u rssi=%d held=%us",
-                            (unsigned)f->reason, (int)f->rssi_at_drop, (unsigned)f->held_s);
+                            (unsigned)f->reason, (int)f->rssi, (unsigned)f->held_s);
             }
             else
             {
@@ -611,7 +648,7 @@ static void wd_fact_format(const wd_fact_t *f)
                     event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms,
                                       "DROP reason=%u (%s) rssi=%d held=%us [+%u similar suppressed]",
                                       (unsigned)f->reason, wifi_diag_reason_str(f->reason),
-                                      (int)f->rssi_at_drop, (unsigned)f->held_s,
+                                      (int)f->rssi, (unsigned)f->held_s,
                                       (unsigned)f->suppressed);
                 }
                 else
@@ -619,7 +656,7 @@ static void wd_fact_format(const wd_fact_t *f)
                     event_log_emit_at(EVL_WIFI, &f->tv, f->up_ms,
                                       "DROP reason=%u (%s) rssi=%d held=%us",
                                       (unsigned)f->reason, wifi_diag_reason_str(f->reason),
-                                      (int)f->rssi_at_drop, (unsigned)f->held_s);
+                                      (int)f->rssi, (unsigned)f->held_s);
                 }
             }
             break;
@@ -757,6 +794,17 @@ void wifi_diag_note_got_ip(const char *ip)
         s_ttc_n++;
         s_attempt_start_ms = 0;
     }
+    // Signal strength of the link we just got an address on -- the number that explains a slow or
+    // flaky connect. Read from the sampler's cached snapshot, NOT from esp_wifi_sta_get_ap_info():
+    // this runs on the system event task, whose stack this firmware does not own (#111), and a
+    // driver call there is exactly the kind of work that belongs on the drain instead. Two scalar
+    // reads inside a critical section the function already takes.
+    //
+    // The cache is at most one sampler tick (~1 s) old, and association precedes GOT_IP by however
+    // long DHCP takes (seconds), so by now it is normally the NEW link's reading. When it is not --
+    // a boot where GOT_IP beats the first sample, or a link already down at the last tick -- sta_up
+    // is false, rssi stays 0, and the format side omits the field instead of inventing one.
+    f.rssi = s_snap.sta_up ? s_snap.rssi : 0;
     if (ip != NULL) strlcpy(s_ip, ip, sizeof(s_ip));
     portEXIT_CRITICAL(&s_lock);
 
@@ -789,7 +837,7 @@ void wifi_diag_note_disconnected(const char *ssid, uint8_t reason)
 
     // The RSSI that matters is the last one read WHILE THE LINK WAS UP: esp_wifi_sta_get_ap_info()
     // fails the moment it drops, so reading it here would report nothing at all.
-    f.rssi_at_drop = s_snap.rssi;
+    f.rssi = s_snap.rssi;
     f.link_was_up  = s_snap.sta_up;
 
     // Throttle only the shared-log line (see WD_EVL_REPEAT_MS). The verdict is decided HERE and

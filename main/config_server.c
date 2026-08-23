@@ -1768,6 +1768,25 @@ typedef struct {
 	esp_err_t err;
 } ota_upload_ctx_t;
 
+/* The multipart filename is text the CLIENT chose: main/multipart_upload.c copies the header
+ * value verbatim, with no character filtering. It then lands on the SD event log permanently and
+ * passes through ESP_LOGI on the way, so a terminal escape byte (0x1B) in it could rewrite what a
+ * reader is looking at. CR/LF cannot survive header parsing; nothing else is filtered today.
+ * Printable ASCII only, capped short enough to leave room for the rest of the detail line.
+ * '%' is folded too -- the result is only ever passed as an ARGUMENT and never as a format
+ * string, so that part is belt-and-braces against a future caller getting it wrong. */
+#define OTA_NAME_MAX 48
+static void ota_sanitize_filename(const char *in, char *out, size_t cap)
+{
+	size_t n = 0;
+	for (; in && in[n] != '\0' && n + 1 < cap; n++)
+	{
+		unsigned char c = (unsigned char)in[n];
+		out[n] = (c < 0x20 || c > 0x7E || c == '%') ? '_' : (char)c;
+	}
+	out[n] = '\0';
+}
+
 static bool ota_on_part_begin(const multipart_part_info_t *info, void *user_ctx)
 {
 	ota_upload_ctx_t *ctx = (ota_upload_ctx_t *)user_ctx;
@@ -1810,7 +1829,23 @@ static bool ota_on_part_begin(const multipart_part_info_t *info, void *user_ctx)
 	ctx->started = true;
 	// Operational event (Task #24): firmware update began. Runs on the httpd task; the in-RAM ring
 	// carries it even though the SD may be unavailable during the OTA flash window.
-	event_log_emit(EVL_OTA_START, "firmware OTA started (part subtype %d)", (int)ctx->update_partition->subtype);
+	//
+	// The uploaded file name is the one fact a reader wants on this line. The partition subtype
+	// that used to be here only said which of the two A/B slots was written -- it is still on
+	// serial just above, and the BOOT line after the reboot carries the new version, which is what
+	// actually answers "did my update work".
+	char safe_name[OTA_NAME_MAX + 1];
+	ota_sanitize_filename(info->filename, safe_name, sizeof(safe_name));
+	if (safe_name[0] != '\0')
+	{
+		event_log_emit(EVL_UPDATE_START, "firmware update started (%s)", safe_name);
+	}
+	else
+	{
+		// A part accepted purely on its content-type carries no name (see the test at the top of
+		// this function). Say nothing rather than print an empty "()".
+		event_log_emit(EVL_UPDATE_START, "firmware update started");
+	}
 	return true;
 }
 
@@ -1984,9 +2019,20 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 		{
 			esp_ota_abort(ctx.update_handle);
 		}
-		// Operational event (Task #24): single consolidated OTA-failure site.
-		event_log_emit(EVL_OTA_FAIL, "OTA failed: mp=%s ota=%s started=%d",
-		               esp_err_to_name(mp_err), esp_err_to_name(ctx.err), (int)ctx.started);
+		// Operational event (Task #24): single consolidated update-failure site. The two esp_err
+		// names come FIRST on purpose. This board has no serial console a PC can read, so they are
+		// the only diagnostic that survives the failure, and the detail is capped at
+		// EVENT_LOG_DETAIL_MAX (112) -- two long names (ESP_ERR_OTA_ROLLBACK_INVALID_STATE is 34
+		// characters) can reach that cap on their own. Ordering them ahead of the byte count means
+		// truncation eats the cheap field, never the diagnosis.
+		//
+		// The byte count is what says how far it got, and it is read from total_size rather than
+		// from ctx.started: `started` only means esp_ota_begin() succeeded, so keying the wording
+		// on it would report "partway through" for a client that dropped the connection before
+		// sending a single byte.
+		event_log_emit(EVL_UPDATE_FAIL, "firmware update FAILED: transfer=%s flash=%s (after %lu bytes)",
+		               esp_err_to_name(mp_err), esp_err_to_name(ctx.err),
+		               (unsigned long)ctx.total_size);
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA upload failed");
 		return ESP_FAIL;
 	}
@@ -1997,8 +2043,10 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 	 * the reboot itself. */
 	total_size = (uint32_t)ctx.total_size;
 	ESP_LOGI(TAG, "OTA upload complete: %lu bytes", (unsigned long)total_size);
-	// Operational event (Task #24): OTA written + boot partition switched; reboot scheduled below.
-	event_log_emit(EVL_OTA_OK, "firmware OTA complete: %lu bytes, reboot scheduled", (unsigned long)total_size);
+	// Operational event (Task #24): update written + boot partition switched; reboot scheduled
+	// below. The byte count stays -- after the fact it is the only thing that tells a truncated
+	// upload apart from a good one.
+	event_log_emit(EVL_UPDATE_DONE, "firmware update complete: %lu bytes, rebooting", (unsigned long)total_size);
 
 	httpd_resp_set_status(req, "303 See Other");
 	httpd_resp_set_hdr(req, "Location", "/");
@@ -3497,7 +3545,8 @@ void vrestartTimerCallback( TimerHandle_t xTimer )
 //	vTaskDelay(1000 / portTICK_PERIOD_MS);
 	// NOTE: the reboot is recorded by the event log AFTER the fact, on the next boot (the boot event
 	// reads restart_tracker's planned-reason), so nothing new touches this reset chokepoint. Events
-	// emitted before a reboot (OTA_OK, etc.) are already fsync'd by the writer within ~1s of emission.
+	// emitted before a reboot (UPDATE_DONE, etc.) are already fsync'd by the writer within ~1s of
+	// emission.
 	restart_tracker_restart(s_reboot_reason, s_reboot_source, s_reboot_flags);
 }
 

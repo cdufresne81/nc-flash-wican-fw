@@ -76,9 +76,12 @@ typedef enum {
     EVL_ENGINE_OFF,      // poll_log: rpm stopped, or the ECU went silent under a running engine
     EVL_DATALOG_OPEN,    // csv_logger: a logging session/file opened
     EVL_DATALOG_CLOSE,   // csv_logger: a logging session/file closed
-    EVL_OTA_START,       // firmware OTA upload began
-    EVL_OTA_OK,          // firmware OTA written + boot partition switched
-    EVL_OTA_FAIL,        // firmware OTA aborted/failed
+    // "UPDATE", not "OTA": the label is what a person reads in their own log, and the acronym
+    // says nothing to them. The names are also 12 characters or fewer, which is what the label
+    // column pads to (event_log.c) -- see the note there before adding a longer one.
+    EVL_UPDATE_START,    // firmware update upload began
+    EVL_UPDATE_DONE,     // firmware update written + boot partition switched
+    EVL_UPDATE_FAIL,     // firmware update aborted/failed
     // --- NC-Flash / coexistence lifecycle (Task #12). Milestone-only: emitted at start/done/abort
     //     of a flash, fast-read, or host bus session -- NEVER per-block on the TransferData hot path
     //     and NEVER inside an fwrite/fsync flash-cache-disable window (NCFWPROG covers live progress).

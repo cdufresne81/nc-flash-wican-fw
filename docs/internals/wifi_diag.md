@@ -111,6 +111,11 @@ how a trailing-space or homoglyph SSID typo gets spotted) and the tail of the BS
 it identifies the AP vendor, which is diagnostic, and is not specific to a household). Its entire
 purpose is to be pasted into a public issue.
 
+The **event log masks too, but without the length.** Its lines are the owner reading his own
+device, where he already knows how long his own network name is, so `(N chars)` on every
+association line is noise rather than a diagnostic. `wd_mask_ssid_ex(..., with_len=false)` is the
+short form and `wd_fact_format()` is its only caller; every other masking call keeps the length.
+
 The **JSON does not mask**. It renders on the user's own device showing their own network, and
 masking there would defeat the most common use — spotting that it joined the wrong SSID.
 
@@ -176,7 +181,11 @@ Raising the stack made the desk bigger without reducing the paperwork, so #111 m
 - A hook now fills a **`wd_fact_t`** — an enum, a few ints, one `strlcpy`'d SSID, plus
   `gettimeofday()` and the uptime **captured at the event** — and pushes it into a static 16-deep
   ring (`s_facts[]`, ~1.6 KB of `.bss`) under the module's existing lock. Nothing formats. No
-  `snprintf`, no masking, no emit.
+  `snprintf`, no masking, no emit. Anything the *event's own moment* knows and the drain cannot
+  travels in the fact — the connect stopwatch, and the RSSI on both `GOT_IP` and `DISCONNECTED`,
+  read from the 1 Hz sampler's cached snapshot rather than from `esp_wifi_sta_get_ap_info()`
+  (a driver call on the system event task is exactly the work this mechanism exists to move). An
+  unknown RSSI stays 0 and the format side leaves the field out rather than printing a fake 0 dBm.
 - **`wd_drain_facts()`** pops the facts and does all of it — `wd_evt_push()`, `wd_mask_ssid()`,
   `event_log_emit_at()` — on a stack that owns itself.
 

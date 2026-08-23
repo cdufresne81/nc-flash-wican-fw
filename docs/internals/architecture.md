@@ -869,7 +869,7 @@ A real example of the whole chain working, from the bench right after an OTA:
 
 ```
 2026-07-25 15:13:42 up=160ms  BOOT         reason=software planned=ota_apply src=web_ui fw=v1.17.0 sd=mounted
-2026-07-25 15:13:44 up=3108ms IGNITION_ON  ignition on -- ECU answering
+2026-07-25 15:13:44 up=3108ms IGNITION_ON  ECU answering
 ```
 
 The boot line carries the *previous* boot's reason, which is what makes an

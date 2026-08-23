@@ -124,7 +124,11 @@ void crash_report_emit_pending(void)
     crash_record_t c = s_crash;
     s_crash.magic = 0;
 
-    event_log_emit(EVL_INFO, "CRASH %s core=%ld pc=0x%08lx cause=%lu frames=%lu",
+    // WARN, not INFO: the web UI colours the Event Log card by CODE, so an INFO crash summary
+    // rendered green next to healthy lines -- the single most alarming line in the log wearing the
+    // "everything is fine" colour. The backtrace frames below stay INFO; they are continuation
+    // detail under this headline, not separate findings.
+    event_log_emit(EVL_WARN, "CRASH %s core=%ld pc=0x%08lx cause=%lu frames=%lu",
                    crash_exc_str(c.exception), (long)c.core,
                    (unsigned long)c.pc, (unsigned long)c.exccause, (unsigned long)c.depth);
 

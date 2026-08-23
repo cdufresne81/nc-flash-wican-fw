@@ -571,7 +571,9 @@ static void polllog_engine_started(void)
     char volts[12];
     polllog_volt_str(volts, sizeof(volts));
     ESP_LOGI(TAG, "engine started (%d rpm, %s)", polllog_rpm_i(s_rpm_value), volts);
-    event_log_emit(EVL_ENGINE_ON, "engine started -- %d rpm, %s", polllog_rpm_i(s_rpm_value), volts);
+    /* The detail carries only the evidence; the ENGINE_ON label already says the engine started.
+     * The ESP_LOGI above keeps its full wording -- serial has no label column. */
+    event_log_emit(EVL_ENGINE_ON, "%d rpm, %s", polllog_rpm_i(s_rpm_value), volts);
 }
 
 /* The falling edge. `why` is the evidence, already in plain words ("0 rpm", "ECU stopped
@@ -592,7 +594,9 @@ static void polllog_engine_stopped(const char *why)
     char volts[12];
     polllog_volt_str(volts, sizeof(volts));
     ESP_LOGI(TAG, "engine stopped after %s (%s, %s)", dur, why, volts);
-    event_log_emit(EVL_ENGINE_OFF, "engine stopped after %s -- %s, %s", dur, why, volts);
+    /* Same as ENGINE_ON: no "engine stopped" prefix, the label said it. "after" stays so the line
+     * still reads as a sentence -- "ENGINE_OFF   after 22m10s -- ECU stopped answering, 12.1V". */
+    event_log_emit(EVL_ENGINE_OFF, "after %s -- %s, %s", dur, why, volts);
 }
 
 /* One pass of the engine-run edge, fed the gate's own rpm verdict so the two can never disagree.
@@ -942,9 +946,10 @@ static bool polllog_poll_one(pid_data_t *pid)
                  * frame alone only PROBES (flips us to NORMAL); the OK is what confirms, so a stray
                  * wind-down frame can never log a false start. Exactly one IGNITION_ON per key-on.
                  * The message states the EVIDENCE ("ECU answering") because that is all we know: a
-                 * car at key-on with the engine not turning answers every request too (#98). */
+                 * car at key-on with the engine not turning answers every request too (#98).
+                 * It does NOT repeat "ignition on" -- the IGNITION_ON label already said that. */
                 s_ecu_answering = true;
-                event_log_emit(EVL_IGNITION_ON, "ignition on -- ECU answering");
+                event_log_emit(EVL_IGNITION_ON, "ECU answering");
             }
             got = true;
             break;
@@ -1576,9 +1581,10 @@ static void polllog_rx_task(void *arg)
                         /* Operational event (Task #24): once per confirmed on->off transition.
                          * Plain words, not internals: "5000ms -> quiesce (LISTEN_ONLY)" means nothing
                          * to someone reading their own event log (#98). The seconds come from the
-                         * constant so the text and the timeout can never drift apart. */
+                         * constant so the text and the timeout can never drift apart. The detail does
+                         * not repeat "ignition off" -- the IGNITION_OFF label already said that. */
                         event_log_emit(EVL_IGNITION_OFF,
-                                       "ignition off -- no ECU reply for %ds, stopped sending requests",
+                                       "no ECU reply for %ds, stopped sending requests",
                                        POLLLOG_ENGINE_OFF_MS / 1000);
                     }
                     else

@@ -214,8 +214,8 @@ The recording-gate fields. `req_s` alone is ambiguous once the gate exists — ~
 The gate already knows when the crank is turning; before this it never said so, and an event log showing only steady 12.8 V readings was misread as "the engine never ran" — the `DATALOG_OPEN` line was the only (implicit) proof. Two event codes now state it outright:
 
 ```
-ENGINE_ON    engine started -- 812 rpm, 14.32V
-ENGINE_OFF   engine stopped after 12m34s -- 0 rpm, 12.81V
+ENGINE_ON    812 rpm, 14.32V
+ENGINE_OFF   after 12m34s -- 0 rpm, 12.81V
 ```
 
 - **Edge-triggered**, latched — one line per start, never per sweep (`polllog_eval_gate` runs up to 100×/s).
