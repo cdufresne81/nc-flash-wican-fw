@@ -1063,10 +1063,21 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
      * dead-man reaper clears it, and the reaper is gated on the bus going idle -- which, key-on,
      * does not happen until the key turns off (#70). Holding sleep off on the raw flag would
      * therefore be unbounded, trading a rare cut session for a flat battery. The lease is
-     * self-bounding instead: the host renews every 4 s against a 75 s TTL, so ANY way the host
-     * dies stops the renewals and the claim expires within the TTL. The owner_alive term covers
-     * the tail where the claim has expired but its 35001 socket is still retransmitting. This
-     * consults no reaper output at all, so a stuck reaper or a zombie socket cannot extend it. */
+     * self-bounding instead -- but read the bound precisely. The host renews every 4 s against a
+     * 75 s TTL, so once the owning 35001 socket is GONE this drops within the TTL. The socket
+     * dying is what every real host death looks like: a crash, a suspend, a WiFi drop or an
+     * unplugged cable all surface as a closed or dead socket within ~20 s (TCP keepalive on
+     * 35001 is 5 s idle / 5 s interval / 3 probes), and the owner_alive term exists to cover
+     * exactly that tail, where the lease has expired but the socket is still retransmitting.
+     *
+     * What this is NOT is a hard 75 s ceiling. owner_alive stays true for as long as that same
+     * socket stays open, so a host application that FREEZES while its machine stays awake and
+     * connected -- renewals stopped, socket never closed -- holds sleep off for as long as it
+     * sits there, not for 75 s. Left overnight in a parked car that flattens the battery. It is
+     * accepted knowingly: before #92 the same situation cut a live flash instead, which is the
+     * worse of the two. Do not design anything new against a TTL bound that is not there.
+     *
+     * This consults no reaper output at all, so a stuck reaper cannot extend it. */
     can_coexist_snapshot_t coexist;
     can_coexist_snapshot(&coexist);
     const bool session_live = (coexist.host_bus_claimed &&
@@ -1150,8 +1161,9 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
                 }
                 else
                 {
-                    /* Claim-only postpone. Bounded by the lease, so it cannot outlive the host
-                     * by more than the TTL plus one retry -- see the gate comment above. */
+                    /* Session postpone. Bounded by the lease once the host's socket is gone --
+                     * TTL plus one retry -- but not while that socket stays open; see the gate
+                     * comment above for the frozen-host case this deliberately does not bound. */
                     ESP_LOGW(TAG, "sleep postponed: host session active -- claim/park lease held (#92)");
                     event_log_emit(EVL_INFO, "sleep postponed -- host session active (claim/park lease held)");
                 }
@@ -1899,8 +1911,10 @@ void light_sleep_task(void *pvParameters)
          * Read the LEASE, never can_host_bus_claim_active(): the raw flag stays set until the
          * dead-man reaper clears it, and that reap waits for the bus to go idle -- which, key-on,
          * means key-off (#70). Vetoing on the raw flag would hide a device that never sleeps
-         * behind a UI reporting NORMAL. The lease self-bounds: the host renews every 4 s against
-         * a 75 s TTL, so however it dies, this drops within the TTL. */
+         * behind a UI reporting NORMAL. The lease self-bounds, with the caveat spelled out at the
+         * teardown gate: the host renews every 4 s against a 75 s TTL, so this drops within the
+         * TTL once the owning 35001 socket is gone (~20 s of TCP keepalive covers every way the
+         * host machine dies) -- but for as long as that socket stays open it holds. */
         can_coexist_snapshot_t sleep_coexist;
         can_coexist_snapshot(&sleep_coexist);
         const bool claim_live = sleep_coexist.host_bus_claimed &&
