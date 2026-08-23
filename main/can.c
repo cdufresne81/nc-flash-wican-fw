@@ -84,7 +84,28 @@ typedef struct {
 static lease_t s_claim = {0};   /* host bus-claim raised over the UDS auth window (auth fence) */
 static lease_t s_park  = {0};   /* host REST datalog-pause (advisory pre-park)                 */
 static volatile uint32_t s_last_bus_activity_ms = 0; /* last TWAI TX or RX (atomic 32-bit ms) */
+/* Last DIAGNOSTIC activity (#131/#70): any TX by us, or an RX frame in the OBD diagnostic ID
+ * range. Separate from s_last_bus_activity_ms on purpose -- with the key on, the PCM broadcasts
+ * ~2000 frames/s, so "the bus went quiet" is never true on a running car and the dead-man reaper
+ * could never fire. What the reaper actually needs to know is whether a diagnostic CONVERSATION
+ * is in flight, which is what this clock measures. Same single atomic 32-bit ms write. */
+static volatile uint32_t s_last_diag_activity_ms = 0;
 static volatile bool     s_stuck_flash_alarm = false;
+
+/* ISO 15765-4 diagnostic identifiers: 0x7DF (functional request) and 0x7E0-0x7EF (the eight
+ * physical request/response pairs; the NC PCM is 0x7E0/0x7E8). The 29-bit ranges 0x18DAxxxx /
+ * 0x18DBxxxx are included for completeness -- this vehicle is 11-bit, but the check is free. */
+static inline bool frame_is_diagnostic(const twai_message_t *m)
+{
+	if(m == NULL) { return false; }
+	if(m->extd)
+	{
+		uint32_t hi = m->identifier & 0x1FFF0000U;
+		return (hi == 0x18DA0000U) || (hi == 0x18DB0000U);
+	}
+	return (m->identifier == 0x7DFU) ||
+	       (m->identifier >= 0x7E0U && m->identifier <= 0x7EFU);
+}
 
 #define TAG 		__func__
 enum bus_state
@@ -374,6 +395,12 @@ uint32_t can_bus_idle_ms(void)
 	return now_ms - s_last_bus_activity_ms;   /* unsigned wrap is fine (same modulus) */
 }
 
+uint32_t can_diag_idle_ms(void)
+{
+	uint32_t now_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+	return now_ms - s_last_diag_activity_ms;  /* unsigned wrap is fine (same modulus) */
+}
+
 void can_set_stuck_flash_alarm(bool on)
 {
 	s_stuck_flash_alarm = on;
@@ -398,6 +425,7 @@ void can_coexist_snapshot(can_coexist_snapshot_t *out)
 	uint32_t live_gen = (uint32_t)slcan_port_conn_gen();
 	bool flash = can_flash_active();
 	uint32_t idle_ms = (uint32_t)(now / 1000ULL) - s_last_bus_activity_ms;
+	uint32_t diag_idle_ms = (uint32_t)(now / 1000ULL) - s_last_diag_activity_ms;
 
 	portENTER_CRITICAL(&s_park_mux);
 	out->now_us            = now;
@@ -417,6 +445,7 @@ void can_coexist_snapshot(can_coexist_snapshot_t *out)
 	out->park_owner_alive  = (s_park.owner_gen == 0) ? (live_gen != 0)
 	                                                 : (live_gen == s_park.owner_gen);
 	out->bus_idle_ms       = idle_ms;
+	out->diag_idle_ms      = diag_idle_ms;
 	portEXIT_CRITICAL(&s_park_mux);
 }
 
@@ -687,7 +716,13 @@ esp_err_t can_receive(twai_message_t *message, TickType_t ticks_to_wait)
 		{
 			/* Stamp bus activity (dead-man's-switch bus-idle evidence): a received frame
 			 * proves the bus is not quiescent. Single atomic 32-bit ms write. */
-			s_last_bus_activity_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+			uint32_t now_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+			s_last_bus_activity_ms = now_ms;
+			/* An ECU response (0x7E8 etc.) means a diagnostic exchange is LIVE even though the
+			 * tester is silent -- exactly what a 7F..78 response-pending window looks like. This
+			 * stamp is what stops the 12 s park-reap resuming the poller into that window; do
+			 * not "simplify" the diag clock to TX-only. */
+			if(frame_is_diagnostic(message)) { s_last_diag_activity_ms = now_ms; }
 		}
 		return ret;
 	}
@@ -720,7 +755,13 @@ esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait)
 		{
 			/* Stamp bus activity (dead-man's-switch bus-idle evidence): the single TX
 			 * chokepoint. Single atomic 32-bit ms write. */
-			s_last_bus_activity_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+			uint32_t now_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+			s_last_bus_activity_ms = now_ms;
+			/* Every TX counts as diagnostic activity regardless of ID: this device is the
+			 * tester side, so anything it puts on the wire while something is parked is
+			 * host-driven work. Counting it can only DELAY a reap, which is the safe way to
+			 * be wrong. */
+			s_last_diag_activity_ms = now_ms;
 		}
 		return ret;
 	}

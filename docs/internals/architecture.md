@@ -397,9 +397,10 @@ Consequences:
 
 - In ELM327 and AutoPID modes the ESP32's own CAN controller is **not used at
   all**. Those modes reach the bus through the external chip.
-- `can_bus_idle_ms()` therefore means *"the ESP32's TWAI controller saw no
-  traffic"*, **not** *"the bus is quiet"*. In AutoPID mode the external chip can
-  be polling the ECU continuously while this reports the bus fully idle.
+- `can_bus_idle_ms()` (and `can_diag_idle_ms()`) therefore mean *"the ESP32's
+  TWAI controller saw no traffic"*, **not** *"the bus is quiet"*. In AutoPID mode
+  the external chip can be polling the ECU continuously while both report the bus
+  fully idle.
 - `/check_status` has two different health fields for two different things:
   `obd_chip_status` ("Ready"/"Sleep") is the external chip, read from
   `OBD_READY_PIN`; `ecu_status` is the broken legacy field from §7.
@@ -480,24 +481,33 @@ Flash runs *before* the codec starts. The dead-man reaper
 `FLASH_ACTIVE_BIT`, so a stray or duplicate resume can never un-park a live
 flash. Either flag alone keeps every producer parked.
 
-> **Known limitation — the dead-man's switch cannot fire while the engine
-> runs.** Both the claim-reap and the datalog-reap require
-> `bus_idle` = `bus_idle_ms >= COEXIST_BUS_IDLE_QUIESCE_MS` (300 ms,
-> `can.h:90`, tested at `datalog_lease_task.c:56, :95, :113`).
-> `s_last_bus_activity_ms` is stamped on **every** TWAI RX and TX — the two
-> chokepoints inside `can_receive()` and `can_send()` (`can.c:642`, `:675`) —
-> and `can_rx_task` deliberately does *not* park during a
-> coexist session (`main.c:379`) so it keeps draining and stamping. A running
-> powertrain bus carries roughly 2,000 frames/s, so `bus_idle_ms` never
-> approaches 300.
+> **Two idle clocks, and the reaper uses the narrow one.** `can.c` keeps two
+> timestamps. `s_last_bus_activity_ms` is stamped on **every** TWAI RX and TX
+> and is surfaced as `can_bus_idle_ms()` / the `bus_idle_ms` JSON field — it
+> answers *"did the TWAI controller see anything at all"* and is **observability
+> only**. `s_last_diag_activity_ms` is stamped on every TX by us plus RX frames
+> in the OBD diagnostic ID range (`0x7DF`, `0x7E0-0x7EF`, and the 29-bit
+> `0x18DA/0x18DB` ranges) and is surfaced as `can_diag_idle_ms()` /
+> `diag_idle_ms`. Both reaps gate on the diagnostic clock
+> (`datalog_lease_task.c`, `diag_idle >= COEXIST_BUS_IDLE_QUIESCE_MS`).
 >
-> Consequence: if the NC Flash host vanishes mid-session **with the engine
-> running**, neither reap fires and the datalogger stays parked until a manual
-> resume or a reboot. The behaviour is fail-safe (parked, not corrupt) and
-> flashing is done key-on-engine-off in practice — but nothing in the firmware
-> enforces or documents that assumption, and the automatic recovery is
-> unavailable in exactly the state a driver would be in. The stuck-flash alarm
-> is unaffected: it does not consult `bus_idle`.
+> This is the fix for [#70](https://github.com/cdufresne81/nc-flash-wican-fw/issues/70)
+> / [#131](https://github.com/cdufresne81/nc-flash-wican-fw/issues/131). Gating
+> on raw bus idle made the dead-man's switch inoperative with the engine
+> running: a live powertrain bus carries roughly 2,000 frames/s, `can_rx_task`
+> deliberately keeps draining during a coexist session (`main.c:379`) so it
+> keeps stamping, and `bus_idle_ms` therefore never approached 300 ms. A host
+> that vanished mid-session left the datalogger parked and silent — measured on
+> the bench at `bus_idle_ms` 0-9 ms for the whole stuck window.
+>
+> The idle term is narrowed, **not removed**. It is what stops a reap resuming
+> the poller into a live UDS exchange — including a `7F..78` response-pending
+> window, where the ECU talks while the tester is silent, which is why ECU
+> responses stamp the diagnostic clock too and a TX-only clock would be
+> brick-unsafe. If diagnostic traffic genuinely never stops (a wedged ECU, or a
+> second scan tool parked on the car) staying parked remains the correct
+> behaviour; the unconditional `op=bus_release` / `op=resume` REST ops are the
+> manual override. The stuck-flash alarm consults neither clock.
 
 ---
 
@@ -1028,7 +1038,7 @@ file so it can go stale without dragging this one with it:
 Open issues it feeds: [#68](https://github.com/cdufresne81/nc-flash-wican-fw/issues/68)
 (config parser panic), [#69](https://github.com/cdufresne81/nc-flash-wican-fw/issues/69)
 (failed OTA leaves CAN disabled), [#70](https://github.com/cdufresne81/nc-flash-wican-fw/issues/70)
-(dead-man's switch inoperative with the engine running),
+(dead-man's switch inoperative with the engine running — **fixed**, see §6),
 [#71](https://github.com/cdufresne81/nc-flash-wican-fw/issues/71)
 (SD reformats itself after a power-loss FAT corruption), plus the ledger in #28
 and the roadmaps in #30 / #35.

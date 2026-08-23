@@ -19,7 +19,7 @@ const { strandRestoreDecision } = requireExports('strandRestoreDecision');
 const healthy = {
     ok: true, flash_active: false, datalog_parked: false, host_bus_claimed: false,
     manual_mode: 'auto', park_token: null, claim_token: null,
-    lease_ttl_ms: 12000, claim_ttl_ms: 75000, bus_idle_ms: 3, stuck_flash_alarm: false,
+    lease_ttl_ms: 12000, claim_ttl_ms: 75000, bus_idle_ms: 3, diag_idle_ms: 8000, stuck_flash_alarm: false,
 };
 
 test('a clean device proceeds behind an ordinary confirm', () => {
