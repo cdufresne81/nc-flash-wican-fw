@@ -35,8 +35,21 @@
 #define ECU_ID 0x7E8u
 #define FRAME_TIMEOUT_MS 200
 #define FC_TIMEOUT_MS 2000        /* ECU may be slow to Flow-Control while busy (e.g. SBL init/erase) */
-#define RESP_FIRST_TIMEOUT_MS 5000 /* a block's first response can lag seconds (erase after the SBL) */
+#define RESP_FIRST_TIMEOUT_MS 5000 /* ordinary mid-region block: keep TIGHT, see below */
 #define RESP_PENDING_TIMEOUT_MS 5000
+/* The ECU erases its application region as soon as the SBL starts running, and it can answer
+ * NOTHING at all while it does -- an erase here takes well over 5 s. RESP_FIRST_TIMEOUT_MS used to
+ * cover that case too, and it does not: on 2026-08-23 a real flash timed out on the LAST SBL block
+ * with FWSUB_ACK_TO and walked away from an ECU that was mid-erase (issue #126).
+ *
+ * Aborting there does not un-erase anything. It abandons an ECU that would have finished, leaving
+ * it with no valid application until someone re-flashes it. So at the erase edge the safe move is
+ * to WAIT, and the ceiling exists only so a truly dead ECU cannot hang the task forever.
+ *
+ * Deliberately asymmetric with RESP_FIRST_TIMEOUT_MS: mid-region a missing ACK really is fatal
+ * (TransferData carries no sequence counter, so there is no resend -- see the header), and failing
+ * fast is correct there. Only the erase edge gets the long ceiling. */
+#define RESP_ERASE_TIMEOUT_MS 30000
 #define MAX_PENDING 24            /* ~ host TIMEOUT_RESPONSE_PENDING_MAX budget for 0x78 retries */
 
 /* Granular ISO-TP sub-failure codes surfaced in the FWERR nrc field so a flash
@@ -257,13 +270,13 @@ static int fw_isotp_send(const uint8_t *payload, uint32_t total)
 
 /* Await a positive UDS response with SID `expect`, riding out 7F xx 78. Sets
  * *out_nrc to the real ECU NRC, or an FWSUB_ACK_* code, on failure. */
-static int fw_await_positive(uint8_t expect, int *out_nrc)
+static int fw_await_positive(uint8_t expect, int *out_nrc, int first_timeout_ms)
 {
     int pending = 0;
     for (;;)
     {
         twai_message_t rx;
-        int to = pending ? RESP_PENDING_TIMEOUT_MS : RESP_FIRST_TIMEOUT_MS;
+        int to = pending ? RESP_PENDING_TIMEOUT_MS : first_timeout_ms;
         if (recv_matching(&rx, to) != 0) { *out_nrc = FWSUB_ACK_TO; return -1; }
         if ((rx.data[0] >> 4) != 0x0) { *out_nrc = FWSUB_ACK_PCI; return -1; } /* want SF reply */
         uint8_t l = rx.data[0] & 0x0F;
@@ -287,17 +300,17 @@ static int fw_request_download(uint32_t addr, uint32_t size, int *nrc)
                     (uint8_t)(size >> 24), (uint8_t)(size >> 16), (uint8_t)(size >> 8), (uint8_t)size};
     int s = fw_isotp_send(p, sizeof(p));
     if (s != 0) { *nrc = -s; return -1; }
-    return fw_await_positive(0x74, nrc);
+    return fw_await_positive(0x74, nrc, RESP_FIRST_TIMEOUT_MS);
 }
 
 /* TransferData [0x36]+block (NO sequence counter), then await 0x76. s_fw_msg[0]
  * is preset to 0x36 by the caller; block bytes live at s_fw_msg[1..blen]. */
-static int fw_transfer_data(uint32_t blen, int *nrc)
+static int fw_transfer_data(uint32_t blen, int *nrc, int first_timeout_ms)
 {
     s_fw_msg[0] = 0x36;
     int s = fw_isotp_send(s_fw_msg, blen + 1);
     if (s != 0) { *nrc = -s; return -1; }
-    return fw_await_positive(0x76, nrc);
+    return fw_await_positive(0x76, nrc, first_timeout_ms);
 }
 
 static int fw_transfer_exit(int *nrc)
@@ -305,7 +318,7 @@ static int fw_transfer_exit(int *nrc)
     uint8_t p[1] = {0x37};
     int s = fw_isotp_send(p, 1);
     if (s != 0) { *nrc = -s; return -1; }
-    return fw_await_positive(0x77, nrc);
+    return fw_await_positive(0x77, nrc, RESP_FIRST_TIMEOUT_MS);
 }
 
 static void fw_ecu_reset(void)
@@ -492,7 +505,15 @@ int ncflash_fast_write(const uint8_t *buf, int len, QueueHandle_t *tx_queue)
             if (live)
             {
                 int nrc = 0;
-                if (fw_transfer_data(take, &nrc) != 0)
+                /* The erase edge (#126). The ECU jumps into the SBL once the SBL region is fully
+                 * transferred, and the SBL erases before it answers, so the stall lands on the ACK
+                 * of the LAST SBL block or on the FIRST program block depending on how the ECU
+                 * sequences it. Cover both -- guessing wrong costs an abandoned mid-erase ECU. */
+                const bool erase_edge = (r == 0 && rem == take) ||
+                                        (r == 1 && off == regions[1][0]);
+                if (fw_transfer_data(take, &nrc,
+                                     erase_edge ? RESP_ERASE_TIMEOUT_MS
+                                                : RESP_FIRST_TIMEOUT_MS) != 0)
                 {
                     fw_emit_err(tx_queue, off, r == 0 ? 11 : 12, nrc);
                     rc = -2;
