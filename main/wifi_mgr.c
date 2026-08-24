@@ -839,6 +839,13 @@ esp_err_t wifi_mgr_enable(void) {
     
     // Set event bits BEFORE creating reconnect task
     xEventGroupSetBits(wifi_event_group, WIFI_INIT_BIT | WIFI_ENABLED_BIT);
+    /* #135: and drop any disconnect left over from the last time the radio was up -- esp_wifi_start()
+     * above has already fired a fresh connect via STA_START (:1381), so older news is stale by
+     * definition and would only make the reconnect task cut that join short. Every caller happens to
+     * clear this bit already (disable :865, set_mode :926, deinit :670, or a cold boot), so today
+     * this is belt and braces -- but that is an invariant spread across four call sites, and it
+     * belongs here, next to the code that depends on it. */
+    xEventGroupClearBits(wifi_event_group, WIFI_DISCONNECTED_BIT);
     
     // Create reconnect task if STA auto-reconnect is enabled
     if ((wifi_config.mode == WIFI_MGR_MODE_STA || wifi_config.mode == WIFI_MGR_MODE_APSTA) 
@@ -1687,7 +1694,11 @@ static void wifi_reconnect_task(void* pvParameters) {
         if (wifi_status.ap_connected_stations > 0) {
             ESP_LOGI(TAG, "AP has %d connected stations, pausing STA reconnection to avoid channel switching", 
                      wifi_status.ap_connected_stations);
-            vTaskDelay(ap_client_check_delay); // Wait and check again, don't consume the disconnect event
+            /* #135: this used to claim it does not consume the disconnect event. It does -- the bit
+             * was already cleared above, before this check ever runs. Losing it costs speed only:
+             * the "no bit and no connection" branch keeps retrying regardless, so recovery is never
+             * lost, just paced at 5 s. The false comment is what is dangerous here, so it is gone. */
+            vTaskDelay(ap_client_check_delay); // Wait and check again
             continue;
         }
         
@@ -1706,6 +1717,10 @@ static void wifi_reconnect_task(void* pvParameters) {
          * pending disconnect, takes the no-event branch below, and waits the full 5 s. Measured on
          * the bench: 2103 -> 2108 -> 2113 -> 2118, all 5 s apart. That is fine -- one quick try is
          * what turns a 5-10 s outage into a sub-second one -- but do not read this as two.
+         * Since the attempt site consumes the bit, "one" is now structural, not just a timing
+         * accident: every iteration except one leaving the connected branch reaches the loop top
+         * straight after a clear, so this test is never even evaluated with a count of 1. An IDF
+         * that reported failures instantly would break the timing argument, not this one.
          * The bound matters: no known network in range settles back to 5 s pacing, and each failed
          * attempt costs the driver 3-4 s of its own, so this cannot become a tight loop. */
         vTaskDelay((fast_retry && wifi_status.sta_retry_count < 2)
