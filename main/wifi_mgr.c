@@ -45,6 +45,11 @@ static const char *TAG = "WiFi_Manager";
 static esp_netif_t* ap_netif = NULL;
 static esp_netif_t* sta_netif = NULL;
 static TaskHandle_t reconnect_task_handle = NULL;
+/* #135: the reason code from the most recent STA_DISCONNECTED, so wifi_reconnect_task can tell a
+ * link that failed on us from one we tore down ourselves. Written on the system event task, read
+ * on the reconnect task; a single aligned int, so a plain volatile is enough -- no lock needed and
+ * none wanted, because the write sits on the stack-tight sys_evt task (see #111/#118). */
+static volatile int s_last_disc_reason = -1;
 static EventGroupHandle_t wifi_event_group = NULL;
 static StaticEventGroup_t wifi_event_group_buffer;
 static wifi_mgr_config_t wifi_config;
@@ -834,6 +839,13 @@ esp_err_t wifi_mgr_enable(void) {
     
     // Set event bits BEFORE creating reconnect task
     xEventGroupSetBits(wifi_event_group, WIFI_INIT_BIT | WIFI_ENABLED_BIT);
+    /* #135: and drop any disconnect left over from the last time the radio was up -- esp_wifi_start()
+     * above has already fired a fresh connect via STA_START (:1381), so older news is stale by
+     * definition and would only make the reconnect task cut that join short. Every caller happens to
+     * clear this bit already (disable :865, set_mode :926, deinit :670, or a cold boot), so today
+     * this is belt and braces -- but that is an invariant spread across four call sites, and it
+     * belongs here, next to the code that depends on it. */
+    xEventGroupClearBits(wifi_event_group, WIFI_DISCONNECTED_BIT);
     
     // Create reconnect task if STA auto-reconnect is enabled
     if ((wifi_config.mode == WIFI_MGR_MODE_STA || wifi_config.mode == WIFI_MGR_MODE_APSTA) 
@@ -1395,6 +1407,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                 
             case WIFI_EVENT_STA_DISCONNECTED:
                 ESP_LOGI(TAG, "STA disconnected");
+                /* #135: publish the reason BEFORE raising WIFI_DISCONNECTED_BIT. The bit is what
+                 * releases the reconnect task, so setting it first would let that task read a
+                 * stale reason and fast-retry a disconnect we asked for. */
+                s_last_disc_reason = event_data
+                    ? (int)((wifi_event_sta_disconnected_t*)event_data)->reason
+                    : -1;
                 wifi_status.sta_connected = false;
                 memset(wifi_status.sta_ip, 0, sizeof(wifi_status.sta_ip));
                 // Update queue with empty IP
@@ -1614,6 +1632,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
  */
 static void wifi_reconnect_task(void* pvParameters) {
     const TickType_t reconnect_delay = pdMS_TO_TICKS(5000); // 5 seconds
+    const TickType_t fast_reconnect_delay = pdMS_TO_TICKS(500); // #135: first tries after a real drop
     const TickType_t ap_client_check_delay = pdMS_TO_TICKS(10000); // 10 seconds
     
     ESP_LOGI(TAG, "WiFi reconnect task started");
@@ -1638,16 +1657,29 @@ static void wifi_reconnect_task(void* pvParameters) {
         
         // Check if STA is already connected
         if (wifi_status.sta_connected) {
-            vTaskDelay(reconnect_delay);
+            /* #135: this used to be a flat vTaskDelay(5000), so a link that died one millisecond
+             * into the nap went unnoticed for the rest of it -- up to 5 s of the 11 s outage seen
+             * on the bench was spent right here. Wait on the disconnect bit instead and wake the
+             * moment the event handler raises it. Do NOT clear on exit: the clear stays in the
+             * branch below, which is what decides the bit has actually been handled. */
+            xEventGroupWaitBits(wifi_event_group, WIFI_DISCONNECTED_BIT,
+                                pdFALSE, pdFALSE, reconnect_delay);
             continue;
         }
-        
+
         // Check if we have a disconnection event or if we're already disconnected
         bool should_reconnect = false;
+        /* #135: true only for a real drop event, which is what earns the short retry below. The
+         * no-event branch is the boot path (nothing has dropped -- the first join is simply still
+         * in flight), and it must keep the full 5 s so we never interrupt it. */
+        bool fast_retry = false;
         if (current_bits & WIFI_DISCONNECTED_BIT) {
             // Clear the disconnected bit since we're handling it
             xEventGroupClearBits(wifi_event_group, WIFI_DISCONNECTED_BIT);
             should_reconnect = true;
+            /* Reason 8 (ASSOC_LEAVE) is us leaving, not a fault -- sleep entry and smartconnect's
+             * deliberate wifi_mgr_sta_disconnect() both land here. Never race those. */
+            fast_retry = (s_last_disc_reason != 8);
         } else if (!wifi_status.sta_connected) {
             // STA is disconnected but no event bit set, still try to reconnect
             should_reconnect = true;
@@ -1662,7 +1694,11 @@ static void wifi_reconnect_task(void* pvParameters) {
         if (wifi_status.ap_connected_stations > 0) {
             ESP_LOGI(TAG, "AP has %d connected stations, pausing STA reconnection to avoid channel switching", 
                      wifi_status.ap_connected_stations);
-            vTaskDelay(ap_client_check_delay); // Wait and check again, don't consume the disconnect event
+            /* #135: this used to claim it does not consume the disconnect event. It does -- the bit
+             * was already cleared above, before this check ever runs. Losing it costs speed only:
+             * the "no bit and no connection" branch keeps retrying regardless, so recovery is never
+             * lost, just paced at 5 s. The false comment is what is dangerous here, so it is gone. */
+            vTaskDelay(ap_client_check_delay); // Wait and check again
             continue;
         }
         
@@ -1674,8 +1710,22 @@ static void wifi_reconnect_task(void* pvParameters) {
             continue;
         }
         
-        // Wait before reconnecting
-        vTaskDelay(reconnect_delay); 
+        /* #135: wait before reconnecting. A genuine drop gets ONE quick try, then the old 5 s
+         * pacing. The retry_count < 2 test reads like "two quick tries", but in practice only the
+         * first one is quick: after firing a connect this loop returns to the top long before the
+         * driver reports that attempt's failure (3-4 s later), so the next iteration finds no
+         * pending disconnect, takes the no-event branch below, and waits the full 5 s. Measured on
+         * the bench: 2103 -> 2108 -> 2113 -> 2118, all 5 s apart. That is fine -- one quick try is
+         * what turns a 5-10 s outage into a sub-second one -- but do not read this as two.
+         * Since the attempt site consumes the bit, "one" is now structural, not just a timing
+         * accident: every iteration except one leaving the connected branch reaches the loop top
+         * straight after a clear, so this test is never even evaluated with a count of 1. An IDF
+         * that reported failures instantly would break the timing argument, not this one.
+         * The bound matters: no known network in range settles back to 5 s pacing, and each failed
+         * attempt costs the driver 3-4 s of its own, so this cannot become a tight loop. */
+        vTaskDelay((fast_retry && wifi_status.sta_retry_count < 2)
+                       ? fast_reconnect_delay
+                       : reconnect_delay);
         
         // Double-check conditions before attempting reconnection
         current_bits = xEventGroupGetBits(wifi_event_group);
@@ -1684,7 +1734,18 @@ static void wifi_reconnect_task(void* pvParameters) {
             
             ESP_LOGI(TAG, "Attempting to reconnect (attempt %d)", wifi_status.sta_retry_count + 1);
             wifi_status.sta_retry_count++;
-            
+
+            /* #135: this attempt supersedes every disconnect reported before now, so consume the
+             * bit here. Without this the bit is only ever cleared at :1671, so a drop that lands
+             * during the wait above survives into the NEXT iteration and reads as fresh news --
+             * which fired a second connect 500 ms after this one and aborted a join that was still
+             * in flight. That is the exact failure #135 was originally (wrongly) blamed on, and
+             * the boot path is where it bites: the initial join's failure arrives at ~8.2 s while
+             * this task is still asleep in its first 5 s wait.
+             * From here the bit means one thing only: "a disconnect happened AFTER our last
+             * attempt", which is the only condition that earns the fast retry. */
+            xEventGroupClearBits(wifi_event_group, WIFI_DISCONNECTED_BIT);
+
             esp_err_t ret;
             if (wifi_config.fallback_count > 0) {
                 wifi_mgr_scan_select_and_connect();

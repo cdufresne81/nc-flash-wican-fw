@@ -268,11 +268,21 @@ const char *wifi_diag_reason_str(uint8_t reason)
         case 1:   return "unspecified";
         case 2:   return "auth expired (the AP aged this station out)";
         case 3:   return "auth left (the AP deauthenticated us)";
-        case 4:   return "association expired (the AP heard nothing from us in time)";
+        /* #135: on this product reason 4 usually is NOT an aged-out live link -- it is a join that
+         * never completed. Both readings are legitimate, so name both rather than assert the rarer
+         * one, and point at the field that actually separates them: the ring prints
+         * "(never associated)" for a failed join (:643) and "held=<seconds>" for a link that had
+         * really been up (:638). Do NOT tell the reader to "check held=" -- that field is absent
+         * from the very line this case describes. */
+        case 4:   return "the AP stopped hearing us, or a join timed out (see 'never associated')";
         case 5:   return "AP is full (too many stations associated)";
         case 6:   return "class-2 frame from a non-authenticated station";
         case 7:   return "class-3 frame from a non-associated station";
-        case 8:   return "association left (the AP disassociated us)";
+        /* #135: this label used to read "the AP disassociated us", which is backwards and sent two
+         * separate investigations chasing a phantom AP-side fault. Reason 8 is what the IDF reports
+         * when the STATION leaves -- on this product that is almost always our own sleep entry
+         * (sleep_mode_teardown -> wifi_mgr_deinit -> esp_wifi_disconnect, main/wifi_mgr.c:871). */
+        case 8:   return "we left the AP ourselves (normal when entering sleep or turning WiFi off)";
         case 9:   return "association without authentication";
         case 13:  return "invalid information element";
         case 14:  return "MIC failure (corrupt or wrong key material)";
