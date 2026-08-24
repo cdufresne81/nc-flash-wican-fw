@@ -1699,11 +1699,15 @@ static void wifi_reconnect_task(void* pvParameters) {
             continue;
         }
         
-        /* #135: wait before reconnecting. A genuine drop gets two quick tries before falling back
-         * to the old 5 s pacing -- enough to ride out a router that ignored one join, without
-         * turning into a tight loop when no known network is in range (each failed attempt also
-         * costs the driver ~3-4 s of its own, so the floor is seconds, not milliseconds).
-         * sta_retry_count is reset to 0 on every GOT_IP, so "two" means two per outage. */
+        /* #135: wait before reconnecting. A genuine drop gets ONE quick try, then the old 5 s
+         * pacing. The retry_count < 2 test reads like "two quick tries", but in practice only the
+         * first one is quick: after firing a connect this loop returns to the top long before the
+         * driver reports that attempt's failure (3-4 s later), so the next iteration finds no
+         * pending disconnect, takes the no-event branch below, and waits the full 5 s. Measured on
+         * the bench: 2103 -> 2108 -> 2113 -> 2118, all 5 s apart. That is fine -- one quick try is
+         * what turns a 5-10 s outage into a sub-second one -- but do not read this as two.
+         * The bound matters: no known network in range settles back to 5 s pacing, and each failed
+         * attempt costs the driver 3-4 s of its own, so this cannot become a tight loop. */
         vTaskDelay((fast_retry && wifi_status.sta_retry_count < 2)
                        ? fast_reconnect_delay
                        : reconnect_delay);
@@ -1715,7 +1719,18 @@ static void wifi_reconnect_task(void* pvParameters) {
             
             ESP_LOGI(TAG, "Attempting to reconnect (attempt %d)", wifi_status.sta_retry_count + 1);
             wifi_status.sta_retry_count++;
-            
+
+            /* #135: this attempt supersedes every disconnect reported before now, so consume the
+             * bit here. Without this the bit is only ever cleared at :1671, so a drop that lands
+             * during the wait above survives into the NEXT iteration and reads as fresh news --
+             * which fired a second connect 500 ms after this one and aborted a join that was still
+             * in flight. That is the exact failure #135 was originally (wrongly) blamed on, and
+             * the boot path is where it bites: the initial join's failure arrives at ~8.2 s while
+             * this task is still asleep in its first 5 s wait.
+             * From here the bit means one thing only: "a disconnect happened AFTER our last
+             * attempt", which is the only condition that earns the fast retry. */
+            xEventGroupClearBits(wifi_event_group, WIFI_DISCONNECTED_BIT);
+
             esp_err_t ret;
             if (wifi_config.fallback_count > 0) {
                 wifi_mgr_scan_select_and_connect();
