@@ -59,6 +59,10 @@ void can_set_filter(uint32_t f);
 void can_set_mask(uint32_t m);
 void can_set_bitrate(uint8_t rate);
 esp_err_t can_receive(twai_message_t *message, TickType_t ticks_to_wait);
+/* Non-blocking twin of can_receive(): returns ESP_ERR_INVALID_STATE instead of parking forever
+ * when the bus is disabled. For poll_log, whose task must keep passing or the sleep veto and the
+ * recording gate freeze at their last values. See the comment on the definition in can.c. */
+esp_err_t can_receive_nb(twai_message_t *message);
 esp_err_t can_send(twai_message_t *message, TickType_t ticks_to_wait);
 void can_init(uint8_t bitrate);
 uint8_t can_is_silent(void);
