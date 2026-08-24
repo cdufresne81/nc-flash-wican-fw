@@ -351,7 +351,15 @@ output (the evaluator cannot run commands).
   DO-NOT-MERGE banner in poll_log.h first.
 - **C4** — Fail-open on voltage stays: an unreadable ADC (`sleep_mode_get_voltage` failing) still
   counts as `volt_ok` (poll_log.c:709).
-- **C5** — A config with **no** RPM channel keeps today's voltage-only gate with no new delay;
+- **C5** — *(amended during implementation, 2026-08-24, on Fable's ruling.)* A config with **no**
+  RPM channel keeps today's voltage-only gate with no new delay. The no-delay promise keys on
+  **CONFIGURED**, not on **SEEN**: the original wording let the implementation read "no sample yet
+  this uptime" as "no channel", which is true for the first seconds of every boot and made the
+  gate open on voltage and write a junk session on every boot. `s_rpm_configured` scans the PID
+  table *and* the broadcast filters, each with the same validity rule its consumer applies. The
+  original text follows.
+
+  A config with **no** RPM channel keeps today's voltage-only gate with no new delay;
   the only added strictness anywhere is the ≤3-pass open-block for a channel that WAS seen and
   went stale, and the divisor override on RPM rows.
 - **C6** — `polllog_engine_edge()` semantics (ENGINE_ON/ENGINE_OFF events, the load-bearing

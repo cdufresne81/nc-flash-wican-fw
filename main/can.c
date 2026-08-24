@@ -728,6 +728,42 @@ esp_err_t can_receive(twai_message_t *message, TickType_t ticks_to_wait)
 	}
 }
 
+/* Non-blocking receive for a sole-consumer path that must never park on the fence.
+ *
+ * can_receive() opens with an INFINITE xEventGroupWaitBits on CAN_ENABLE_BIT and ignores the
+ * caller's tick argument. For elm327/fast_log/can_rx_task that is deliberate -- the fence is
+ * their OTA/sleep park and they have nothing else to do -- but for poll_log it is a trap: the
+ * datalogger's task carries the sleep veto (poll_log_ecu_answering) and the recording gate, and
+ * a task frozen inside that wait keeps both FROZEN AT THEIR LAST VALUE. A veto stuck true stops
+ * the device ever sleeping, which on a parked car flattens the battery in days. The trigger is
+ * reachable from outside: one stray SLCAN 'C' on the always-on port 35001 clears the bit with no
+ * owner and no trace.
+ *
+ * So this variant does what can_send() already does: read the bit, fail fast, let the caller
+ * decide. Same activity stamps, same twai_receive; only the fence differs. The blocking
+ * can_receive() above is UNCHANGED for its other callers. */
+esp_err_t can_receive_nb(twai_message_t *message)
+{
+	EventBits_t uxBits = xEventGroupGetBits(s_can_event_group);
+
+	if(!(uxBits & CAN_ENABLE_BIT))
+	{
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	/* Hardcoded 0, and there is deliberately no timeout parameter: a caller that passed a
+	 * nonzero wait would block INSIDE the driver across a teardown, which is the exact panic the
+	 * fence above exists to prevent. Making that unexpressible is cheaper than documenting it. */
+	esp_err_t ret = twai_receive(message, 0);
+	if(ret == ESP_OK)
+	{
+		uint32_t now_ms = (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+		s_last_bus_activity_ms = now_ms;
+		if(frame_is_diagnostic(message)) { s_last_diag_activity_ms = now_ms; }
+	}
+	return ret;
+}
+
 /* NOTE (single-CAN-owner invariant, task #36): can_send() intentionally does NOT check
  * FLASH_ACTIVE_BIT here. The flash codecs themselves call can_send() WHILE holding the bit,
  * so a blanket reject would deadlock the flash. Single-ownership is therefore enforced at

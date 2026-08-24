@@ -50,12 +50,31 @@ A NORMAL-mode sweep now runs in one of two speeds:
 |---|---|---|
 | PROBE | full rate | `!s_ecu_answering` — never slowed, resume-in-one-frame depends on it |
 | WATCH | one full sweep per `POLLLOG_WATCH_SWEEP_MS` (1 s, ~15 req/s on the 19-PID table) | ECU answers but the engine is not running |
-| FAST | full rate, today's path unchanged | the gate is open |
+| FAST | full rate, today's path unchanged | `s_fast_sweep` — the gate is open **or** a CSV session is open |
 
-The gate (`polllog_eval_gate`) asks one question — *is the engine running* — from voltage **and** RPM:
+**Two questions, two variables, and keeping them apart is load-bearing.** `s_gate_open` is the ENGINE answer (voltage + RPM only) and is the only thing `poll_log_gate_open()` serves to the CSV writer. `s_fast_sweep` is the RATE answer, `s_gate_open || csv_logger_session_active()`, and is what every sweep-shape decision reads. An open session buys full rate — that is what keeps the web **Start** button and bench work fast, since a bench PCM reports RPM 0 — without claiming the engine is running.
 
-- **Open**: `s_ecu_answering` **and** voltage ≥ `engine_volt` **and** RPM > `POLLLOG_GATE_RPM_ON` (the RPM term drops out when no RPM channel exists). A CSV session already being open forces it too — that is what keeps the web **Start** button and bench work at full rate, since a bench PCM reports RPM 0.
+Before v1.22.3 they were one variable, and an open session force-set it. The gate then answered "the engine is running" with the meaning "we are already recording", a circle with no exit: one junk session on a stationary bench held it open for twelve hours and wrote 347 MB.
+
+The rules live in `components/fast_log/poll_gate_logic.c`, a pure function with no ESP-IDF includes, pinned by `tools/hosttest/poll_gate_test.c`. `polllog_eval_gate` is only the adapter that gathers inputs and acts on the answer.
+
+- **Open**: `s_ecu_answering` **and** voltage ≥ `engine_volt` **and** RPM > `POLLLOG_GATE_RPM_ON` (the RPM term drops out when no RPM channel exists).
 - **Close**: the same test against `engine_volt - VEHICLE_IGN_HYSTERESIS_V`, sustained for `CSV_LOGGER_IGN_OFF_DEBOUNCE_MS`. **Either** signal dropping closes it.
+
+**A missing RPM answer is not a missing RPM channel.** The gate's RPM input is a **config** fact, `s_rpm_configured`, not the runtime "has a sample ever arrived". `rpm_configured && !rpm_known` covers two situations: a channel that answered and has gone quiet — every pause longer than `POLLLOG_RPM_STALE_MS` (2 s) does this: a host park, a bus claim, a dead-man reaper resume — **and the first seconds of every boot**, before any sample has landed. The gate does **not** fall back to voltage in either case; it waits for a fresh sample for up to `POLLLOG_RPM_CONFIRM_SWEEPS` (3) passes, then opens on voltage anyway so a genuinely dead channel can never lose a drive. Every sweep polls RPM and probe sweeps bypass the divisors, so in practice the wait is one pass: ~40 ms in FAST, ≤1 s in WATCH. A config with **no** RPM channel is unaffected and opens immediately, exactly as before.
+
+Using "has a sample arrived" here was the boot bug: at `up=4163ms` the ECU starts answering, at `up=4306ms` the gate opened on voltage alone and a session was created, and it closed itself 3 s later with reason `engine_off`. Harmless-looking on a bench, but it is not bench-only — a battery holds 13.2–13.5 V for minutes after a drive, so an OTA at home reboots straight into the same window, and the `DATALOG_OPEN`/`DATALOG_CLOSE` pair landed in the event log on every boot.
+
+`s_rpm_configured` is computed in `polllog_prepare_schedule()` (init and every hot-swap) and scans **both** sources, each with the same rule the consumer applies, so "configured" always means *a sample can actually arrive*:
+
+- the PID table, counting a row only if it passes the pollability funnel (`polllog_req_bytes`) **and** carries an enabled parameter named `RPM`;
+- the CAN broadcast filters, skipping a vehicle-profile filter while *Vehicle Specific PIDs* is off, because `polllog_decode_broadcast` skips it too.
+
+Scanning only the PID table would misclassify a car whose RPM arrives solely on the broadcast path, turning the whole stale-sample protection off for exactly the configuration where a host park starves RPM hardest.
+
+Because the gate's own sensor must never go stale by configuration, `polllog_prepare_schedule()` forces `SampleEvery = 1` on any row carrying an enabled parameter named `RPM` (matched exactly the way `polllog_stamp_rpm` matches). A divisor ≥ 53 would otherwise push the sample past the freshness window every sweep.
+
+While the gate is **open**, staleness *holds* the close debounce: it neither restarts it nor lets it expire. Restarting on staleness would let a channel flapping fresh/stale hold the gate open forever against a stopped engine; expiring on staleness would end a real trip every time a host paused the poller.
 
 Both thresholds and the debounce are **shared constants, not copies** (`vehicle.h`, `csv_logger.h`), because the gate must agree with the CSV writer about when the engine stopped.
 
@@ -96,7 +115,16 @@ Three bypasses skip the gate completely, and while bypassed the counters do **no
 |---|---|---|
 | Probing | `!s_ecu_answering` | Boot and every quiesce-resume run full sweeps, so an all-gated table can never starve `POLLLOG_PROBE_MS` of attempts and strand the logger in a quiesce loop. |
 | Stale OK | no OK for `POLLLOG_GATE_STALE_MS` (2.5 s) | A long divisor on the only answering channel could otherwise push `now - s_last_ok_us` past `POLLLOG_ENGINE_OFF_MS` and fire a **false** `IGNITION_OFF`, closing the CSV require-engine gate mid-drive. With the engine genuinely off, un-gated sweeps still yield no OK and still quiesce at 5 s. |
-| Watch | `!s_gate_open` | A watch sweep already runs at a fraction of the divisors' intended rate; applying them on top would starve channels and leave the gate's own RPM input stale. |
+| Watch | `!s_fast_sweep` | A watch sweep already runs at a fraction of the divisors' intended rate; applying them on top would starve channels and leave the gate's own RPM input stale. |
+
+### The bus-withheld park
+
+`can_receive()` opens with an infinite wait on `CAN_ENABLE_BIT`. For elm327/fast_log/can_rx_task that is their OTA/sleep park and is correct; for poll_log it was a trap. The poll task carries the sleep veto (`poll_log_ecu_answering()`) and the recording gate, and a frozen task keeps publishing its **last** values — so a device with the bus disabled went on reporting a live ECU and an open gate forever, and the sleep veto stuck true means a parked car never sleeps: a flat battery in days. One stray SLCAN `C` on the always-on port 35001 is enough, from any TCP client, with no event-log trace.
+
+Two changes close it:
+
+- **`can_receive_nb()`** (`main/can.c`) reads the bit with `xEventGroupGetBits` and returns `ESP_ERR_INVALID_STATE` instead of parking — the same fast-fail shape `can_send()` already had. Every poll_log receive uses it. The blocking `can_receive()` is unchanged for its other callers.
+- **A withheld-bus park** at the top of the task loop: if the peripheral is disabled and `can_should_park()` is false (so nobody owns it), the task clears `s_ecu_answering`, `s_gate_open` and `s_fast_sweep` — nothing is maintaining them, and unknown must read as *no* for both — and after `POLLLOG_BUS_WITHHELD_MS` (10 s) re-runs its own bring-up bracket and emits an `EVL_WARN`. It never touches `FLASH_ACTIVE_BIT`, and it can never run during a host session because `can_should_park()` takes the branch above it.
 
 `can_should_park()` and the QUIESCED branch both `continue` *above* the gate, so a 10 s flash session can't burn every PID's skip budget and then fire them all at once on the first unparked sweep.
 
@@ -176,8 +204,9 @@ The Auto (fastest) logging rate is a **measurement, not an estimate** — this i
  "win_ok":1197,"win_timeout":0,"win_txfail":0,
  "ignition_on":true,"quiesced":false,"bus_idle_ms":4294967295,
  "reload_ok":true,"reload_pending":false,
- "state":"fast","gate_open":true,
- "gate_volt":13.2,"rpm_known":true,"rpm":2150,"engine_running":true}
+ "state":"fast","gate_open":true,"fast_sweep":true,
+ "gate_volt":13.2,"rpm_known":true,"rpm_seen":true,"rpm_age_ms":38,
+ "rpm_configured":true,"rpm":2150,"engine_running":true,"loop_age_ms":12}
 ```
 
 `ok/timeout/txfail` are cumulative; `win_*` are the last 3 s window; `bus_idle_ms` saturates at UINT32_MAX when no broadcast traffic is tracked.
@@ -203,9 +232,14 @@ The recording-gate fields. `req_s` alone is ambiguous once the gate exists — ~
 | Field | Meaning |
 |---|---|
 | `state` | `inactive` / `quiesced` / `probe` / `watch` / `fast`. The one field that says what the poll task is doing. `probe` is the short post-boot or post-resume window before the ECU has answered — still full rate. |
-| `gate_open` | The recording gate itself. Not redundant with `state`: a CSV session opened during `probe` shows `gate_open:true` while `state` is still `probe`. |
+| `gate_open` | The ENGINE answer: voltage + RPM only. This is what the CSV writer's require-engine check reads. An open CSV session no longer forces it. |
+| `fast_sweep` | The RATE answer: `gate_open` **or** a CSV session is open. This is what `state` reports as `fast`. |
 | `gate_volt` | The `engine_volt` threshold in use, read once at init. The close edge sits `VEHICLE_IGN_HYSTERESIS_V` under it. |
-| `rpm_known` | An RPM channel exists **and** its last value is fresh (within `POLLLOG_RPM_STALE_MS`). `false` ⇒ the gate is running on voltage alone. |
+| `rpm_known` | The gate's own verdict: an RPM channel exists **and** its last value is fresh (within `POLLLOG_RPM_STALE_MS`). Before v1.22.3 this field wrongly reported `rpm_seen`, so it read `true` while the gate was treating RPM as unknown — that discrepancy cost a whole investigation round. |
+| `rpm_seen` | An RPM channel has delivered at least one sample, ever. The old meaning of `rpm_known`, under its honest name. **The gate does not read this** — it is diagnostic only. |
+| `rpm_configured` | The config carries an RPM channel that can deliver (PID table or broadcast filter). **This is the gate's input.** `false` with a channel you believe exists means the row is unpollable, or a vehicle-profile filter is disabled. |
+| `rpm_age_ms` | Milliseconds since the last RPM sample; `4294967295` when never seen. Read it next to `rpm_known` — the two can no longer drift apart silently. |
+| `loop_age_ms` | Milliseconds since the poll task last completed a pass. **The one field that distinguishes a live task from a frozen one**: a wedged task keeps publishing its last counters and looks perfectly healthy. Small in normal operation; growing means parked, withheld, or stuck. |
 | `rpm` | Last RPM seen, from either the polled or the broadcast copy. **`rpm_known:true` with a wrong low value is the one way this feature can silently stop automatic trips** — check it first if logging stops. |
 | `engine_running` | The latch behind the `ENGINE_ON` / `ENGINE_OFF` event lines (below). Same rpm verdict the gate uses, debounced on the stop edge. Always `false` on a bench PCM, which reports rpm 0. |
 
