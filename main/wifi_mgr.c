@@ -45,6 +45,11 @@ static const char *TAG = "WiFi_Manager";
 static esp_netif_t* ap_netif = NULL;
 static esp_netif_t* sta_netif = NULL;
 static TaskHandle_t reconnect_task_handle = NULL;
+/* #135: the reason code from the most recent STA_DISCONNECTED, so wifi_reconnect_task can tell a
+ * link that failed on us from one we tore down ourselves. Written on the system event task, read
+ * on the reconnect task; a single aligned int, so a plain volatile is enough -- no lock needed and
+ * none wanted, because the write sits on the stack-tight sys_evt task (see #111/#118). */
+static volatile int s_last_disc_reason = -1;
 static EventGroupHandle_t wifi_event_group = NULL;
 static StaticEventGroup_t wifi_event_group_buffer;
 static wifi_mgr_config_t wifi_config;
@@ -1395,6 +1400,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                 
             case WIFI_EVENT_STA_DISCONNECTED:
                 ESP_LOGI(TAG, "STA disconnected");
+                /* #135: publish the reason BEFORE raising WIFI_DISCONNECTED_BIT. The bit is what
+                 * releases the reconnect task, so setting it first would let that task read a
+                 * stale reason and fast-retry a disconnect we asked for. */
+                s_last_disc_reason = event_data
+                    ? (int)((wifi_event_sta_disconnected_t*)event_data)->reason
+                    : -1;
                 wifi_status.sta_connected = false;
                 memset(wifi_status.sta_ip, 0, sizeof(wifi_status.sta_ip));
                 // Update queue with empty IP
@@ -1614,6 +1625,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
  */
 static void wifi_reconnect_task(void* pvParameters) {
     const TickType_t reconnect_delay = pdMS_TO_TICKS(5000); // 5 seconds
+    const TickType_t fast_reconnect_delay = pdMS_TO_TICKS(500); // #135: first tries after a real drop
     const TickType_t ap_client_check_delay = pdMS_TO_TICKS(10000); // 10 seconds
     
     ESP_LOGI(TAG, "WiFi reconnect task started");
@@ -1638,16 +1650,29 @@ static void wifi_reconnect_task(void* pvParameters) {
         
         // Check if STA is already connected
         if (wifi_status.sta_connected) {
-            vTaskDelay(reconnect_delay);
+            /* #135: this used to be a flat vTaskDelay(5000), so a link that died one millisecond
+             * into the nap went unnoticed for the rest of it -- up to 5 s of the 11 s outage seen
+             * on the bench was spent right here. Wait on the disconnect bit instead and wake the
+             * moment the event handler raises it. Do NOT clear on exit: the clear stays in the
+             * branch below, which is what decides the bit has actually been handled. */
+            xEventGroupWaitBits(wifi_event_group, WIFI_DISCONNECTED_BIT,
+                                pdFALSE, pdFALSE, reconnect_delay);
             continue;
         }
-        
+
         // Check if we have a disconnection event or if we're already disconnected
         bool should_reconnect = false;
+        /* #135: true only for a real drop event, which is what earns the short retry below. The
+         * no-event branch is the boot path (nothing has dropped -- the first join is simply still
+         * in flight), and it must keep the full 5 s so we never interrupt it. */
+        bool fast_retry = false;
         if (current_bits & WIFI_DISCONNECTED_BIT) {
             // Clear the disconnected bit since we're handling it
             xEventGroupClearBits(wifi_event_group, WIFI_DISCONNECTED_BIT);
             should_reconnect = true;
+            /* Reason 8 (ASSOC_LEAVE) is us leaving, not a fault -- sleep entry and smartconnect's
+             * deliberate wifi_mgr_sta_disconnect() both land here. Never race those. */
+            fast_retry = (s_last_disc_reason != 8);
         } else if (!wifi_status.sta_connected) {
             // STA is disconnected but no event bit set, still try to reconnect
             should_reconnect = true;
@@ -1674,8 +1699,14 @@ static void wifi_reconnect_task(void* pvParameters) {
             continue;
         }
         
-        // Wait before reconnecting
-        vTaskDelay(reconnect_delay); 
+        /* #135: wait before reconnecting. A genuine drop gets two quick tries before falling back
+         * to the old 5 s pacing -- enough to ride out a router that ignored one join, without
+         * turning into a tight loop when no known network is in range (each failed attempt also
+         * costs the driver ~3-4 s of its own, so the floor is seconds, not milliseconds).
+         * sta_retry_count is reset to 0 on every GOT_IP, so "two" means two per outage. */
+        vTaskDelay((fast_retry && wifi_status.sta_retry_count < 2)
+                       ? fast_reconnect_delay
+                       : reconnect_delay);
         
         // Double-check conditions before attempting reconnection
         current_bits = xEventGroupGetBits(wifi_event_group);
