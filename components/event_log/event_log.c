@@ -120,7 +120,7 @@ static const char *evl_code_str(event_log_code_t code)
         case EVL_HOST_RELEASE:  return "HOST_RELEASE";
         case EVL_DATALOG_PARK:  return "DATALOG_PARK";
         case EVL_DATALOG_RESUME:return "DATALOG_RESUME";
-        case EVL_REAPER_RESUME: return "REAPER_RESUME";
+        case EVL_REAPER_RESUME: return "AUTO_RESUME";
         case EVL_CAN_WAKE:      return "CAN_WAKE";
         case EVL_WIFI:          return "WIFI";
         case EVL_WARN:          return "WARN";

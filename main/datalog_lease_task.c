@@ -126,9 +126,16 @@ static void datalog_lease_task(void *arg)
             // that fired (park lease TTL expired AND its owning socket dropped; the diagnostics then
             // gone quiet). claim_reaped distinguishes "host vanished mid bus-claim/flash" from a plain
             // parked-then-gone. event_log_emit is non-blocking, safe from this prio-2 task.
+            // Plain English for the owner reading the log (#129 wording pass): a sentence first,
+            // the number last so it does not fight the sentence. Rounded to a tenth of a second
+            // with integer math, same as the erase-wait line in ncflash_fastwrite.c.
+            const uint32_t quiet10 = (uint32_t)s.diag_idle_ms + 50;   /* round, not truncate */
             event_log_emit(EVL_REAPER_RESUME,
-                           "auto-resume: host gone (ttl_expired socket_dropped) diag_idle=%ums%s",
-                           (unsigned)s.diag_idle_ms, claim_reaped ? " mid_claim" : "");
+                           "the PC tool vanished%s (quiet %lu.%lu s)",
+                           claim_reaped ? " during a flash -- bus released, logging again"
+                                        : " -- logging again",
+                           (unsigned long)(quiet10 / 1000),
+                           (unsigned long)((quiet10 % 1000) / 100));
         }
     }
 }
