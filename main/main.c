@@ -111,9 +111,8 @@ static QueueHandle_t xMsg_Tx_Queue, xMsg_Rx_Queue, xmsg_ble_tx_queue, xmsg_uart_
  * push DEV_SLCAN_PORT replies here, drained by slcan_port_tx_task to its own socket, so they
  * never collide with the stock port's xMsg_Tx_Queue. WICAN_PRO only. */
 static QueueHandle_t xMsg_SlcanPort_Tx_Queue;
-/* Fixed TCP port of the dedicated always-on SLCAN listener; MUST match the host's
- * WICAN_DEDICATED_SLCAN_PORT (src/ecu/constants.py). */
-#define WICAN_DEDICATED_SLCAN_PORT   35001
+/* WICAN_DEDICATED_SLCAN_PORT now lives in config_server.h -- the config parser needs it too,
+ * so that the stock port can never be set to the same number and silence the listener. */
 static xdev_buffer ucTCP_RX_Buffer;
 static xdev_buffer ucTCP_TX_Buffer;
 static xdev_buffer ucBLE_TX_Buffer;
@@ -292,67 +291,11 @@ static void can_tx_task(void *pvParameters)
 			}
 			continue;
 		}
-		if(protocol == SLCAN)
-		{
-			if(ucTCP_RX_Buffer.dev_channel == DEV_WIFI)
-			{
-				if(ncflash_is_fastread_cmd(msg_ptr, temp_len))
-					{
-						/* NC Flash autonomous in-firmware ROM read */
-						ncflash_fast_read(msg_ptr, temp_len, &xMsg_Tx_Queue);
-					}
-					else if(ncflash_is_fastwrite_cmd(msg_ptr, temp_len))
-					{
-						/* NC Flash SD-staged in-firmware ROM write (Option B) */
-						ncflash_fast_write(msg_ptr, temp_len, &xMsg_Tx_Queue);
-					}
-					else
-					{
-						slcan_parse_str(msg_ptr, temp_len, &tx_msg, &xMsg_Tx_Queue);
-					}
-			}
-			else if(ucTCP_RX_Buffer.dev_channel == DEV_BLE)
-			{
-				slcan_parse_str(msg_ptr, temp_len, &tx_msg, &xmsg_ble_tx_queue);
-			}
-			else if(ucTCP_RX_Buffer.dev_channel == DEV_UART)
-			{
-				slcan_parse_str(msg_ptr, temp_len, &tx_msg, &xmsg_uart_tx_queue);
-			}
-		}
-		else if(protocol_feeds_elm327(protocol))
-		{
-			#if HARDWARE_VER == WICAN_PRO
-			static char elm327_cmd_buffer[2048];
-			static uint32_t cmd_buffer_len = 0;
-			static int64_t last_cmd_time = 0;
-			// memset(elm327_cmd_buffer, 0, sizeof(elm327_cmd_buffer));
-
-			// set DEV_EXTERNAL_ELM327_APP_BIT on incoming request
-			dev_status_clear_bits(DEV_AUTOPID_ELM327_APP_BIT);
-			autopid_app_reset_timer();	//timer will set the bit again after 10 seconds of inactivity
-			if(ucTCP_RX_Buffer.dev_channel == DEV_WIFI)
-			{
-				elm327_process_cmd(msg_ptr, temp_len, &xMsg_Tx_Queue, elm327_cmd_buffer, &cmd_buffer_len, &last_cmd_time, &send_to_host);
-			}
-			else if(ucTCP_RX_Buffer.dev_channel == DEV_BLE)
-			{
-				elm327_send_cmd(msg_ptr, temp_len);
-				// ESP_LOG_BUFFER_HEXDUMP("can_tx_task", msg_ptr, temp_len, ESP_LOG_INFO);
-				// elm327_process_cmd(msg_ptr, temp_len, &xmsg_ble_tx_queue, elm327_cmd_buffer, &cmd_buffer_len, &last_cmd_time, &send_to_host);
-				// elm327_run_command((char*)msg_ptr, temp_len, 1000, &xmsg_ble_tx_queue, &send_to_host);
-			}
-			#else
-			if(ucTCP_RX_Buffer.dev_channel == DEV_WIFI)
-			{
-				elm327_process_cmd(msg_ptr, temp_len, &tx_msg, &xMsg_Tx_Queue);
-			}
-			else if(ucTCP_RX_Buffer.dev_channel == DEV_BLE)
-			{
-				elm327_process_cmd(msg_ptr, temp_len, &tx_msg, &xmsg_ble_tx_queue);
-			}
-			#endif
-		}
+		/* Nothing else routes here. The device has one mode (POLL_LOG), which drives TWAI from
+		 * its own task, so a frame arriving on the STOCK port has no consumer -- exactly as it
+		 * already behaved on every datalogger device, where neither the slcan arm nor the
+		 * elm327 arm that used to sit here could ever be true. The dedicated port above is the
+		 * only channel that does work, and it is dispatched before any of this. */
 	}
 }
 #define HEAP_CAPS   (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
@@ -446,44 +389,11 @@ static void can_rx_task(void *pvParameters)
 				continue;
 			}
 
-        	//TODO: optimize, useless ifs
-			if(tcp_port_open() || ble_connected() || HARDWARE_VER == WICAN_USB_V100 || protocol == AUTO_PID )
-			{
-				memset(ucTCP_TX_Buffer.ucElement, 0, sizeof(ucTCP_TX_Buffer.ucElement));
-				ucTCP_TX_Buffer.usLen = 0;
-
-				if(protocol == SLCAN)
-				{
-					ucTCP_TX_Buffer.usLen = slcan_parse_frame(ucTCP_TX_Buffer.ucElement, &rx_msg);
-				}
-				#if HARDWARE_VER != WICAN_PRO
-				else if(protocol_feeds_elm327(protocol))
-				{
-					// Let elm327.c decide which messages to process
-					xQueueSend( xmsg_obd_rx_queue, ( void * ) &rx_msg, pdMS_TO_TICKS(0) );
-				}
-				#endif
-
-
-
-
-				if(ucTCP_TX_Buffer.usLen != 0)
-				{
-					if(tcp_port_open())
-					{
-						xQueueSend( xMsg_Tx_Queue, ( void * ) &ucTCP_TX_Buffer, pdMS_TO_TICKS(0) );
-					}
-					if(ble_connected() && !protocol_feeds_elm327(protocol))
-					{
-						xQueueSend( xmsg_ble_tx_queue, ( void * ) &ucTCP_TX_Buffer, pdMS_TO_TICKS(0) );
-						ESP_LOG_BUFFER_HEXDUMP(TAG, ucTCP_TX_Buffer.ucElement, ucTCP_TX_Buffer.usLen, ESP_LOG_INFO);
-					}
-					else if(HARDWARE_VER == WICAN_USB_V100)
-					{
-						xQueueSend( xmsg_uart_tx_queue, ( void * ) &ucTCP_TX_Buffer, pdMS_TO_TICKS(0) );
-					}
-				}
-			}
+        	/* The stock-port / BLE fan-out that used to sit here is gone with the mode field.
+        	 * It only ever produced bytes under `protocol == SLCAN` (deleted) or, on non-PRO
+        	 * hardware, under the elm327 arm -- and `protocol` is now the constant POLL_LOG, so
+        	 * every branch computed a zero-length frame and sent nothing. POLL_LOG consumes TWAI
+        	 * in its own task; the coexist forward above is the only path that still emits here. */
         }
         vTaskDelay(pdMS_TO_TICKS(1));
 	}
@@ -874,38 +784,18 @@ void app_main(void)
 		can_set_silent(1);
 	}
 
+	/* One mode, always: config_server_protocol() is a constant now (the `protocol` config field
+	 * is a placebo the parser discards). SmartConnect used to rewrite this to AUTO_PID or
+	 * OBD_ELM327 from home_protocol/drive_protocol -- it was the only code that could change the
+	 * running mode, and it is gone. SmartConnect's WiFi behaviour is untouched.
+	 *
+	 * The boot MODE line (issue #92, "stored=%s running=%s") is retired with it: it existed to
+	 * date a mode flip, a flip is now impossible, and a constant line every boot is noise. The
+	 * EVL_MODE code stays reserved in event_log.h -- the codes are persisted in logs on the SD
+	 * card, so deleting the member would shift every later code and misread old files. */
 	protocol = config_server_protocol();
 
 	wifi_mode_t wifi_mode = config_server_get_wifi_mode();
-
-	if(wifi_mode == SMARTCONNECT_MODE)
-	{
-		if(config_server_get_drive_protocol() == AUTO_PID ||
-			config_server_get_home_protocol() == AUTO_PID)
-		{
-			protocol = AUTO_PID;
-		}
-		else
-		{
-			protocol = OBD_ELM327;
-		}
-	}
-
-	/* Record which mode this boot actually came up in (issue #92). Until now
-	 * nothing in the device's own log said what mode it was running, so when a
-	 * unit was found stuck in Bench SLCAN with its datalogger dead there was no
-	 * way to date the flip or attribute it. This line makes the next one
-	 * datable.
-	 *
-	 * It cannot be folded into the BOOT line: that is emitted before config.json
-	 * is parsed, so the mode there would always read as the fallback. Both
-	 * values are logged because SmartConnect makes them legitimately differ -- a
-	 * device can be STORED as slcan while RUNNING elm327, which is its own trap
-	 * and is now visible here rather than having to be inferred. */
-	event_log_emit(EVL_MODE, "stored=%s running=%s smartconnect=%d",
-				   config_server_protocol_str(),
-				   config_server_protocol_name(protocol),
-				   (wifi_mode == SMARTCONNECT_MODE) ? 1 : 0);
 
 	#if HARDWARE_VER == WICAN_PRO
 	// xmsg_obd_rx_queue = xQueueCreate(32, sizeof( twai_message_t) );
@@ -924,66 +814,26 @@ void app_main(void)
 	xmsg_obd_rx_queue = xQueueCreateStatic(32, xdev_buffer_size, (uint8_t *)elm327_uart_rx_queue_storage, &elm327_uart_rx_queue_buffer);
 	// elm327_init( &send_to_host, &xmsg_obd_rx_queue, NULL); //not needed
 
-	/* Only start elm327_read_task in the modes where an ELM327 client can actually reach us --
-	 * see elm327_set_read_task_enabled() in elm327.h for what goes wrong when it runs otherwise.
+	/* elm327_read_task stays OFF. It must only run in a mode where an ELM327 client can reach
+	 * us -- see elm327_set_read_task_enabled() in elm327.h for what goes wrong otherwise: it sits
+	 * on the UART lock for nobody, which was the 20 s wake bug. With one mode left there is no
+	 * such client, so this is now constant-false, which is the safe side of that bug.
 	 *
-	 * It shares protocol_feeds_elm327() with the router rather than repeating the test, so the two
-	 * cannot drift apart. Read the resolved `protocol` local, NOT config_server_protocol(): the
-	 * SmartConnect override above rewrites it, and calling the getter again would miss that and
-	 * gate wrongly. Protocol changes need a reboot, so deciding once here is sound. */
+	 * elm327_init() below still runs: the sleep path needs its UART, its lock and its chip
+	 * maintenance. Do NOT re-add the old claim that it "stays dormant" in the datalogger modes --
+	 * it was false about the UART lock and cost an evening of debugging. */
 	elm327_set_read_task_enabled(protocol_feeds_elm327(protocol));
 	elm327_init(&send_to_host, &xmsg_ble_tx_queue, NULL);
-	if(protocol == AUTO_PID)
+	/* One mode, one bring-up. This used to be an if/else chain over AUTO_PID / FAST_LOG /
+	 * POLL_LOG (and, in a #else arm for non-PRO hardware, OBD_ELM327 / AUTO_PID). The `protocol`
+	 * config field is a placebo now, so POLL_LOG is the only reachable arm and the rest are gone.
+	 *
+	 * Native-TWAI request/response poller: brings the bus up NORMAL/on-bus and polls the
+	 * configured mode-01/22 PIDs, with no ELM emulation. The CSV writer comes up inline before
+	 * the producer so the first file opens as soon as the ECU answers -- see csv_bringup_logic.h
+	 * for the crash-guard chain. Explicit '== 1' so a garbage csv_log value can NEVER enable the
+	 * logger through bool coercion. */
 	{
-		// can_set_bitrate(can_datarate);
-		// #if HARDWARE_VER != WICAN_PRO
-		// can_enable();
-		// #endif
-		// CSV datalogger: brings the writer up inline, no start delay -- the first file
-		// opens when the ECU answers, since this runs before the producers below. See
-		// csv_bringup_logic.h for the crash-guard chain. Explicit '== 1' so a garbage
-		// csv_log value can NEVER enable the logger via bool coercion.
-		if(config_server_get_csv_log() == 1)
-		{
-			csv_logger_start_at_boot();
-		}
-		autopid_init((char*)&uid[0]);
-	}
-	else if(protocol == FAST_LOG)
-	{
-		// Native-TWAI fast datalogger (Task #18), Phase A: passive broadcast capture.
-		// fast_log brings up the bus LISTEN_ONLY and decodes broadcast frames at bus rate,
-		// in place of the AutoPID/ELM poll loop. Same CSV gate as AUTO_PID: deferred start
-		// when csv_log is enabled.
-		//
-		// elm327_init() above still runs (the sleep path needs its UART, lock and chip
-		// maintenance) but elm327_read_task is NOT started here -- see
-		// elm327_set_read_task_enabled() in elm327.h. Do NOT re-add the old claim that
-		// elm327_init() "stays dormant" in this mode: it was false about the UART lock and cost
-		// an evening of debugging.
-		uint32_t log_period = 0;
-		if(config_server_get_log_period(&log_period) == -1)
-		{
-			log_period = 60;
-		}
-		if(config_server_get_csv_log() == 1)
-		{
-			csv_logger_start_at_boot();
-		}
-		fast_log_init((char*)&uid[0], log_period);
-	}
-	else if(protocol == POLL_LOG)
-	{
-		// Native-TWAI request/response poller (Task #18, Phase B "measure-first"). Brings up the
-		// bus NORMAL/on-bus and polls the configured mode-01/22 PIDs with no ELM emulation and no
-		// hardcoded 100ms inter-poll delay, in place of the AutoPID/ELM poll loop. Same CSV gate
-		// as FAST_LOG: deferred start.
-		//
-		// elm327_init() above still runs (the sleep path needs its UART, lock and chip
-		// maintenance) but elm327_read_task is NOT started here -- see
-		// elm327_set_read_task_enabled() in elm327.h. Do NOT re-add the old claim that
-		// elm327_init() "stays dormant" in this mode: it was false about the UART lock and cost
-		// an evening of debugging.
 		uint32_t log_period = 0;
 		if(config_server_get_log_period(&log_period) == -1)
 		{
@@ -994,30 +844,6 @@ void app_main(void)
 			csv_logger_start_at_boot();
 		}
 		poll_log_init((char*)&uid[0], log_period);
-	}
-
-	#else
-	else if(protocol == OBD_ELM327)
-	{
-//		can_init(CAN_500K);
-		#if HARDWARE_VER != WICAN_PRO
-		can_set_bitrate(can_datarate);
-		can_set_silent(1);
-		can_enable();
-		#endif
-		xmsg_obd_rx_queue = xQueueCreate(32, sizeof( twai_message_t) );
-		elm327_init(&xmsg_obd_rx_queue, NULL);
-	}
-	else if(protocol == AUTO_PID)
-	{
-		can_set_bitrate(can_datarate);
-		#if HARDWARE_VER != WICAN_PRO
-		can_enable();
-		#endif
-		xmsg_obd_rx_queue = xQueueCreate(32, sizeof( twai_message_t) );
-		
-		elm327_init(&xmsg_obd_rx_queue, NULL);
-		autopid_init((char*)&uid[0]);
 	}
 	#endif
 	
@@ -1057,38 +883,24 @@ void app_main(void)
 	}
 	wifi_diag_init();
 
-	int32_t port = config_server_get_port();
-
-	if(config_server_get_port_type() == UDP_PORT)
-	{	
-		#if HARDWARE_VER == WICAN_V300 || HARDWARE_VER == WICAN_USB_V100
-		tcp_server_init(port, &xMsg_Tx_Queue, &xMsg_Rx_Queue, CONNECTED_LED_GPIO_NUM, 1);
-		#elif HARDWARE_VER == WICAN_PRO
-		tcp_server_init(port, &xMsg_Tx_Queue, &xMsg_Rx_Queue, 0, 1);
-		#endif
-	}
-	else
-	{
-		#if HARDWARE_VER == WICAN_V300 || HARDWARE_VER == WICAN_USB_V100
-		tcp_server_init(port, &xMsg_Tx_Queue, &xMsg_Rx_Queue, CONNECTED_LED_GPIO_NUM, 0);
-		#elif HARDWARE_VER == WICAN_PRO
-		tcp_server_init(port, &xMsg_Tx_Queue, &xMsg_Rx_Queue, 0, 0);
-		#endif
-	}
+	/* The configurable stock CAN-over-TCP/UDP server is gone. It existed to serve the slcan and
+	 * elm327 host protocols on a user-chosen port; both modes are retired, so nothing produced
+	 * bytes for it and nothing consumed bytes from it. Its `port` / `port_type` settings went with
+	 * it -- a knob that cannot change anything is worse than no knob, because the next reader
+	 * believes it works.
+	 *
+	 * Deleting it also removes a trap: when the stock port was set to 35001 the dedicated listener
+	 * below was skipped to avoid two binds fighting, which silently made ECU flashing impossible.
+	 * With one listener left on a fixed port, that collision cannot happen. */
 
 	#if HARDWARE_VER == WICAN_PRO
 	/* No-reboot coexistence (task #36): start the always-on dedicated SLCAN listener AFTER
 	 * the queues exist (above) and the network stack is up (wifi_network_init). Frames arrive
 	 * tagged DEV_SLCAN_PORT on the shared RX queue and are dispatched by can_tx_task regardless
-	 * of persisted protocol; replies drain from the private xMsg_SlcanPort_Tx_Queue. If the
-	 * stock port is (mis)configured to the same value, skip rather than fight over the bind --
-	 * the host then simply falls back to the legacy reboot path. */
-	if(port == WICAN_DEDICATED_SLCAN_PORT)
-	{
-		ESP_LOGW(TAG, "stock port == %d collides with dedicated SLCAN port; coexistence listener NOT started",
-				 WICAN_DEDICATED_SLCAN_PORT);
-	}
-	else if(slcan_port_init(WICAN_DEDICATED_SLCAN_PORT, &xMsg_Rx_Queue, &xMsg_SlcanPort_Tx_Queue) != 0)
+	 * of any config; replies drain from the private xMsg_SlcanPort_Tx_Queue. This is now the
+	 * ONLY TCP port this firmware opens for CAN traffic, on a fixed number, so nothing can
+	 * collide with it. If it fails to start, ECU flashing is unavailable until the next boot. */
+	if(slcan_port_init(WICAN_DEDICATED_SLCAN_PORT, &xMsg_Rx_Queue, &xMsg_SlcanPort_Tx_Queue) != 0)
 	{
 		ESP_LOGE(TAG, "dedicated SLCAN port init failed (no-reboot coexistence unavailable)");
 	}
