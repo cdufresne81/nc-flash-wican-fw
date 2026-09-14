@@ -106,7 +106,7 @@
 #define BLE_EN_PIN_SEL		(1ULL<<BLE_EN_PIN_NUM)
 #define BLE_Enabled()		(!gpio_get_level(BLE_EN_PIN_NUM))
 
-static QueueHandle_t xMsg_Tx_Queue, xMsg_Rx_Queue, xmsg_ble_tx_queue, xmsg_uart_tx_queue, xmsg_obd_rx_queue, xmsg_elm327_rx_queue;
+static QueueHandle_t xMsg_Tx_Queue, xMsg_Rx_Queue, xmsg_ble_tx_queue, xmsg_uart_tx_queue, xmsg_obd_rx_queue;
 /* Private reply queue for the dedicated SLCAN port (task #36): the fast-read/write codecs
  * push DEV_SLCAN_PORT replies here, drained by slcan_port_tx_task to its own socket, so they
  * never collide with the stock port's xMsg_Tx_Queue. WICAN_PRO only. */
