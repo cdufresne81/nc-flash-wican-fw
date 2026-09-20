@@ -84,3 +84,7 @@ tools/https_test_server/test_certs/
 *.bin
 build_*.log
 build_log_*.txt
+
+# Python bytecode from tools/ (build_web.py, lint_web.py, check_docs.py)
+__pycache__/
+*.pyc
