@@ -132,6 +132,13 @@ export function loadMainJs({ strictDom = false } = {}) {
         // Under strictDom the tests call showNotification(), which arms a 5 s (50 s for the
         // default-password message) timer. An un-unref'd timer keeps `node --test` alive that
         // long, so drop the process's reference to it. Behaviour is otherwise unchanged.
+        //
+        // ⚠️ An unref'd timer does NOT keep node alive, so a future strictDom test that AWAITS
+        // a timer can see the process exit before the callback runs and pass for the wrong
+        // reason. Today's strictDom tests are all synchronous, so this cannot bite yet. If you
+        // write one that waits on a timeout, hold the process open yourself rather than
+        // removing the unref. Note requestAnimationFrame below closes over Node's real
+        // setTimeout, not this wrapper, so rAF timers are never unref'd (harmless at 0 ms).
         setTimeout: strictDom
             ? (fn, ms, ...a) => { const t = setTimeout(fn, ms, ...a); t.unref?.(); return t; }
             : setTimeout,

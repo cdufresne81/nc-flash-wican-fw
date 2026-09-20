@@ -3796,9 +3796,14 @@ async function uploadCfg() {
 }
 
 // Config keys with no UI after the streamline: captured from /load_config in Load(),
-// re-sent verbatim by postConfig() so config-file edits survive a Submit. The four
-// pre-seeded defaults are mandatory keys -- /store_config rejects the whole POST when
-// any of them is missing, so they must always be sent even if /load_config omits them.
+// re-sent verbatim by postConfig() so config-file edits survive a Submit. Every entry
+// below is pre-seeded, so the form sends it even when /load_config omits it -- which is
+// not hypothetical: a device running a build older than the v1.25.0 shim replies without
+// the three deprecated keys, and capture-only would silently drop them from the file.
+// Of these, only can_datarate and can_mode are mandatory to THIS firmware's parser
+// (config_server.c, both `goto config_error` when absent); log_period and imu_threshold
+// fall back to defaults, and the three deprecated keys are ignored entirely -- see the
+// comment on them below for why they are sent anyway.
 // The home_*/drive_* SmartConnect keys are optional and captured only when present.
 var loadedPassthrough = {
     can_datarate: "500K",   // NC platform is always 500K
@@ -4031,7 +4036,7 @@ xhttp.onload = async function() {
 
         // --- Restored settings population (regression fix: commit d372fc9 over-cut this block,
         //     causing every Submit to persist stock HTML defaults). MQTT-gateway lines intentionally
-        //     omitted (feature removed by the trim); protocol is populated by checkStatus(). ---
+        //     omitted (feature removed by the trim); the protocol field was retired in #141. ---
         // Datalogger master + wide-CSV grid controls (firmware default is 10 Hz; the grid
         // is always fixed-rate -- csv_grid_mode retired in issue #53, ignored if present).
         var _cs_on = (obj.csv_log === "enable");
