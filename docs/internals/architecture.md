@@ -49,14 +49,14 @@ surprisingly hard to reconstruct from the source:
 | **Console** | The Field Console — live gauges for the polled channels; the Trip Recorder (Start Trip, Mark Event); Recent Trips; a tail of the Event Log |
 | **Files** | SD browser — new folder, download/delete selected, size/modified/type |
 | **Logger** | The **sensor set**: Polled PIDs, Broadcast PIDs, Calculated PIDs, plus Export/Import Sensors and the engine-gating and low-voltage-protection options |
-| **Settings** | Wi-Fi (AP mode, Station mode, Backup Networks, Scan), Sleep Mode, Battery Alert/MQTT, and the protocol selector (OBD App `elm327` / Bench SLCAN) |
+| **Settings** | Wi-Fi (AP mode, Station mode, Backup Networks, Scan), Sleep Mode, Battery Alert/MQTT, Time Zone |
 | **Status** | Live device status |
 | **System** | Firmware update (OTA) |
 | **About** | Version and links |
 
 > The **Logger** tab is the product. Everything else is either operating the
 > recorder (Console, Files), configuring the device (Settings, System), or
-> inherited (the Battery Alert/MQTT block, the protocol selector).
+> inherited (the Battery Alert/MQTT block).
 
 **Hidden UI is a much smaller story than issue #28 implies.** Of the 11 elements
 carrying `style="display:none"` in `homepage_full.html`, nine are ordinary
@@ -73,17 +73,15 @@ two are the real "hide, don't delete" residue.
   keeping; if you find some, it is upstream residue.
 - **One board.** `CMakeLists.txt:54` hardcodes `set(HARDWARE_VER ${WICAN_PRO})`.
   The V210 / V300 / USB_V100 lines above it are commented out.
-- **One protocol, in practice — and out of the box too.** A configured device
-  runs `poll_log`, and so does a factory-reset one: the **live**
-  `device_config_default[]` in `config_server.c` carries `"protocol":"poll_log"`.
-  Two older defaults naming `elm327` sit just below it, commented out — this doc
-  previously cited one of those and claimed the factory default was `elm327`,
-  which was wrong. Note that `config_server_protocol()` falls back to
-  `OBD_ELM327` for an *unrecognised* string, while a *missing* `protocol` key
-  makes the whole config load fail, so corrupt and absent behave differently.
-  Other protocols still exist behind the `protocol` config key for bench use;
-  the selector is hidden in the UI. A device's actual boot mode is now recorded
-  on the `MODE` event-log line, and readable over HTTP at `/host_caps`.
+- **One protocol, compiled in.** `config_server_protocol()` is a constant
+  returning `POLL_LOG`. The `protocol` config key was retired in v1.23.0 (#141,
+  closing #92): the parser discards it, `device_config_t` has no field for it,
+  and no config file, backup or host tool can select another mode. The old
+  string-compare chain ended in a `return OBD_ELM327;` fallback, so *any*
+  unrecognised word booted the device into a mode where the datalogger never
+  ran — a constant cannot. `/host_caps` still reports `"protocol":"poll_log"`
+  because NC Flash reads that key, but it is a fixed string, not a reading.
+  See [returning-to-datalogger.md](returning-to-datalogger.md).
 - **No serial console.** The USB-C port is a USB **host** at runtime. You cannot
   attach a PC and read logs the normal way. Every diagnostic has to arrive over
   Wi-Fi — which is why `/poll_status`, `/event_log` and the crash-report
@@ -236,8 +234,8 @@ carry comments saying why — do not reorder casually.
 7. `event_log_init()` → emit `EVL_BOOT` → `crash_report_emit_pending()`.
 8. Message queues allocated in SPIRAM, then **`config_server_start()`**.
 9. `sleep_mode_init()`, `slcan_init()`, `can_init(rate)`.
-10. `protocol = config_server_protocol()` → `poll_log_init()` or another
-    front-end.
+10. `protocol = config_server_protocol()` (a constant) → `poll_log_init()`.
+    There is no other arm.
 
 **Three things about `app_main` that break most people's mental model:**
 
@@ -405,17 +403,19 @@ Consequences:
   `obd_chip_status` ("Ready"/"Sleep") is the external chip, read from
   `OBD_READY_PIN`; `ecu_status` is the broken legacy field from §7.
 
-### The protocol selector is an if/else chain in `main.c`, not a dispatch table
+### `can_tx_task` now dispatches on `dev_channel` alone
 
-It lives inside `can_tx_task` (`main.c:265-341`) and branches on **`dev_channel`
-before `protocol`**. Frames tagged `DEV_SLCAN_PORT` are handled and `continue`d
-at `main.c:279` so they never reach the protocol arms at all — **that five-line
-early exit *is* the no-reboot coexistence feature.**
+It lives in `main.c:255-299` and the protocol arms that used to follow it are
+gone with the mode field (#141). Frames tagged `DEV_SLCAN_PORT` — the dedicated
+35001 listener — are handled and `continue`d; **that early exit *is* the
+no-reboot coexistence feature.** Nothing else routes here, because the one
+remaining mode drives TWAI from the poll task's own loop.
 
-There is **no arm for `FAST_LOG` or `POLL_LOG`**. In the two datalogger modes the
-stock TCP port still accepts connections, still `recv()`s, still queues buffers —
-and `can_tx_task` silently drops every one of them by falling off the end of the
-chain. That silent drop is precisely why port 35001 had to exist.
+This is not a behaviour change: on a datalogger device neither the slcan arm nor
+the elm327 arm that used to sit below could ever be true, so a frame arriving on
+the stock port was already dropped silently. That silent drop is precisely why
+port 35001 had to exist — and the stock port itself is now gone too, along with
+the `port` and `port_type` keys that configured it.
 
 ### Shared state: the config lock
 
@@ -970,8 +970,11 @@ Nothing below is enforced by CI today — that gap is
 
 CI (`.github/workflows/build-firmware.yml`) builds on pushes to `wican-pro`, on
 `v*` tags, and on PRs; a `v*` tag additionally publishes a GitHub Release with
-five assets. **CI runs no tests and no lint** — `tools/lint_web.py` and
-`tools/webtest/` are local-only today.
+five assets. A **Static checks** job runs ahead of the build and gates it:
+`tools/lint_web.py` (web lint + generated-file freshness), `tools/check_docs.py`
+(docs match the code), `node --test tools/webtest/*.test.mjs` and
+`tools/hosttest/run.sh` (the C host tests). The build job then runs
+`tools/check_build_budget.py` over the build log.
 
 Budget on the v1.17.0 baseline, from `idf.py size` / `size-components`. App image
 **2,743,616 B** with **47% of the app partition free**; DIRAM **227,779 / 341,760
