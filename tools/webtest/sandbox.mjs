@@ -68,13 +68,35 @@ function stubElement() {
     return el;
 }
 
+// Ids the real page actually has: id="..." in homepage_full.html, plus ids main.js
+// assigns to elements it builds itself. Same two sources tools/lint_web.py check 1 uses,
+// so the test and the lint agree on what "exists" means.
+function realPageIds() {
+    const html = readFileSync(join(REPO, 'main', 'web', 'homepage_full.html'), 'utf8');
+    const js = readFileSync(MAIN_JS, 'utf8');
+    const ids = new Set();
+    for (const m of html.matchAll(/\bid=["']([^"']+)["']/g)) ids.add(m[1]);
+    for (const m of js.matchAll(/\.id\s*=\s*["']([^"']+)["']/g)) ids.add(m[1]);
+    for (const m of js.matchAll(/setAttribute\(\s*["']id["']\s*,\s*["']([^"']+)["']\s*\)/g)) ids.add(m[1]);
+    return ids;
+}
+
 /**
  * Evaluate main.js and return { exports, missing, context }.
  *  - exports: the EXPORTS above that resolved, by name
  *  - missing: names that did not resolve (a rename or deletion in main.js)
+ *
+ * Options:
+ *  - strictDom: getElementById returns null for an id the real page does not define.
  */
-export function loadMainJs() {
+export function loadMainJs({ strictDom = false } = {}) {
     const src = readFileSync(MAIN_JS, 'utf8');
+
+    // strictDom: model the REAL page -- an id that homepage_full.html does not define
+    // returns null, exactly as the browser does. The permissive default hands out a stub
+    // for every id, which is fine for the pure round-trip tests but cannot catch a DOM
+    // element that was deleted from the HTML while main.js still looks it up.
+    const knownIds = strictDom ? realPageIds() : null;
 
     const elCache = new Map();
     const documentStub = {
@@ -82,6 +104,7 @@ export function loadMainJs() {
         // top-level DOM side effect -- getElementById("defaultOpen").click() --
         // and a null there aborts the whole load.
         getElementById(id) {
+            if (knownIds && !knownIds.has(id)) return null;
             if (!elCache.has(id)) elCache.set(id, stubElement());
             return elCache.get(id);
         },
@@ -106,7 +129,20 @@ export function loadMainJs() {
         // Any test that needs the network should stub this itself; the default
         // must never reach out.
         fetch: async () => { throw new Error('sandbox: unexpected network call'); },
-        setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
+        // Under strictDom the tests call showNotification(), which arms a 5 s (50 s for the
+        // default-password message) timer. An un-unref'd timer keeps `node --test` alive that
+        // long, so drop the process's reference to it. Behaviour is otherwise unchanged.
+        //
+        // ⚠️ An unref'd timer does NOT keep node alive, so a future strictDom test that AWAITS
+        // a timer can see the process exit before the callback runs and pass for the wrong
+        // reason. Today's strictDom tests are all synchronous, so this cannot bite yet. If you
+        // write one that waits on a timeout, hold the process open yourself rather than
+        // removing the unref. Note requestAnimationFrame below closes over Node's real
+        // setTimeout, not this wrapper, so rAF timers are never unref'd (harmless at 0 ms).
+        setTimeout: strictDom
+            ? (fn, ms, ...a) => { const t = setTimeout(fn, ms, ...a); t.unref?.(); return t; }
+            : setTimeout,
+        clearTimeout, setInterval, clearInterval, queueMicrotask,
         requestAnimationFrame: (f) => setTimeout(f, 0),
         alert() {}, confirm: () => true, prompt: () => null,
         Blob: class Blob { constructor(parts) { this.parts = parts; } },

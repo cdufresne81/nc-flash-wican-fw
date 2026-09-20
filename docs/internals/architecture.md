@@ -200,7 +200,7 @@ components/                 15,318 lines
   restart_tracker/ cmdline/ wican_common/
 tools/
   build_web.py              homepage_full.html -> src/homepage.html
-  lint_web.py               3 mandatory web gates
+  lint_web.py               4 mandatory web gates
   webtest/                  node --test unit tests for main.js
 docs/internals/             you are here
 ```

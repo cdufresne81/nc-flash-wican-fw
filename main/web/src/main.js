@@ -3047,10 +3047,7 @@ function submit_enable() {
     // Validate form and enable/disable submit button
     const isValid = validateForm(elements, wifiMode);
     elements.submitButton.disabled = !isValid;
-    
-    // Configure protocol-specific settings
-    configureProtocolSettings(elements);
-    
+
     // Configure sleep and battery alert settings
     configureSleepSettings(elements);
     
@@ -3140,9 +3137,6 @@ function validateForm(elements, wifiMode) {
 
     
     // Port validation
-    if (!validatePort(elements.tcpPortValue.value)) {
-        return disableSubmitWithError("TCP Port value, min=1 max=65535", 5000);
-    }
     if (!validatePort(elements.battAlertPort.value)) {
         return disableSubmitWithError("Battery Alert Port value, min=1 max=65535", 5000);
     }
@@ -3172,12 +3166,6 @@ function validateForm(elements, wifiMode) {
     }
     
     return true;
-}
-
-function configureProtocolSettings(elements) {
-    elements.tcpPortValue.disabled = false;
-    elements.portType.selectedIndex = 0;
-    elements.portType.disabled = false;
 }
 
 function configureSleepSettings(elements) {
@@ -3808,21 +3796,35 @@ async function uploadCfg() {
 }
 
 // Config keys with no UI after the streamline: captured from /load_config in Load(),
-// re-sent verbatim by postConfig() so config-file edits survive a Submit. The four
-// pre-seeded defaults are mandatory keys -- /store_config rejects the whole POST when
-// any of them is missing, so they must always be sent even if /load_config omits them.
+// re-sent verbatim by postConfig() so config-file edits survive a Submit. Every entry
+// below is pre-seeded, so the form sends it even when /load_config omits it -- which is
+// not hypothetical: a device running a build older than the v1.25.0 shim replies without
+// the three deprecated keys, and capture-only would silently drop them from the file.
+// Of these, only can_datarate and can_mode are mandatory to THIS firmware's parser
+// (config_server.c, both `goto config_error` when absent); log_period and imu_threshold
+// fall back to defaults, and the three deprecated keys are ignored entirely -- see the
+// comment on them below for why they are sent anyway.
 // The home_*/drive_* SmartConnect keys are optional and captured only when present.
 var loadedPassthrough = {
     can_datarate: "500K",   // NC platform is always 500K
     can_mode: "normal",
     imu_threshold: "8",     // IMU only feeds the removed SmartConnect logic
     log_period: "10",       // datalog period (no UI element after the trim)
+    // DEPRECATED, delete together with the /load_config shim in v1.25.0 (config_server.c,
+    // load_config_handler). This firmware ignores all three. They are re-sent so config.json
+    // keeps them, because a firmware older than v1.23.0 hard-requires them and FACTORY-RESETS
+    // the device (owner's Wi-Fi gone) when one is missing. The shim only puts them in the
+    // /load_config reply; these entries are what puts them back in the file on Submit.
+    protocol: "poll_log",   // must match the shim's values exactly
+    port: "35000",
+    port_type: "tcp",
 };
 // "debug" (#98): has no UI element, so without it here every Submit rewrote config.json without
 // the key and silently turned debug logging back off. That was invisible while the flag only
 // controlled serial output nobody can read on this device; it now also gates the event log's
 // detail-only lines, so a Submit mid-debugging-session would quietly end the session.
 var PASSTHROUGH_KEYS = ["can_datarate", "can_mode", "imu_threshold", "log_period", "debug",
+    "protocol", "port", "port_type",   // DEPRECATED rollback shim, see loadedPassthrough above
     "home_ssid", "home_password", "home_security", "home_protocol",
     "drive_ssid", "drive_password", "drive_security", "drive_protocol",
     "drive_connection_type", "drive_mode_timeout"];
@@ -4034,7 +4036,7 @@ xhttp.onload = async function() {
 
         // --- Restored settings population (regression fix: commit d372fc9 over-cut this block,
         //     causing every Submit to persist stock HTML defaults). MQTT-gateway lines intentionally
-        //     omitted (feature removed by the trim); protocol is populated by checkStatus(). ---
+        //     omitted (feature removed by the trim); the protocol field was retired in #141. ---
         // Datalogger master + wide-CSV grid controls (firmware default is 10 Hz; the grid
         // is always fixed-rate -- csv_grid_mode retired in issue #53, ignored if present).
         var _cs_on = (obj.csv_log === "enable");
@@ -4090,7 +4092,10 @@ xhttp.onload = async function() {
 
         // Apply mode-dependent enable/disable rules after values are loaded
         try { toggleApStationWarning(); } catch(_) {}
-        try { submit_enable(); } catch(_) {}
+        // Keep the catch: the two lines below MUST still run so Store and Submit end up
+        // disabled. But do not eat the error -- a swallowed throw here is what hid the
+        // dead-Submit-button bug (#141 fallout) from the console on every page load.
+        try { submit_enable(); } catch (e) { console.error("submit_enable failed during Load()", e); }
 
         document.querySelector(".store").disabled = true;
         document.getElementById("submit_button").disabled = true;

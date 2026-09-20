@@ -1162,9 +1162,15 @@ static esp_err_t load_config_handler(httpd_req_t *req)
 	 * release notes for the version that drops it, not only here.
 	 *
 	 * Everything else about this endpoint is unchanged: it is BOTH the seed for the settings form
-	 * AND the file the user downloads as a backup, so what is written here comes back on the next
-	 * Submit. The file on the SD card is NOT rewritten -- firmware never rewrites config.json
-	 * outside the store path, because an interrupted write loses the owner's Wi-Fi credentials. */
+	 * AND the file the user downloads as a backup. The file on the SD card is NOT rewritten --
+	 * firmware never rewrites config.json outside the store path, because an interrupted write
+	 * loses the owner's Wi-Fi credentials.
+	 *
+	 * THIS BLOCK IS ONLY HALF THE SHIM. It puts the keys in the REPLY; it does not make them come
+	 * back on the next Submit. postConfig() builds its POST from a fixed whitelist, not an echo of
+	 * what it was served, so the other half is PASSTHROUGH_KEYS + loadedPassthrough in
+	 * main/web/src/main.js. Without that half, every Submit writes a config.json missing all three
+	 * keys and the rollback hazard above is wide open. Delete BOTH halves together in v1.25.0. */
 	{
 		static const struct { const char *key, *val; } deprecated_keys[] = {
 			{ "protocol",  "poll_log" },   /* the only mode this firmware has */
