@@ -64,9 +64,17 @@
 #define UDP_PORT			0
 #define TCP_PORT			1
 
-#define SLCAN				0
-/* protocol ids 1 (realdash66) and 2 (savvycan) retired in the #5 trim; values
- * reserved so the remaining ids never shift. */
+/* Fixed TCP port of the dedicated always-on SLCAN listener used by NC Flash to reach the ECU
+ * without any protocol switch; MUST match the host's WICAN_DEDICATED_SLCAN_PORT
+ * (src/ecu/constants.py). Lives here rather than in main.c so any module can name the port
+ * without redefining the number. It is the ONLY TCP port this firmware opens for CAN traffic:
+ * the configurable stock server is gone, so nothing can collide with it any more. */
+#define WICAN_DEDICATED_SLCAN_PORT	35001
+
+/* protocol ids 0 (slcan), 1 (realdash66) and 2 (savvycan) retired; values reserved so the
+ * remaining ids never shift. id 0 went when `protocol` became a placebo: the device has one
+ * mode and the stored value is discarded at the parse site, so no id here is selectable any
+ * more. The rest stay defined because dead-but-compiled router arms in main.c still name them. */
 #define OBD_ELM327			3
 #define AUTO_PID			4
 #define FAST_LOG			5	/* Native-TWAI fast datalogger (Task #18) */
@@ -135,10 +143,7 @@ typedef struct _device_config
 	char drive_mode_timeout[8];
 	char can_datarate[65];
 	char can_mode[65];
-	char port_type[65];
-	char port[65];
 	char ap_pass[65];
-	char protocol[65];
 	char ble_pass[18];
 	char ble_status[32];
 	char ble_power[8]; // dBm value as string (e.g., -12, -9, -6, -3, 0, 3, 6, 9)
@@ -197,8 +202,6 @@ wifi_security_t config_server_get_home_security_type(void);
 wifi_security_t config_server_get_drive_security_type(void);
 int8_t config_server_get_can_rate(void);
 int8_t config_server_get_can_mode(void);
-int8_t config_server_get_port_type(void);
-int32_t config_server_get_port(void);
 //void config_server_wifi_connected(bool flag);
 //bool config_server_get_wifi_connected(void);
 void config_server_set_sta_ip(char* ip);
@@ -207,11 +210,6 @@ char *config_server_get_ap_pass(void);
 int8_t config_server_get_ap_ssid_en(void);
 char *config_server_get_ap_ssid(void);
 int8_t config_server_protocol(void);
-/* The STORED protocol string, verbatim. config_server_protocol() above maps it to an
- * enum and coerces unknown values to OBD_ELM327, which is the right thing for dispatch
- * but hides what is actually on disk -- and what is on disk is the thing that strands a
- * device in Bench SLCAN (issue #92). Used by the boot MODE line and /host_caps. */
-const char *config_server_protocol_str(void);
 /* Name of a resolved protocol enum value, for logging. Never NULL. */
 const char *config_server_protocol_name(int8_t protocol);
 int config_server_ble_pass(void);

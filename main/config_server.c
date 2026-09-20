@@ -380,11 +380,8 @@ char *config_server_get_home_security(void)
 
 int8_t config_server_get_home_protocol(void)
 {
-	if(strcmp(device_config.home_protocol, "slcan") == 0)
-	{
-		return SLCAN;
-	}
-	else if(strcmp(device_config.home_protocol, "elm327") == 0)
+	// No slcan arm: protocol id 0 is retired (config_server.h) and the device has one mode.
+	if(strcmp(device_config.home_protocol, "elm327") == 0)
 	{
 		return OBD_ELM327;
 	}
@@ -412,11 +409,8 @@ char *config_server_get_drive_security(void)
 
 int8_t config_server_get_drive_protocol(void)
 {
-	if(strcmp(device_config.drive_protocol, "slcan") == 0)
-	{
-		return SLCAN;
-	}
-	else if(strcmp(device_config.drive_protocol, "elm327") == 0)
+	// See config_server_get_home_protocol(): no slcan arm, id 0 is retired.
+	if(strcmp(device_config.drive_protocol, "elm327") == 0)
 	{
 		return OBD_ELM327;
 	}
@@ -468,16 +462,10 @@ wifi_security_t config_server_get_drive_security_type(void)
 	return WIFI_WPA3_PSK; // Default to WPA3
 }
 
-const char *config_server_protocol_str(void)
-{
-	return device_config.protocol;
-}
-
 const char *config_server_protocol_name(int8_t protocol)
 {
 	switch(protocol)
 	{
-		case SLCAN:       return "slcan";
 		case OBD_ELM327:  return "elm327";
 		case AUTO_PID:    return "auto_pid";
 		case FAST_LOG:    return "fast_log";
@@ -488,26 +476,14 @@ const char *config_server_protocol_name(int8_t protocol)
 
 int8_t config_server_protocol(void)
 {
-	if(strcmp(device_config.protocol, "slcan") == 0)
-	{
-		return SLCAN;
-	}
-	else if(strcmp(device_config.protocol, "elm327") == 0)
-	{
-		return OBD_ELM327;
-	}
-	// No auto_pid arm: the parser coerces a stored "auto_pid" to "poll_log" before it can reach
-	// device_config, so this string is unreachable. Kept out rather than left dead so nobody
-	// reads it as evidence that AUTO_PID is still a selectable protocol.
-	else if(strcmp(device_config.protocol, "fast_log") == 0)
-	{
-		return FAST_LOG;
-	}
-	else if(strcmp(device_config.protocol, "poll_log") == 0)
-	{
-		return POLL_LOG;
-	}
-	return OBD_ELM327;
+	// One mode, always. `protocol` is a placebo -- the parse site discards the stored value
+	// (see the pin next to `dst->protocol`), so there is nothing left to match against.
+	//
+	// What used to be here was a chain of string compares ending in `return OBD_ELM327;`. That
+	// fallback is the reason this collapsed rather than shrank: ANY unrecognised word in the
+	// config -- "slcan" (issue #92), a typo, a truncated write -- landed on it and booted the
+	// device into a mode where the datalogger does not run, silently. A constant cannot.
+	return POLL_LOG;
 }
 
 int8_t config_server_get_can_rate(void)
@@ -577,32 +553,6 @@ int8_t config_server_get_can_mode(void)
 		return CAN_SILENT;
 	}
 	return -1;
-}
-
-int8_t config_server_get_port_type(void)
-{
-	if(strcmp(device_config.port_type, "tcp") == 0)
-	{
-		return TCP_PORT;
-	}
-	else if(strcmp(device_config.port_type, "udp") == 0)
-	{
-		return UDP_PORT;
-	}
-	return -1;
-}
-
-int32_t config_server_get_port(void)
-{
-	int port_val = atoi(device_config.port);
-
-	if(port_val > 0 && port_val <= 65535)
-	{
-		return port_val;
-	}
-
-	ESP_LOGE(TAG, "Invalid port number in config");
-	return 35000;
 }
 
 // Create directories recursively if they don't exist
@@ -1189,6 +1139,52 @@ static esp_err_t load_config_handler(httpd_req_t *req)
 	CONFIG_SECRET_FIELDS(REDACT_SECRET)
 	#undef REDACT_SECRET
 
+	/* ---- DEPRECATED COMPATIBILITY SHIM -- REMOVE IN v1.25.0 ---------------------------------
+	 *
+	 * `protocol`, `port` and `port_type` are GONE from this firmware: the parser ignores them,
+	 * device_config_t has no fields for them, no code reads them, and the web UI has no controls
+	 * for them. They are re-inserted here, at fixed values, for ONE reason and one only.
+	 *
+	 * THE REASON: an older firmware's parser hard-requires all three, and a missing required key
+	 * does not merely fail -- config_server_load_cfg() unlinks config.json and writes the factory
+	 * default. So without these three words, the first Submit on this firmware would produce a
+	 * config file that FACTORY-RESETS the device if it were ever rolled back to an older build:
+	 * Wi-Fi credentials gone, device off the owner's network, recoverable only by holding the
+	 * hardware button for 5 s. A firmware rollback is the normal response to a bad build, so it
+	 * must not be the thing that wipes the device.
+	 *
+	 * The values are deliberately the historical defaults, not a report of any live state. There
+	 * is no live state left to report.
+	 *
+	 * REMOVAL: delete this whole block in v1.25.0. By then no supported build requires the keys.
+	 * When it goes, a backup taken afterwards can no longer be restored on any firmware older than
+	 * this one -- which is exactly the trade being deferred, not avoided. Announce it in the
+	 * release notes for the version that drops it, not only here.
+	 *
+	 * Everything else about this endpoint is unchanged: it is BOTH the seed for the settings form
+	 * AND the file the user downloads as a backup, so what is written here comes back on the next
+	 * Submit. The file on the SD card is NOT rewritten -- firmware never rewrites config.json
+	 * outside the store path, because an interrupted write loses the owner's Wi-Fi credentials. */
+	{
+		static const struct { const char *key, *val; } deprecated_keys[] = {
+			{ "protocol",  "poll_log" },   /* the only mode this firmware has */
+			{ "port",      "35000"    },   /* historical stock-server default */
+			{ "port_type", "tcp"      },
+		};
+		for (size_t i = 0; i < sizeof deprecated_keys / sizeof deprecated_keys[0]; i++)
+		{
+			cJSON_DeleteItemFromObject(root, deprecated_keys[i].key);
+			cJSON_AddStringToObject(root, deprecated_keys[i].key, deprecated_keys[i].val);
+		}
+		/* The indicator. A downloaded backup carries its own expiry date, so the deprecation is
+		 * visible to whoever opens the file rather than living only in a source comment nobody
+		 * reads. Both the old and the new parser ignore keys they do not look up, so carrying it
+		 * is free. Delete it with the block above. */
+		cJSON_DeleteItemFromObject(root, "_deprecated");
+		cJSON_AddStringToObject(root, "_deprecated",
+			"protocol/port/port_type do nothing on this firmware and are dropped in v1.25.0");
+	}
+
 	char *resp_str = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
 	if (resp_str == NULL)
@@ -1592,12 +1588,9 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 //	cJSON_AddStringToObject(root, "can_datarate", device_config.can_datarate);
 	cJSON_AddStringToObject(root, "can_datarate", can_datarate_str[can_get_bitrate()]);
 	cJSON_AddStringToObject(root, "can_mode", device_config.can_mode);
-	cJSON_AddStringToObject(root, "port_type", device_config.port_type);
-	cJSON_AddStringToObject(root, "port", device_config.port);
 	cJSON_AddStringToObject(root, "fw_version", fver);
 	cJSON_AddStringToObject(root, "hw_version", hver);
 	cJSON_AddStringToObject(root, "git_version", GIT_SHA);
-	cJSON_AddStringToObject(root, "protocol", device_config.protocol);
 	cJSON_AddStringToObject(root, "sleep_status", device_config.sleep_status);
 	cJSON_AddStringToObject(root, "can_wake", device_config.can_wake);
 	cJSON_AddStringToObject(root, "sleep_disable_agree", device_config.sleep_disable_agree);
@@ -1721,10 +1714,10 @@ static esp_err_t check_status_handler(httpd_req_t *req)
  * host's 1.5 s probe budget, so old firmware looked like a network fault).
  *
  * Two contracts a future editor must not break:
- *   * "protocol" is the STORED mode (device_config.protocol), NOT the resolved
- *     running one. The host's stranded-device sweep asks "what will this device
- *     be after a reboot", and under SmartConnect the two differ -- reporting the
- *     running mode would make it judge a stranded device healthy.
+ *   * "protocol" must keep being sent. It is now the constant "poll_log": the mode field is
+ *     gone from the config and the device compiles in one mode, so there is no stored-versus-
+ *     running distinction left to get wrong. The host's stranded-device sweep reads this as
+ *     "healthy", which is now simply always true -- a strand is unreachable by construction.
  *   * "ncfr_rev" derives from NCFLASH_FASTREAD_REV, the same number the NCFRv
  *     wire marker is built from, so the two can never disagree.
  *
@@ -1740,9 +1733,9 @@ static esp_err_t host_caps_handler(httpd_req_t *req)
 		return ESP_FAIL;
 	}
 	cJSON_AddNumberToObject(root, "ncfr_rev", NCFLASH_FASTREAD_REV);
-	/* cJSON rather than snprintf: the stored string is parser-bounded but not
-	 * charset-restricted, and this escapes it for free. */
-	cJSON_AddStringToObject(root, "protocol", device_config.protocol);
+	/* A constant now, and kept ONLY because it is a host contract -- NC Flash reads this key.
+	 * There is no stored mode left to report: the device compiles in one mode. */
+	cJSON_AddStringToObject(root, "protocol", "poll_log");
 
 	char *resp_str = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
@@ -2275,10 +2268,13 @@ static esp_err_t scan_available_pids_handler(httpd_req_t *req)
     char param[32];
     uint8_t protocol_num = 6; // Default protocol
 
-    if(config_server_protocol() != AUTO_PID)
+    /* Always taken: config_server_protocol() is the constant POLL_LOG. The legacy AutoPID
+     * scanner is unreachable on this fork -- the mode field is gone and there is no Settings
+     * control to point the user at any more, so the old "go and set Protocol to AutoPID"
+     * message named a UI that no longer exists. */
     {
         httpd_resp_set_type(req, "application/json");
-		const char *resp_str = "{\"text\":\"Go to Settings -> CAN and set Protocol to AutoPID then click Submit Changes\"}";
+		const char *resp_str = "{\"text\":\"Scanning for available PIDs is not supported on this firmware. Add the PIDs you want under Logger -> Polled PIDs.\"}";
         httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
@@ -2709,28 +2705,13 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	strlcpy(dst->can_mode, key->valuestring, sizeof(dst->can_mode));
 	ESP_LOGI(TAG, "dst->can_mode: %s", dst->can_mode);
 
-	key = cJSON_GetObjectItem(root,"port_type");
-	if(key == 0)
-	{
-		goto config_error;
-	}
-	if (key->valuestring == NULL) {
-		goto config_error;
-	}
-	strlcpy(dst->port_type, key->valuestring, sizeof(dst->port_type));
-	ESP_LOGI(TAG, "dst->port_type: %s", dst->port_type);
-
-	key = cJSON_GetObjectItem(root,"port");
-	if(key == 0)
-	{
-		goto config_error;
-	}
-	if (key->valuestring == NULL) {
-		goto config_error;
-	}
-	strlcpy(dst->port, key->valuestring, sizeof(dst->port));
-	ESP_LOGI(TAG, "dst->port: %s", dst->port);
-
+	/* `port_type` and `port` are gone. They configured the stock CAN-over-TCP/UDP server, which
+	 * served the slcan and elm327 host protocols -- both retired with the mode field. Nothing
+	 * produced bytes for that port or consumed bytes from it any more, so the server is no longer
+	 * started at all (main.c) and these two keys configured nothing. Deleted rather than kept as
+	 * placeholders: a setting that cannot change anything is worse than no setting, because the
+	 * next person to read it believes it works. An older config file that still carries them
+	 * loads fine -- the parser only looks up the keys it wants and ignores the rest. */
 
 	key = cJSON_GetObjectItem(root,"ap_pass");
 	if(key == 0)
@@ -2744,32 +2725,10 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	strlcpy(dst->ap_pass, key->valuestring, sizeof(dst->ap_pass));
 	CONFIG_LOG_SECRET("dst->ap_pass", dst->ap_pass);
 
-	key = cJSON_GetObjectItem(root,"protocol");
-	if(key == 0)
-	{
-		goto config_error;
-	}
-	if(key->valuestring == NULL || strlen(key->valuestring) < 2 || strlen(key->valuestring) > 64)
-	{
-		goto config_error;
-	}
-	strlcpy(dst->protocol, key->valuestring, sizeof(dst->protocol));
-	// The legacy AutoPID scheduler is retired on this fork (issue #28). It polls one PID at a
-	// time (~0.5 Hz per channel, vs poll_log sweeping the whole table ~20x/s) and it never runs
-	// the calculated-channel pass -- autopid_eval_calculated_channels() is called only from
-	// poll_log.c and fast_log.c -- so its CSVs carry phantom all-empty CALC columns. Devices
-	// that still store the old value are coerced here, in RAM ONLY: no write to config.json, so
-	// a booting device never risks the truncate-then-write path. Every consumer (boot, the
-	// /store_config shadow validation, the live-apply diff) funnels through this parser, and the
-	// coercion is idempotent. Unlike home/drive_protocol -- where the getter alone is enough --
-	// this one rewrites the string, because /check_status reports it verbatim and the web UI
-	// keys its "this protocol cannot record PIDs" banner off that value.
-	if(strcmp(dst->protocol, "auto_pid") == 0)
-	{
-		strlcpy(dst->protocol, "poll_log", sizeof(dst->protocol));
-		ESP_LOGW(TAG, "protocol auto_pid is retired on this fork; running poll_log");
-	}
-	ESP_LOGI(TAG, "dst->protocol: %s", dst->protocol);
+	/* `protocol` is gone for the same reason. The device has exactly one mode, the Datalogger,
+	 * and it is compiled in -- there is nothing to select. This is what closes issue #92: no
+	 * config file, no import, no host tool and no UI can put the device into Bench SLCAN (or
+	 * elm327, or fast_log) any more, because the concept no longer exists on the device. */
 
 	key = cJSON_GetObjectItem(root,"ble_pass");
 	if(key == 0)

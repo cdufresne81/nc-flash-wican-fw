@@ -1286,18 +1286,6 @@
                         </td>
                     </tr>
                     <tr>
-                        <td>Port Type:</td>
-                        <td>
-                            <div id="port_type_status">TCP&nbsp;</div>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td>TCP/UDP Port:</td>
-                        <td>
-                            <div id="port_status">3333&nbsp;</div>
-                        </td>
-                    </tr>
-                    <tr>
                         <td>Battery Voltage:</td>
                         <td>
                             <div id="batt_voltage">12.8V&nbsp;</div>
@@ -1630,37 +1618,6 @@
                         <div style="color:#78350f;font-size:13px;line-height:1.4">When BLE connects, WiFi AP is disabled. To restore WiFi AP: disconnect BLE and power cycle device.</div>
                     </div>
                 </div>
-                <div class="divider"></div>
-                <div class="section-title">CAN</div>
-                <table class="form-table">
-                    <tbody>
-                        <tr>
-                            <td>Port Type:</td>
-                            <td><select id="port_type" name="port_type">
-                                    <option value="tcp">TCP</option>
-                                    <option value="udp">UDP</option>
-                                </select></td>
-                        </tr>
-                        <tr>
-                            <td>TCP/UDP Port:</td>
-                            <td><input id="tcp_port_value" max="65535" min="1" name="tcp_port_value" type="number" value="3333"></td>
-                        </tr>
-                        <!-- Protocol selector hidden: this product always runs the Datalogger
-                             (poll_log) protocol, and NC Flash talks to the always-on port 35001
-                             regardless. The select stays in the DOM: checkStatus() mirrors the
-                             device's live protocol into it and postConfig() re-sends that value,
-                             so config-file edits round-trip. -->
-                        <tr style="display:none">
-                            <td>Protocol:</td>
-                            <td><select id="protocol" name="protocol">
-                                    <option value="poll_log">Datalogger (poll_log)</option>
-                                    <option value="fast_log">Passive Logger (fast_log)</option>
-                                    <option value="elm327">OBD App (elm327)</option>
-                                    <option value="slcan">Bench SLCAN (slcan)</option>
-                                </select></td>
-                        </tr>
-                    </tbody>
-                </table>
                 <!-- Time zone (issue #91). It shapes the log file names and timestamps,
                      but it is a device-wide setting, so it lives here rather than on the
                      Logger tab. Options are injected from TZ_TABLE in main.js so the zone
@@ -1772,14 +1729,6 @@
                     <div style="color:#78350f;font-size:13px;line-height:1.4">It is recommended to keep this enabled. Polling the ECU when the battery voltage is low can increase battery drain while the vehicle is parked.</div>
                 </div>
             </div>
-            </div>
-            <div style="margin:8px 0;display:none" id="autopid_warning_div">
-                <div style="background:linear-gradient(135deg,#fef3c7 0%,#fde68a 100%);border:1px solid #f59e0b;border-radius:8px;padding:12px;box-shadow:0 2px 4px #0000001a">
-                    <div style="align-items:center;margin-bottom:6px;display:flex"><span data-lucide="alert-triangle" style="margin-right:8px;font-size:16px"></span><strong style="color:#92400e;font-size:14px">PID Polling Inactive</strong></div>
-                    <div style="color:#78350f;font-size:13px;line-height:1.4">The current protocol does not poll PIDs, so nothing can be recorded. Use the button below to put the device back into Datalogger (poll_log) mode. You can still do it by hand instead: download the configuration on the System page, set "protocol" to "poll_log", and upload it back.</div>
-                    <div style="margin-top:10px"><button type="button" class="primary-button" id="restore_datalogger_btn" onclick="restoreDataloggerMode()">Restore Datalogger mode</button></div>
-                    <div style="color:#78350f;font-size:12px;margin-top:6px">Checks first that no ECU flash is running, then reboots the device (about 6 seconds).</div>
-                </div>
             </div>
             <div>
                 <!-- Sensor set export/import (issue #63): a Logger-scoped backup covering all

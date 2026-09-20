@@ -3006,14 +3006,11 @@ function getElements() {
         battAlertDiv: document.getElementById("batt_alert_div"),
         submitButton: document.getElementById("submit_button"),
         apPassValue: document.getElementById("ap_pass_value"),
-        tcpPortValue: document.getElementById("tcp_port_value"),
         battAlertPort: document.getElementById("batt_alert_port"),
         blePassValue: document.getElementById("ble_pass_value"),
         sleepVolt: document.getElementById("sleep_volt"),
         sleepStatus: document.getElementById("sleep_status"),
         sleepDisableAgree: document.getElementById("sleep_disable_agree"),
-        protocol: document.getElementById("protocol"),
-        portType: document.getElementById("port_type"),
         sta_ble_info: document.getElementById("sta_ble_info")
     };
 }
@@ -3239,26 +3236,10 @@ function checkStatus() {
         } else if(obj.can_mode == "silent") {
             document.getElementById("can_mode_status").innerHTML = "Silent";
         }
-        if(obj.port_type == "tcp") {
-            document.getElementById("port_type_status").innerHTML = "TCP";
-        } else if(obj.port_type == "udp") {
-            document.getElementById("port_type_status").innerHTML = "UDP";
-        }
-        document.getElementById("port_status").innerHTML = obj.port;
         // The git-describe tag IS the firmware version (issue #21): the old MeatPi
         // major.minor fw_version means nothing on this fork.
         document.getElementById("fw_version").innerHTML = obj.git_version;
         document.getElementById("hw_version").innerHTML = obj.hw_version;
-        document.getElementById("protocol").value = obj.protocol;
-        // poll_log is the native poller; fast_log records only CAN-filter/calculated
-        // channels. auto_pid (the legacy ELM poller) is no longer listed: the config parser
-        // coerces it to poll_log, so /check_status can never report it -- and if it ever did,
-        // it deserves the warning rather than the silent pass it used to get.
-        if (["poll_log", "fast_log"].indexOf(obj.protocol) === -1) {
-            document.getElementById("autopid_warning_div").style.display = "block";
-        }else {
-            document.getElementById("autopid_warning_div").style.display = "none";
-        }
         if(obj.subnet_overlap == "yes" && obj.ap_auto_disable != "enable") {
             document.getElementById("apconfig_warning_div").style.display = "block";
         } else {
@@ -3376,10 +3357,7 @@ async function postConfig() {
     // Keys with no UI (CAN, IMU, log period, SmartConnect leftovers): re-send the
     // stored values verbatim so they survive a Submit (see loadedPassthrough).
     Object.assign(obj, loadedPassthrough);
-    obj["port_type"] = document.getElementById("port_type").value;
-    obj["port"] = document.getElementById("tcp_port_value").value;
     obj["ap_pass"] = document.getElementById("ap_pass_value").value;
-    obj["protocol"] = document.getElementById("protocol").value;
     obj["ble_pass"] = document.getElementById("ble_pass_value").value;
     obj["ble_status"] = document.getElementById("ble_status").value;
     obj["ble_power"] = document.getElementById("ble_power").value; // BLE TX power (dBm)
@@ -3479,129 +3457,6 @@ async function postConfig() {
         }
     };
     xhttp.send(configJSON);
-}
-
-// --- Restore Datalogger mode (issue #92) -------------------------------------
-//
-// A device left in Bench SLCAN stops datalogging and, before this, the only way
-// out was downloading config.json, hand-editing one key, and uploading it back.
-// The banner above now carries a button instead.
-//
-// The button is only safe because of this check. That banner is ALSO visible
-// during every legitimate NC Flash session on older firmware -- which switches
-// the device to slcan on purpose for the duration of a flash. Clicking it then
-// would reboot the adapter out from under a live ECU write and can leave the
-// car's PCM half-written. So we ask the firmware what is going on first, and
-// refuse while anything is holding the bus.
-
-/**
- * Decide what the restore button may do, given GET /datalog.
- *
- * Pure and side-effect free so the gating can be tested without a browser --
- * this is the part that must never be wrong.
- *
- * @param d parsed /datalog body, or null when it is unreachable or absent
- *          (older firmware has no such endpoint). null means "cannot confirm",
- *          NEVER "nothing is running".
- * @returns {{action: 'refuse'|'confirm'|'proceed', message: string}}
- */
-function strandRestoreDecision(d) {
-    if (d && (d.flash_active || d.host_bus_claimed)) {
-        return {
-            action: 'refuse',
-            message: 'An NC Flash session or an ECU flash is active on this device. ' +
-                     'Restoring now would reboot it and could interrupt a write to the ' +
-                     'car\'s ECU. Close NC Flash first, then try again.'
-        };
-    }
-    if (d && d.stuck_flash_alarm) {
-        return {
-            action: 'refuse',
-            message: 'This device reports a flash that never finished. Rebooting will ' +
-                     'not clear it. Power-cycle the device, then try again.'
-        };
-    }
-    if (!d) {
-        return {
-            action: 'confirm',
-            message: 'The device could not confirm that no ECU flash is running ' +
-                     '(older firmware?). Continue ONLY if you are certain NC Flash is ' +
-                     'not flashing or reading the ECU right now.\n\nRestore Datalogger ' +
-                     'mode and reboot?'
-        };
-    }
-    if (d.datalog_parked) {
-        // Soft, not hard: a park can be left behind by a dead host socket, and a
-        // permanent refusal here would push the user back to hand-editing -- the
-        // exact thing this button exists to replace.
-        return {
-            action: 'confirm',
-            message: 'A host tool has paused the datalogger and may still be mid-session. ' +
-                     'Restore Datalogger mode and reboot anyway?'
-        };
-    }
-    return {
-        action: 'proceed',
-        message: 'Restore Datalogger (poll_log) mode? The device will reboot, which takes ' +
-                 'about 6 seconds.'
-    };
-}
-
-async function restoreDataloggerMode() {
-    const btn = document.getElementById("restore_datalogger_btn");
-    if (btn) btn.disabled = true;
-    try {
-        // Ask the firmware what is happening. Any failure -- network, 404 on
-        // firmware that predates /datalog, unparseable body -- becomes null,
-        // which the decision treats as "cannot confirm", not as "all clear".
-        let state = null;
-        try {
-            const r = await fetch("/datalog", { cache: "no-store" });
-            if (r.ok) state = await r.json();
-        } catch (e) {
-            state = null;
-        }
-
-        const decision = strandRestoreDecision(state);
-        if (decision.action === 'refuse') {
-            showNotification(decision.message, "red", 12000);
-            return;
-        }
-        if (!confirm(decision.message)) return;
-
-        // The designed round-trip: /load_config serves the stored file with
-        // secrets swapped for the placeholder and /store_config swaps them back,
-        // so changing one key here changes exactly one key on the device.
-        const cfgResp = await fetch("/load_config", { cache: "no-store" });
-        if (!cfgResp.ok) {
-            showNotification("Could not read the device configuration (HTTP " +
-                             cfgResp.status + "). Restore it by hand from the System page.",
-                             "red", 12000);
-            return;
-        }
-        const cfg = await cfgResp.json();
-        cfg.protocol = "poll_log";
-
-        const saveResp = await fetch("/store_config", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(cfg)
-        });
-        if (!saveResp.ok) {
-            showNotification("Could not save the configuration (HTTP " + saveResp.status +
-                             "). Restore it by hand from the System page.", "red", 12000);
-            return;
-        }
-
-        // protocol is not live-appliable, so the device reboots itself.
-        showNotification("Restoring Datalogger mode. The device is rebooting...", "yellow", 9000);
-        setTimeout(function() { window.location.reload(); }, 8000);
-    } catch (e) {
-        console.error("restoreDataloggerMode failed", e);
-        showNotification("Could not restore Datalogger mode: " + e, "red", 12000);
-    } finally {
-        if (btn) btn.disabled = false;
-    }
 }
 
 function toggleApSsid() {
@@ -4132,11 +3987,6 @@ xhttp.onload = async function() {
         document.getElementById("ssid_value").value = obj.sta_ssid;
         document.getElementById("pass_value").value = obj.sta_pass;
         document.getElementById("sta_security").value = obj.sta_security || "wpa3";			
-        if(obj.port_type == "tcp") {
-            document.getElementById("port_type").selectedIndex = "0";
-        } else if(obj.port_type == "udp") {
-            document.getElementById("port_type").selectedIndex = "1";
-        }
         if(obj.ble_status == "enable") {
             document.getElementById("ble_status").selectedIndex = 0;
         } else if(obj.ble_status == "disable") {
@@ -4208,7 +4058,6 @@ xhttp.onload = async function() {
         document.getElementById("ble_power").value = blePowerVal;
         document.getElementById("ble_power_value").textContent = blePowerVal;
 
-        document.getElementById("tcp_port_value").value = obj.port;
         document.getElementById("ap_pass_value").value = obj.ap_pass;
         document.getElementById("ble_pass_value").value = obj.ble_pass;
         document.getElementById("sleep_volt").value = obj.sleep_volt;
@@ -4716,15 +4565,13 @@ function consoleLoadChips() {
             var staUp = (d && d.sta_status === 'Connected');
             if (wifiDot) wifiDot.className = 'chip-dot ' + (staUp ? 'ok' : 'bad');
             if (wifiChip) wifiChip.textContent = staUp ? (d.sta_ip || 'connected') : 'AP only';
-            // Friendly mode labels; keep the raw protocol string in the tooltip
-            // (runbooks reference the raw names) and fall back to it for unknowns.
-            // Compact chip labels; match the leading words of the protocol <select> options
-            // (homepage_full.html ~1495) so the two stay a single friendly-name source.
-            var MODE_NAMES = {poll_log:'Datalogger', fast_log:'Passive Logger', elm327:'OBD App', auto_pid:'Legacy AutoPID', slcan:'Bench SLCAN'};
+            // The mode chip is a constant. This device compiles in one mode, the Datalogger, and
+            // the `protocol` config field is gone -- /check_status no longer carries that key, so
+            // reading it here would render an en-dash on every load. Written out rather than looked
+            // up because there is no longer a second value it could ever take.
             if (proto) {
-                var p = (d && d.protocol) || '';
-                proto.textContent = MODE_NAMES[p] || p || '\u2013';
-                proto.title = p;
+                proto.textContent = 'Datalogger';
+                proto.title = 'This device only runs the Datalogger';
             }
             if (fw) fw.textContent = (d && (d.git_version || d.fw_version)) || '\u2013';
         })

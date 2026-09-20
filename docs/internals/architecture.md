@@ -247,7 +247,7 @@ carry comments saying why — do not reorder casually.
    with the *remaining* init code. **Any reasoning of the form "init X finishes
    before task Y starts" is unsound** unless X is upstream of Y's create call.
    `csv_logger.c:1418-1430` documents having been burned by exactly this.
-2. **`app_main` returns** (`main.c:1187`) — there is no trailing `while(1)`. IDF
+2. **`app_main` returns** (`main.c:1077`) — there is no trailing `while(1)`. IDF
    deletes the main task, so after boot nothing owns "the boot", and there is
    nowhere to add post-boot supervision without creating a task.
 3. **Nothing is pinned to a core.** No project code calls
@@ -326,7 +326,7 @@ shipping (`poll_log`) configuration the ones that matter are:
 | Prio | Task | Created at | Stack | Role |
 |---|---|---|---|---|
 | 5 | `polllog_rx` | `poll_log.c:1292` | 8 KB **internal RAM** | the poll sweep; **sole TWAI consumer** |
-| 5 | `can_rx_task` / `can_tx_task` / `obd_rx_task` | `main.c:1104-1108` | shared | legacy front-end paths |
+| 5 | `can_rx_task` / `can_tx_task` / `obd_rx_task` | `main.c:986-991` | shared | legacy front-end paths |
 | 4 | `csv_logger` | `csv_logger.c:1433` | 6 KB | drains the record queue, writes SD |
 | 3 | `sync_sys_time`, `csv_retry` | | | deferred startup (`csv_retry` exists only after a skipped CSV bring-up) |
 | 2 | `led_ind_task`, `datalog_reaper` | | | housekeeping |
@@ -351,10 +351,10 @@ Two traps when adding a task:
   BYTES. Note that this differs from vanilla FreeRTOS"
   (`freertos/FreeRTOS-Kernel/include/freertos/task.h:315`, `:428`). Two call
   sites in this repo carry comments claiming *words* —
-  `can_task_stack_depth_words` (`main.c:1093`) and `sync_sys_time.c:200`.
+  `can_task_stack_depth_words` (`main.c:976`) and `sync_sys_time.c:200`.
   > **They are harmless here, and only here.** On the Xtensa port
   > `portSTACK_TYPE` is `uint8_t` (`portable/xtensa/include/freertos/portmacro.h:88`),
-  > so `sizeof(StackType_t) == 1` and words and bytes coincide. `main.c:1095`'s
+  > so `sizeof(StackType_t) == 1` and words and bytes coincide. `main.c:977`'s
   > `depth_words * sizeof(StackType_t)` is a no-op multiply, and
   > `StackType_t s_rx_task_stack[POLLLOG_RX_STACK_BYTES]` (`poll_log.c:196`) is
   > exactly 8,192 bytes, as intended. Nothing is over-allocated.
@@ -540,8 +540,10 @@ It is called from exactly two places, `poll_log.c:1249` and `fast_log.c:217`.
 That function *is* the boundary #28 should cut along: everything it touches is
 the keep side, `autopid_init()`'s extra work is the discard side. Verified: the
 task itself is created only at `autopid.c:3163`, reached solely via
-`autopid_init()`, which `main.c` calls only inside `protocol == AUTO_PID`
-branches (`main.c:916`, `:975`).
+`autopid_init()`. **`main.c` no longer calls it at all**: the `protocol` config
+field was retired and the mode dispatch collapsed to the one datalogger arm, so
+the legacy AutoPID scheduler is now unreachable from boot. What remains of
+`components/autopid` is the table/expression side that `poll_log` uses.
 
 ### There are two expression evaluators, deliberately
 

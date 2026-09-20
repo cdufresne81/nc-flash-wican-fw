@@ -52,8 +52,6 @@ const EXPORTS = [
     'effDivisor', 'readSampleEvery', 'sampleLoadFromEntries', 'predictedSweepMs',
     // --- datalogger auto-start visibility ---
     'csvAutostartLabel',
-    // --- restoring a device left in Bench SLCAN (issue #92) ---
-    'strandRestoreDecision',
 ];
 
 function stubElement() {
