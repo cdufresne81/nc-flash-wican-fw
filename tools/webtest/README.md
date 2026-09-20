@@ -65,6 +65,13 @@ non-canonical mode-23 row, and the expression-vs-read-size mismatch).
 ## Related
 
 `tools/lint_web.py` is the other web guard — it checks that every
-`getElementById` literal resolves, every inline handler exists, and the
-generated `src/homepage.html` is current. Different failure class: lint catches
-*dangling references*, these tests catch *wrong answers*. Run both.
+`getElementById` literal resolves, every inline handler exists, the generated
+`src/homepage.html` is current, and every `elements.X` read is a key
+`getElements()` returns. Different failure class: lint catches *dangling
+references*, these tests catch *wrong answers*. Run both.
+
+`loadMainJs({ strictDom: true })` makes `getElementById` return `null` for any
+id the real page does not define, instead of the default stub-for-everything.
+`submit_enable.test.mjs` uses it: that test pair is the regression guard for the
+dead "Submit changes" button, where a deleted DOM element left `submit_enable()`
+throwing on every keystroke so no setting on the page could be saved.

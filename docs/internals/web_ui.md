@@ -8,9 +8,9 @@
 | `main/web/src/main.js` | Hand-edited application JS (served as its own file) |
 | `main/web/src/homepage.html` | **Generated** minified page — never edit by hand |
 | `tools/build_web.py` | Regenerates `homepage.html` from `homepage_full.html` |
-| `tools/lint_web.py` | 3 mandatory gates (below) |
+| `tools/lint_web.py` | 4 mandatory gates (below) |
 
-Workflow for any UI change: edit `homepage_full.html` and/or `main.js` → `python tools\build_web.py` → `python tools\lint_web.py` → commit all three files. The lint gates are: (1) every `getElementById` literal resolves to an existing `id`, (2) every inline handler call resolves to a defined function, (3) `build_web --check` confirms the generated file is current. CI-independent — run them locally, always.
+Workflow for any UI change: edit `homepage_full.html` and/or `main.js` → `python tools\build_web.py` → `python tools\lint_web.py` → commit all three files. The lint gates are: (1) every `getElementById` literal resolves to an existing `id`, (2) every inline handler call resolves to a defined function, (3) `build_web --check` confirms the generated file is current, (4) every `elements.X` read is a key the `getElements()` factory actually returns. CI-independent — run them locally, always.
 
 The UI is embedded in the firmware image, so a UI-only change still requires a build + OTA flash to appear on a device.
 

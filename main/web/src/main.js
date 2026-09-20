@@ -3047,10 +3047,7 @@ function submit_enable() {
     // Validate form and enable/disable submit button
     const isValid = validateForm(elements, wifiMode);
     elements.submitButton.disabled = !isValid;
-    
-    // Configure protocol-specific settings
-    configureProtocolSettings(elements);
-    
+
     // Configure sleep and battery alert settings
     configureSleepSettings(elements);
     
@@ -3140,9 +3137,6 @@ function validateForm(elements, wifiMode) {
 
     
     // Port validation
-    if (!validatePort(elements.tcpPortValue.value)) {
-        return disableSubmitWithError("TCP Port value, min=1 max=65535", 5000);
-    }
     if (!validatePort(elements.battAlertPort.value)) {
         return disableSubmitWithError("Battery Alert Port value, min=1 max=65535", 5000);
     }
@@ -3172,12 +3166,6 @@ function validateForm(elements, wifiMode) {
     }
     
     return true;
-}
-
-function configureProtocolSettings(elements) {
-    elements.tcpPortValue.disabled = false;
-    elements.portType.selectedIndex = 0;
-    elements.portType.disabled = false;
 }
 
 function configureSleepSettings(elements) {
@@ -3817,12 +3805,21 @@ var loadedPassthrough = {
     can_mode: "normal",
     imu_threshold: "8",     // IMU only feeds the removed SmartConnect logic
     log_period: "10",       // datalog period (no UI element after the trim)
+    // DEPRECATED, delete together with the /load_config shim in v1.25.0 (config_server.c,
+    // load_config_handler). This firmware ignores all three. They are re-sent so config.json
+    // keeps them, because a firmware older than v1.23.0 hard-requires them and FACTORY-RESETS
+    // the device (owner's Wi-Fi gone) when one is missing. The shim only puts them in the
+    // /load_config reply; these entries are what puts them back in the file on Submit.
+    protocol: "poll_log",   // must match the shim's values exactly
+    port: "35000",
+    port_type: "tcp",
 };
 // "debug" (#98): has no UI element, so without it here every Submit rewrote config.json without
 // the key and silently turned debug logging back off. That was invisible while the flag only
 // controlled serial output nobody can read on this device; it now also gates the event log's
 // detail-only lines, so a Submit mid-debugging-session would quietly end the session.
 var PASSTHROUGH_KEYS = ["can_datarate", "can_mode", "imu_threshold", "log_period", "debug",
+    "protocol", "port", "port_type",   // DEPRECATED rollback shim, see loadedPassthrough above
     "home_ssid", "home_password", "home_security", "home_protocol",
     "drive_ssid", "drive_password", "drive_security", "drive_protocol",
     "drive_connection_type", "drive_mode_timeout"];
@@ -4090,7 +4087,10 @@ xhttp.onload = async function() {
 
         // Apply mode-dependent enable/disable rules after values are loaded
         try { toggleApStationWarning(); } catch(_) {}
-        try { submit_enable(); } catch(_) {}
+        // Keep the catch: the two lines below MUST still run so Store and Submit end up
+        // disabled. But do not eat the error -- a swallowed throw here is what hid the
+        // dead-Submit-button bug (#141 fallout) from the console on every page load.
+        try { submit_enable(); } catch (e) { console.error("submit_enable failed during Load()", e); }
 
         document.querySelector(".store").disabled = true;
         document.getElementById("submit_button").disabled = true;

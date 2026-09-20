@@ -4,7 +4,7 @@
 Catches the class of bug introduced by commit d372fc9 during the #5 trim, where
 removing a feature's code left dangling references behind (an undeclared var made
 the Files tab throw; an amputated population block made Submit clobber settings).
-Three checks:
+Four checks:
 
   1. Every getElementById("X") string-literal in src/main.js resolves to an
      id="X" defined in homepage_full.html (or an id assigned to an element in
@@ -13,6 +13,10 @@ Three checks:
      defined in src/main.js.
   3. src/homepage.html is not stale (delegates to build_web.py --check; skipped
      with a warning when node/npx is unavailable).
+  4. Every `elements.X` read in src/main.js is a key the getElements() factory
+     actually returns. Check 1 only sees getElementById() string literals, so a
+     reference reached through the elements object is invisible to it -- that is
+     how #141 shipped a permanently greyed-out "Submit changes" button.
 
 Usage:
     python tools/lint_web.py               # all checks; exit 1 on any failure
@@ -96,6 +100,33 @@ def check_handlers(html: str, js: str) -> list:
     return missing
 
 
+def get_elements_keys(js: str):
+    """Keys of the object literal returned by getElements(); None if the function is gone."""
+    m = re.search(r"function\s+getElements\s*\(\)\s*\{\s*return\s*\{(.*?)\}\s*;", js, re.S)
+    if m is None:
+        return None
+    return set(re.findall(r"^\s*([A-Za-z_$][\w$]*)\s*:", m.group(1), re.M))
+
+
+def elements_reads(js: str) -> set:
+    return set(re.findall(r"\belements\.([A-Za-z_$][\w$]*)", js))
+
+
+def check_elements_keys(js: str) -> list:
+    """Every `elements.X` read must be a key getElements() actually returns.
+
+    Check 1 only sees getElementById("literal") strings. A reference that travels through
+    the elements object is invisible to it -- which is exactly how #141 shipped a dead
+    "Submit changes" button: it deleted tcpPortValue/portType from the factory and from the
+    HTML but left validateForm() reading elements.tcpPortValue.value, so submit_enable()
+    threw on every keystroke and the button could never turn on.
+    """
+    keys = get_elements_keys(js)
+    if keys is None:
+        return ["getElements() not found in main.js (renamed? update lint_web.py)"]
+    return sorted(n for n in elements_reads(js) if n not in keys)
+
+
 def check_build(no_build_check: bool) -> tuple:
     """Returns (ok: bool, message: str). Soft-skip when node/npx is missing."""
     if no_build_check:
@@ -154,6 +185,15 @@ def main() -> None:
         failed = True
         print("FAIL check 3: src/homepage.html is stale or build failed:")
         print(f"    {build_msg}")
+
+    dangling_keys = check_elements_keys(js)
+    if dangling_keys:
+        failed = True
+        print("FAIL check 4: elements.X reads that getElements() does not return:")
+        for n in dangling_keys:
+            print(f"    - {n}")
+    else:
+        print("ok  check 4: every elements.X read is a key of getElements()")
 
     sys.exit(1 if failed else 0)
 
