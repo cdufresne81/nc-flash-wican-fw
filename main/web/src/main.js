@@ -4586,19 +4586,10 @@ function consoleLoadChips() {
         .then(function(d) {
             var wifiDot = document.getElementById('console_dot_wifi');
             var wifiChip = document.getElementById('console_chip_wifi');
-            var proto = document.getElementById('console_chip_proto');
             var fw = document.getElementById('console_chip_fw');
             var staUp = (d && d.sta_status === 'Connected');
             if (wifiDot) wifiDot.className = 'chip-dot ' + (staUp ? 'ok' : 'bad');
             if (wifiChip) wifiChip.textContent = staUp ? (d.sta_ip || 'connected') : 'AP only';
-            // The mode chip is a constant. This device compiles in one mode, the Datalogger, and
-            // the `protocol` config field is gone -- /check_status no longer carries that key, so
-            // reading it here would render an en-dash on every load. Written out rather than looked
-            // up because there is no longer a second value it could ever take.
-            if (proto) {
-                proto.textContent = 'Datalogger';
-                proto.title = 'This device only runs the Datalogger';
-            }
             if (fw) fw.textContent = (d && (d.git_version || d.fw_version)) || '\u2013';
         })
         .catch(function() {});
