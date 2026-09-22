@@ -2537,7 +2537,8 @@ static const httpd_uri_t wake_probe_uri = {
  *   state       -- "off"       sleep is disabled in config, or the state machine has published
  *                              nothing yet. The publish site is gated on sleep_en == 1, so with
  *                              sleep off the peek simply fails -- which is what we report, and is
- *                              what stops the UI rendering "undefined".
+ *                              what stops the UI rendering "undefined". Only state and secs_*
+ *                              are gated this way; voltage below is not.
  *                  "normal"    awake, no countdown running.
  *                  "countdown" counting down to sleep; secs_left is meaningful.
  *                  "sleeping" / "waking" -- present for completeness. Never observable in practice:
@@ -2550,18 +2551,22 @@ static const httpd_uri_t wake_probe_uri = {
  *                  Taken from the published struct, NOT re-read from config here: the task and a
  *                  local read fall back to different values on a bad parse (120000 ms vs 0), and a
  *                  secs_total of 0 would make elapsed clamp to 0 so the banner never appeared.
- *   voltage     -- the reading that started the countdown, so the banner can say why.
+ *   voltage     -- the latest battery reading, refreshed every 500 ms while the device is awake,
+ *                  or JSON null when the ADC has never published one. Read from its OWN queue via
+ *                  sleep_mode_get_voltage(), NOT from the struct above: every publisher of the
+ *                  sleep-state queue sits behind the sleep_en == 1 gate, so that copy reads 0.00
+ *                  forever with sleep disabled. The voltage task runs unconditionally, so this
+ *                  field is live either way. The Console page's Batt chip renders it (#82), and
+ *                  null is what makes "no reading" distinguishable from a genuine 0 V.
  * ---------------------------------------------------------------------------------------------- */
 static esp_err_t sleep_status_handler(httpd_req_t *req)
 {
     sleep_state_info_t info = {0};
     const char *state_str = "off";
     unsigned secs_left = 0, secs_total = 0;
-    float voltage = 0.0f;
 
     if (sleep_mode_get_state(&info) == ESP_OK)
     {
-        voltage    = info.voltage;
         secs_total = (unsigned)(info.total_ms / 1000u);
         switch (info.state)
         {
@@ -2575,10 +2580,19 @@ static esp_err_t sleep_status_handler(httpd_req_t *req)
         }
     }
 
+    /* Rendered as a string fragment so the no-reading case can be a bare JSON null rather than a
+     * fake 0.00 -- the browser has to tell "never measured" from "genuinely zero volts". */
+    float v = 0.0f;
+    char vbuf[16];
+    if (sleep_mode_get_voltage(&v) == ESP_OK)
+        snprintf(vbuf, sizeof(vbuf), "%.2f", (double)v);
+    else
+        strlcpy(vbuf, "null", sizeof(vbuf));
+
     char body[160];
     snprintf(body, sizeof(body),
-             "{\"state\":\"%s\",\"secs_left\":%u,\"secs_total\":%u,\"voltage\":%.2f}",
-             state_str, secs_left, secs_total, (double)voltage);
+             "{\"state\":\"%s\",\"secs_left\":%u,\"secs_total\":%u,\"voltage\":%s}",
+             state_str, secs_left, secs_total, vbuf);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, body);

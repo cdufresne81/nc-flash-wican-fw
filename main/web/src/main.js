@@ -4259,11 +4259,29 @@ function sleep_status_cadence(ms) {
     window._sleepStatusTimer = setInterval(sleep_status_tick, ms);
 }
 
+// The Console page's Batt chip (#82). Fed from the /sleep_status poll that already runs on every
+// tab, so no request and no timer is added for it. A non-number -- JSON null from a device that has
+// never measured, or our own null on a dead link -- must render the same en-dash placeholder the
+// other chips start at, never a plausible-looking number: this is the value you read to decide
+// whether the engine is running. Note typeof null === 'object', so a genuine 0.00 still prints.
+function consoleBattChip(v) {
+    var el = document.getElementById('console_chip_batt');
+    if (!el) return;
+    el.textContent = (typeof v === 'number') ? (v.toFixed(2) + ' V') : '–';
+}
+
 function sleep_status_tick() {
     if (window._sleepStatusInFlight) return;
     window._sleepStatusInFlight = true;
     fetch('/sleep_status').then(function(r) { return r.json(); }).then(function(j) {
         window._sleepFails = 0;
+        // Deliberately ABOVE the #sleep_banner guard below, and above the state branches, so the chip
+        // never depends on the banner existing or on which state the device is in. Today the banner
+        // sits in .banner-stack outside every .tabcontent (homepage_full.html ~1140), so it IS present
+        // on the Console tab and the guard would not actually fire -- but main.js is also loaded by
+        // wifi_diag.html, which has no banner at all, and moving the banner into a tab later would
+        // silently freeze this chip at its placeholder. Cheap to keep correct, expensive to debug.
+        consoleBattChip(j ? j.voltage : null);
         var el = sleep_banner_el();
         if (!el) return;
         var counting = !!(j && j.state === 'countdown');
@@ -4306,6 +4324,9 @@ function sleep_status_tick() {
         sleep_banner_render();
     }).catch(function() {
         window._sleepFails = (window._sleepFails || 0) + 1;
+        // Same threshold as the banner's: a stale voltage is at its most misleading exactly when the
+        // device has stopped answering, so blank it rather than leave the last reading on screen.
+        if (window._sleepFails >= SLEEP_LOST_POLLS) consoleBattChip(null);
         // Only a banner that was already counting may turn into "probably slept". Otherwise a reboot
         // or a dropped WiFi link would conjure a sleep warning out of nothing.
         if (window._sleepDeadline != null && window._sleepFails >= SLEEP_LOST_POLLS) {
@@ -4565,19 +4586,10 @@ function consoleLoadChips() {
         .then(function(d) {
             var wifiDot = document.getElementById('console_dot_wifi');
             var wifiChip = document.getElementById('console_chip_wifi');
-            var proto = document.getElementById('console_chip_proto');
             var fw = document.getElementById('console_chip_fw');
             var staUp = (d && d.sta_status === 'Connected');
             if (wifiDot) wifiDot.className = 'chip-dot ' + (staUp ? 'ok' : 'bad');
             if (wifiChip) wifiChip.textContent = staUp ? (d.sta_ip || 'connected') : 'AP only';
-            // The mode chip is a constant. This device compiles in one mode, the Datalogger, and
-            // the `protocol` config field is gone -- /check_status no longer carries that key, so
-            // reading it here would render an en-dash on every load. Written out rather than looked
-            // up because there is no longer a second value it could ever take.
-            if (proto) {
-                proto.textContent = 'Datalogger';
-                proto.title = 'This device only runs the Datalogger';
-            }
             if (fw) fw.textContent = (d && (d.git_version || d.fw_version)) || '\u2013';
         })
         .catch(function() {});
