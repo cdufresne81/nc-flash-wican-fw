@@ -21,6 +21,8 @@
  * Keep this file free of ESP-IDF includes -- tools/hosttest/run.sh builds it with a
  * stock host compiler. */
 
+#include <stddef.h>
+
 #include "csv_bringup_logic.h"
 
 csv_bringup_decision_t csv_bringup_decide(uint32_t *guard, uint32_t *skip_count, bool *skipped)
@@ -67,9 +69,17 @@ bool csv_guard_clear_due(int64_t now_us, int64_t task_start_us)
     return (now_us - task_start_us) > CSV_GUARD_STABLE_US;
 }
 
-int8_t csv_manual_mode_next(int8_t mode, bool ignition_on, bool datalog_parked)
+const char *csv_trip_end_reason(bool ignition_on, bool ecu_silent, bool sleeping)
 {
-    if (mode == CSV_MANUAL_OFF && !ignition_on && !datalog_parked)
+    if (sleeping)     { return "going to sleep"; }
+    if (ecu_silent)   { return "ECU stopped answering"; }
+    if (!ignition_on) { return "ignition is off"; }
+    return NULL;
+}
+
+int8_t csv_manual_mode_next(int8_t mode, bool trip_over, bool datalog_parked)
+{
+    if (mode == CSV_MANUAL_OFF && trip_over && !datalog_parked)
     {
         return CSV_MANUAL_AUTO;
     }

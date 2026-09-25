@@ -139,12 +139,19 @@ static void t2_boot_loop_is_still_bounded(void)
  *   12:44:06  DATALOG_CLOSE (manual_stop)
  *   12:44:20  IGNITION_ON, 104s -> nothing recorded
  * ------------------------------------------------------------------------ */
+/* Is the trip over, given the three signs? Reads like the writer's call site. */
+static bool trip_over(bool ignition_on, bool ecu_silent, bool sleeping)
+{
+    return csv_trip_end_reason(ignition_on, ecu_silent, sleeping) != NULL;
+}
+
 static void t3_manual_stop_is_per_trip(void)
 {
     banner("T3: manual Stop ends the trip, it does not disable auto-logging");
 
     /* Ignition off after a manual Stop -> the override clears itself. */
-    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, false, false) == CSV_MANUAL_AUTO,
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, trip_over(false, false, false), false)
+              == CSV_MANUAL_AUTO,
           "ignition-off clears a manual Stop");
 
     /* ...so the next key-on records, which is what did not happen at 12:44:20. */
@@ -152,24 +159,78 @@ static void t3_manual_stop_is_per_trip(void)
           "the next trip records normally");
 
     /* Stop must still hold for the trip it stopped. */
-    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, true, false) == CSV_MANUAL_OFF,
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, trip_over(true, false, false), false)
+              == CSV_MANUAL_OFF,
           "Stop holds while the ignition is still on");
 
     /* A host session owns the forced-off state; only datalog_restore_mode() lifts it. */
-    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, false, true) == CSV_MANUAL_OFF,
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, trip_over(false, false, false), true)
+              == CSV_MANUAL_OFF,
           "a host-parked datalog is never un-parked by the ignition");
 
     /* The reason this is a LEVEL rule and not an edge one: if the park happens to cover
      * the ignition-off transition, an edge-triggered clear would consume the only edge it
      * was ever going to see and Stop would latch until reboot -- the original bug. As a
      * level, the very next pass after the park lifts still clears it. */
-    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, false, false) == CSV_MANUAL_AUTO,
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, trip_over(false, false, false), false)
+              == CSV_MANUAL_AUTO,
           "and clears on the next pass once the park lifts, with no edge left to catch");
 
-    CHECK(csv_manual_mode_next(CSV_MANUAL_ON, false, false) == CSV_MANUAL_ON,
+    CHECK(csv_manual_mode_next(CSV_MANUAL_ON, trip_over(false, false, false), false)
+              == CSV_MANUAL_ON,
           "bench FORCE_ON survives an ignition cycle");
-    CHECK(csv_manual_mode_next(CSV_MANUAL_AUTO, false, false) == CSV_MANUAL_AUTO,
+    CHECK(csv_manual_mode_next(CSV_MANUAL_AUTO, trip_over(false, false, false), false)
+              == CSV_MANUAL_AUTO,
           "AUTO is unchanged");
+}
+
+/* ---------------------------------------------------------------------------
+ * T3b -- #109, a real drive on v1.24.0 (gperez10, 2026-09-24):
+ *   18:16:59  DATALOG_CLOSE (manual_stop)
+ *   19:08:44  ENGINE_OFF / IGNITION_OFF  "ECU stopped answering, 13.17V"
+ *   19:30:36  entering sleep (12.90V)            <- voltage never reached the 12.7 V OFF edge
+ *   19:31:06  CAN_WAKE, ENGINE_ON 13.25V         <- drive back, nothing recorded
+ *   19:52:30  manual stop cleared                <- only when a key-on load dragged it down
+ * ------------------------------------------------------------------------ */
+static void t3b_trip_ends_without_the_voltage(void)
+{
+    banner("T3b: the ECU going silent or a sleep ends the trip, whatever the voltage says");
+
+    /* 19:08:44 -- the ECU went silent with the battery still reading "on". */
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, trip_over(true, true, false), false)
+              == CSV_MANUAL_AUTO,
+          "a silent ECU clears Stop with the voltage still above the OFF edge");
+
+    /* 19:30:36 -- the sleep. With sleep_volt 12.90 above the 12.7 V OFF edge the voltage
+     * sign can never fire first; the sleep sign must end the trip on its own. */
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, trip_over(true, false, true), false)
+              == CSV_MANUAL_AUTO,
+          "going to sleep clears Stop with the voltage still above the OFF edge");
+
+    /* The trip Stop was pressed on is still protected: key on, ECU answering, awake. */
+    CHECK(trip_over(true, false, false) == false,
+          "no sign -> the trip is not over");
+
+    /* The host park still outranks every sign, the new ones included. */
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, trip_over(true, true, false), true)
+              == CSV_MANUAL_OFF,
+          "a silent ECU does not un-park a host session");
+    CHECK(csv_manual_mode_next(CSV_MANUAL_OFF, trip_over(true, false, true), true)
+              == CSV_MANUAL_OFF,
+          "a sleep does not un-park a host session");
+
+    /* FORCE_ON is bench-only and survives every sign. */
+    CHECK(csv_manual_mode_next(CSV_MANUAL_ON, trip_over(false, true, true), false)
+              == CSV_MANUAL_ON,
+          "bench FORCE_ON survives ECU silence and sleep");
+
+    /* The event line names the sign that fired, most decisive first. */
+    CHECK(strcmp(csv_trip_end_reason(false, true, true), "going to sleep") == 0,
+          "sleep is named first");
+    CHECK(strcmp(csv_trip_end_reason(false, true, false), "ECU stopped answering") == 0,
+          "then a silent ECU");
+    CHECK(strcmp(csv_trip_end_reason(false, false, false), "ignition is off") == 0,
+          "then the voltage, with the wording the event log already used");
 }
 
 /* ---------------------------------------------------------------------------
@@ -245,6 +306,7 @@ int main(void)
     t1_reboot_inside_guard_window();
     t2_boot_loop_is_still_bounded();
     t3_manual_stop_is_per_trip();
+    t3b_trip_ends_without_the_voltage();
     t4_gate_truth_table_is_unchanged();
     t5_countdown_and_boundaries();
 

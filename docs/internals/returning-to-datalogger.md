@@ -142,8 +142,8 @@ If the park flag goes down some other way, the forced-off state can be left behi
 sweeps normally, the Console looks healthy, and no file is ever opened.
 
 This one **does** self-heal, but only on a specific condition: a forced-off writer reverts to
-automatic once the **ignition is off** and the park flag is down (`csv_manual_mode_next()`). So it
-clears itself at the end of the drive and the next key-on records normally — but it will not clear
+automatic once the **trip is over** (ECU silent, voltage ignition off, or going to sleep) and the
+park flag is down (`csv_manual_mode_next()`). So it clears itself at the end of the drive and the next key-on records normally — but it will not clear
 while you sit there with the key on wondering why nothing is recording.
 
 ## Layer 2 — the recording gates

@@ -1938,6 +1938,7 @@ void poll_log_init(char *id, uint32_t log_period)
      * csv_logger, not the reverse. Registers the RECORDING gate, not poll_log_ignition_on --
      * see the WATCH vs FAST block near the top for why those are different questions. */
     csv_logger_set_engine_state_fn(poll_log_gate_open);
+    csv_logger_set_ecu_silent_fn(poll_log_ecu_silent);   /* ends the trip for a manual Stop (#109) */
 
     /* The gate's voltage threshold. Read once here rather than per sweep: changing engine_volt
      * goes through /store_config, which reboots, so it cannot change under a running task. */
@@ -2015,6 +2016,12 @@ bool poll_log_quiesced(void)
 bool poll_log_ecu_answering(void)
 {
     return s_active && s_ecu_answering && !can_should_park();
+}
+
+/* Trip-over sign for the CSV logger's manual Stop (#109). See poll_log.h for the polarity. */
+bool poll_log_ecu_silent(void)
+{
+    return s_active && s_quiesced && !can_should_park();
 }
 
 /* The RECORDING gate (see the WATCH vs FAST block near the top). Returns true when POLL_LOG is not

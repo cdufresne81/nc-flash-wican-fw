@@ -99,12 +99,28 @@ void csv_bringup_mark_stable(uint32_t *guard, uint32_t *skip_count, bool *skippe
 /* Has the writer run long enough for the crash guard to be considered proven? */
 bool csv_guard_clear_due(int64_t now_us, int64_t task_start_us);
 
+/* Why the current trip is over, in plain words for the event log, or NULL while it is not.
+ *
+ * Three independent signs, any one of which ends the trip (#109):
+ *   sleeping     -- the device is going to sleep. A sleep always ends a trip.
+ *   ecu_silent   -- the ECU stopped answering our polls (poll_log quiesced the bus).
+ *   !ignition_on -- battery voltage fell below the engine_volt OFF edge.
+ *
+ * The voltage sign alone was NOT enough, and it failed on a real car: a battery fresh
+ * from a 52-minute drive rested at 12.9-13.2 V, above the 12.7 V OFF edge, until the
+ * device slept at sleep_volt 12.90 V. The writer is frozen during sleep and the
+ * alternator is already charging when it wakes, so the voltage never read "off" and
+ * a manual Stop swallowed the drive out and the drive back. With sleep_volt above the
+ * OFF edge that miss is guaranteed, not bad luck -- so the ECU and sleep signs end the
+ * trip without any help from the voltage. */
+const char *csv_trip_end_reason(bool ignition_on, bool ecu_silent, bool sleeping);
+
 /* The manual override mode for the next writer pass.
  *
  * A manual Stop means "stop this trip", not "disable auto-logging until someone reboots":
- * it clears back to AUTO once the ignition is off, so the next key-on records normally.
- * FORCE_ON is deliberately untouched -- bench work relies on it surviving a voltage that
- * flaps across the ignition threshold.
+ * it clears back to AUTO once the trip is over (csv_trip_end_reason() != NULL), so the
+ * next key-on records normally. FORCE_ON is deliberately untouched -- bench work relies
+ * on it surviving a voltage that flaps across the ignition threshold.
  *
  * A LEVEL rule, not an edge one, and that distinction is load-bearing: an edge-triggered
  * clear is consumed by the single ignition-off transition it sees, so if that transition
@@ -115,7 +131,7 @@ bool csv_guard_clear_due(int64_t now_us, int64_t task_start_us);
  * datalog_parked is a HARD exclusion: while a host holds the datalog park lease the
  * forced-off state belongs to that host session and only datalog_restore_mode() may lift
  * it. An ignition cycle mid-flash must never restart the producer under a host. */
-int8_t csv_manual_mode_next(int8_t mode, bool ignition_on, bool datalog_parked);
+int8_t csv_manual_mode_next(int8_t mode, bool trip_over, bool datalog_parked);
 
 /* The logging gate, verbatim. Extracted only so the host tests can pin it: the v1.18
  * investigation cleared this expression, so any change to its truth table is a

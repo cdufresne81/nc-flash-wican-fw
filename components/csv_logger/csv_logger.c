@@ -119,9 +119,9 @@ static int64_t csv_sd_retry_after_ms = 0;
 // CSV_MANUAL_AUTO/ON/OFF live in csv_bringup_logic.h so the host tests assert on the same
 // values the writer compares against.
 //
-// STOP is per-trip, not permanent: the writer clears OFF back to AUTO on the next
-// ignition-off edge (see csv_manual_mode_next). ON is not cleared -- bench FORCE_ON has to
-// survive a voltage that flaps across the ignition threshold.
+// STOP is per-trip, not permanent: OFF clears back to AUTO once the trip is over -- ignition
+// off, ECU silent, or going to sleep (see csv_manual_stop_rearm). ON is not cleared -- bench
+// FORCE_ON has to survive a voltage that flaps across the ignition threshold.
 static volatile int8_t csv_manual_mode = CSV_MANUAL_AUTO;
 
 // One-shot trip marker (web "Mark event" button). Written 1 by the httpd handler task
@@ -177,6 +177,11 @@ static csv_column_provider_t csv_col_provider = NULL;
 // Engine-running predicate (registered by poll_log). NULL = no provider -> gate degrades to the
 // voltage ignition gate. Written once at boot before the writer runs; read lock-free in the gate.
 static csv_engine_state_fn_t csv_engine_state_fn = NULL;
+
+// "The ECU stopped answering" (registered by poll_log, #109). One of the three signs that end a
+// trip and clear a manual Stop. NULL = no provider -> only the voltage and sleep signs apply.
+// Written once at boot before the writer runs; read lock-free.
+static csv_ecu_silent_fn_t csv_ecu_silent_fn = NULL;
 
 // Measured-rate provider for the Auto grid (registered by poll_log, issue #23). NULL or a 0
 // return -> the Auto grid falls back to CSV_GRID_HZ_DEFAULT. Written once at boot; read
@@ -581,9 +586,35 @@ void csv_logger_set_engine_state_fn(csv_engine_state_fn_t fn)
     csv_engine_state_fn = fn;
 }
 
+void csv_logger_set_ecu_silent_fn(csv_ecu_silent_fn_t fn)
+{
+    csv_ecu_silent_fn = fn;
+}
+
 void csv_logger_set_rate_fn(csv_rate_fn_t fn)
 {
     csv_rate_fn = fn;
+}
+
+// Clear a manual Stop back to AUTO once the trip is over (#109). Called by the writer on every
+// ignition poll, and once by the sleep teardown: with Stop on there is no open session, so the
+// teardown does not wait for the writer, and the writer may never get a pass in before the
+// sleep freezes it. Both callers can only move OFF -> AUTO, so a race between them costs at
+// worst a duplicate event line.
+static void csv_manual_stop_rearm(bool ignition_on, bool sleeping)
+{
+    const int8_t mode = csv_manual_mode;
+    if (mode != CSV_MANUAL_OFF) { return; }   // cheap exit; the rule itself is csv_manual_mode_next
+
+    const bool ecu_silent = (csv_ecu_silent_fn != NULL) && csv_ecu_silent_fn();
+    const char *why = csv_trip_end_reason(ignition_on, ecu_silent, sleeping);
+    const int8_t next = csv_manual_mode_next(mode, why != NULL, can_datalog_park_active());
+    if (next != mode)
+    {
+        csv_manual_mode = next;
+        event_log_emit(EVL_INFO, "manual stop cleared -- %s, auto logging resumes on the "
+                                 "next trip", why);
+    }
 }
 
 // Current FIXED-grid period in ms. Manual mode derives it from the latched csv_grid_hz; Auto
@@ -684,14 +715,7 @@ static void csv_logger_task(void *pvParameters)
             // rather than on the off EDGE -- an edge is consumed once, so an edge that
             // landed under a host park lease would be the only one we ever saw and Stop
             // would latch again. See csv_manual_mode_next().
-            const int8_t next_mode = csv_manual_mode_next(csv_manual_mode, ignition_on,
-                                                          can_datalog_park_active());
-            if (next_mode != csv_manual_mode)
-            {
-                csv_manual_mode = next_mode;
-                event_log_emit(EVL_INFO, "manual stop cleared -- ignition is off, auto "
-                                         "logging resumes on the next trip");
-            }
+            csv_manual_stop_rearm(ignition_on, csv_sleep_requested);
         }
 
         // Log while ignition is on (engine running). Ignition is derived from battery
@@ -929,13 +953,14 @@ esp_err_t csv_logger_set_manual_override(bool enable)
         // STOP: authoritative force-off for the REST OF THIS TRIP. The writer task stays
         // alive (never deleted at runtime) and closes the current session on its next pass
         // (the close logic runs every loop, even with no records). Logging stays off even
-        // if ignition reads on -- until the next START, or until the ignition goes off,
-        // which returns the mode to AUTO so the following key-on records normally.
+        // if ignition reads on -- until the next START, or until the trip is over (ignition
+        // off, ECU silent, or sleep), which returns the mode to AUTO so the following key-on
+        // records normally.
         //
         // That last clause is the fix for a real loss: Stop used to hold until a reboot, so
         // one press silently disabled auto-logging for every subsequent trip. The rearm
-        // lives in the writer's ignition tracker (csv_manual_mode_next), not here, because
-        // only the writer sees the debounced edge.
+        // lives in csv_manual_stop_rearm(), not here, because only the writer sees the
+        // debounced ignition state.
         csv_manual_mode = CSV_MANUAL_OFF;
     }
     return ESP_OK;
@@ -1613,6 +1638,12 @@ bool csv_logger_bringup_skipped(void)
 void csv_logger_set_sleep_requested(bool sleeping)
 {
     csv_sleep_requested = sleeping;
+    if (sleeping)
+    {
+        // A sleep ends the trip. ignition_on is passed as true because the sleep sign alone
+        // decides it here -- the writer's voltage state is not ours to read from this task.
+        csv_manual_stop_rearm(true, true);
+    }
 }
 
 void csv_logger_start_at_boot(void)

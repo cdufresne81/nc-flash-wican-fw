@@ -112,6 +112,18 @@ uint32_t poll_log_bus_idle_ms(void);
 bool     poll_log_ecu_answering(void);
 
 /*
+ * "The ECU stopped answering": true while the poller has quiesced the bus because the ECU went
+ * silent (the same moment the IGNITION_OFF event line is written). Registered with the CSV logger
+ * as a sign that the trip is over, which clears a manual Stop (#109).
+ *
+ * Not simply poll_log_quiesced(): while the poller is parked (flash, host claim, datalog pause,
+ * sleep fence) nothing keeps s_quiesced fresh, so a frozen true is not evidence of anything.
+ */
+/* POLARITY: fails CLOSED (false when POLL_LOG is inactive or parked). A false only means a manual
+ * Stop waits for the voltage or sleep sign instead -- the behaviour before #109. */
+bool     poll_log_ecu_silent(void);
+
+/*
  * Request a live PID-table hot-swap (issue #39). Called on the httpd task after
  * auto_pid.json is rewritten; sets a flag only -- the re-parse + atomic swap runs on the
  * poll task at its safe point (deferred while a CSV trip is open). Returns true if queued,
