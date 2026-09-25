@@ -31,6 +31,7 @@
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "restart_tracker.h"
+#include "config_server.h"   /* config_server_flash_fence (#145) */
 #include "sleep_mode.h"
 #include "hw_config.h"
 #include "freertos/FreeRTOS.h"
@@ -68,11 +69,23 @@ static int cmd_system(int argc, char **argv)
     }
 
     if (system_args.reboot->count > 0) {
+        /* #145: never reboot into a running ECU flash or a live NC Flash session. */
+        flash_fence_t fence = config_server_flash_fence();
+        if (fence != FLASH_FENCE_CLEAR) {
+            cmdline_printf("Refused: %s\n", flash_fence_message(fence));
+            return 1;
+        }
+        /* Through the web server's reboot timer, not a delay + direct restart: that raises the
+         * pending flag a fast-write checks before it starts, and the timer waits out one that got
+         * in first. A direct restart 2 s from now could land in TransferData. */
+        if (!config_server_request_reboot(RESTART_TRACKER_PLANNED_REASON_USER_REQUEST,
+                                          RESTART_TRACKER_SOURCE_CMDLINE,
+                                          RESTART_TRACKER_FLAG_NONE))
+        {
+            cmdline_printf("Error: reboot could not be scheduled\n");
+            return 1;
+        }
         cmdline_printf("System will reboot now...\n");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        restart_tracker_restart(RESTART_TRACKER_PLANNED_REASON_USER_REQUEST,
-                                RESTART_TRACKER_SOURCE_CMDLINE,
-                                RESTART_TRACKER_FLAG_NONE);
         return 0;
     }
 

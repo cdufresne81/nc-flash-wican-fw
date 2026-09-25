@@ -20,6 +20,7 @@
 #include "types.h"
 #include "sdcard.h"
 #include "event_log.h"
+#include "config_server.h"   /* the #145 reboot/OTA fence */
 
 #define TAG "ncflash_fastwrite"
 
@@ -554,6 +555,24 @@ int ncflash_fast_write(const uint8_t *buf, int len, QueueHandle_t *tx_queue)
     /* Claim the bus BEFORE suspending can_rx_task (plan §5.2): the datalogger poll
      * task parks on this bit, so no stray 0x7E0 can corrupt the UDS session. */
     can_flash_active_set();
+
+    /* #145: never start into a reboot or a firmware update. The bit goes up FIRST and the two
+     * flags are read after it; config_server_schedule_reboot() and the OTA handler do the mirror
+     * image (raise their flag, then read this bit), so whichever side starts second sees the other.
+     * Nothing has touched the ECU yet, so refusing here is free. FWERR st=14 (before any NCFWSYNC)
+     * tells the host at once; without it the host waited out its idle timeout or saw the socket
+     * drop, and reported what reads like an interrupted flash when the ECU was never touched. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!flash_fence_write_may_start(config_server_reboot_pending(), config_server_ota_active()))
+    {
+        can_flash_active_clear();
+        s_fwbusy = 0;
+        fw_emit_err(tx_queue, 0, 14, 0);
+        ESP_LOGW(TAG, "fast write refused: the adapter is rebooting or updating its firmware");
+        event_log_emit(EVL_WARN, "flash refused before it started (ECU not touched): the adapter is %s",
+                       config_server_ota_active() ? "updating its firmware" : "about to reboot");
+        return -1;
+    }
 
     /* Variables the cleanup label touches MUST be declared before any goto. */
     FILE *f = NULL;

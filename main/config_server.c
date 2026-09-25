@@ -120,6 +120,11 @@ static uint8_t ws_led;
 static restart_tracker_planned_reason_t s_reboot_reason = RESTART_TRACKER_PLANNED_REASON_USER_REQUEST;
 static restart_tracker_source_t s_reboot_source = RESTART_TRACKER_SOURCE_WEB_UI;
 static uint32_t s_reboot_flags = RESTART_TRACKER_FLAG_NONE;
+/* #145: raised by config_server_schedule_reboot(), lowered only if the timer fails to start (the
+ * reboot clears it otherwise). Read by
+ * the fast-write codec's start check. Single machine word; see the fence note on the codec side. */
+static volatile bool s_reboot_pending = false;
+static bool s_reboot_deferred_logged = false;   /* timer task only */
 
 httpd_handle_t server = NULL;
 char *device_config_file = NULL;
@@ -221,14 +226,84 @@ TimerHandle_t xrestartTimer;
 // Returns false on any parse/validation error (caller decides recovery).
 static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg);
 
-static void config_server_schedule_reboot(restart_tracker_planned_reason_t reason,
+static bool config_server_schedule_reboot(restart_tracker_planned_reason_t reason,
 								  restart_tracker_source_t source,
 								  uint32_t flags)
 {
 	s_reboot_reason = reason;
 	s_reboot_source = source;
 	s_reboot_flags = flags;
-	xTimerStart(xrestartTimer, 0);
+	/* Raised BEFORE the timer starts, and fenced, so a fast-write that sets FLASH_ACTIVE_BIT after
+	 * this point is guaranteed to see it and refuse -- and one that set the bit before it is
+	 * guaranteed to be seen by the timer callback, which then waits. Neither order can end in a
+	 * reboot during TransferData. */
+	s_reboot_pending = true;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (xrestartTimer == NULL || xTimerStart(xrestartTimer, 0) != pdPASS)
+	{
+		/* No reboot is coming, so do not leave every later flash refused as "about to reboot". */
+		s_reboot_pending = false;
+		ESP_LOGE(TAG, "reboot not scheduled: restart timer unavailable");
+		return false;
+	}
+	return true;
+}
+
+bool config_server_request_reboot(restart_tracker_planned_reason_t reason,
+								  restart_tracker_source_t source,
+								  uint32_t flags)
+{
+	return config_server_schedule_reboot(reason, source, flags);
+}
+
+/* --- ECU-flash fence (#145) ---------------------------------------------------------------
+ * The adapter always knew when a flash was running; until #145 only the sleep path asked. */
+flash_fence_t config_server_flash_fence(void)
+{
+	can_coexist_snapshot_t s;
+	can_coexist_snapshot(&s);
+	const flash_fence_in_t in = {
+		.flash_active      = s.flash_active,
+		.claim_raised      = s.host_bus_claimed,
+		.claim_expired     = s.claim_expired,
+		.claim_owner_alive = s.claim_owner_alive,
+	};
+	return flash_fence_eval(&in);
+}
+
+bool config_server_reboot_pending(void)
+{
+	return s_reboot_pending;
+}
+
+/* Refuse an HTTP request with 409 Conflict while the fence is up. Returns true when it refused, in
+ * which case the caller must return without doing anything else. `level` is passed in rather than
+ * read here so a caller can narrow it first (flash_fence_for_sd). */
+static bool config_server_refuse_if_fenced(httpd_req_t *req, flash_fence_t level, const char *action)
+{
+	if (level == FLASH_FENCE_CLEAR)
+	{
+		return false;
+	}
+	cJSON *root = cJSON_CreateObject();
+	char *body = NULL;
+	if (root != NULL)
+	{
+		cJSON_AddBoolToObject(root, "ok", false);
+		cJSON_AddStringToObject(root, "error", "flash_fence");
+		cJSON_AddStringToObject(root, "fence", flash_fence_name(level));
+		cJSON_AddStringToObject(root, "msg", flash_fence_message(level));
+		body = cJSON_PrintUnformatted(root);
+		cJSON_Delete(root);
+	}
+	httpd_resp_set_status(req, "409 Conflict");
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_sendstr(req, body ? body : "{\"ok\":false,\"error\":\"flash_fence\"}");
+	cJSON_free(body);
+	event_log_emit(EVL_WARN, "refused %s: %s", action,
+	               level == FLASH_FENCE_FLASHING ? "an ECU flash is running"
+	                                             : "NC Flash is using the ECU");
+	return true;
 }
 
 void config_server_reboot(void)
@@ -787,6 +862,14 @@ static esp_err_t store_config_handler(httpd_req_t *req)
 		return ESP_ERR_INVALID_ARG;
 	}
 
+	// #145: refuse before config.json is touched. Refusing only the reboot would be dishonest --
+	// the saved file would still apply at the next boot -- and a save that turns out live-only is
+	// not worth reasoning about mid-flash. The body is left unread; httpd discards it.
+	if (config_server_refuse_if_fenced(req, config_server_flash_fence(), "config save"))
+	{
+		return ESP_OK;
+	}
+
 	// Validate content type
 	char content_type[32];
 	if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) == ESP_OK)
@@ -1208,6 +1291,10 @@ static esp_err_t load_config_handler(httpd_req_t *req)
 
 static esp_err_t system_reboot_handler(httpd_req_t *req)
 {
+	if (config_server_refuse_if_fenced(req, config_server_flash_fence(), "reboot"))
+	{
+		return ESP_OK;
+	}
 	const char *resp_str = "Configuration saved! Rebooting...";
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
 	config_server_schedule_reboot(RESTART_TRACKER_PLANNED_REASON_USER_REQUEST,
@@ -1263,9 +1350,19 @@ static esp_err_t system_commands_handler(httpd_req_t *req)
         {
             if (strcmp(cmd, "reboot") == 0)
             {
+                if (config_server_refuse_if_fenced(req, config_server_flash_fence(), "reboot"))
+                {
+                    cJSON_Delete(root);
+                    free(buf);
+                    return ESP_OK;
+                }
                 if (xrestartTimer != NULL)
                 {
-                    xTimerStart(xrestartTimer, 0);
+                    /* Through the scheduler, not xTimerStart() directly, so the reason is
+                     * recorded and the fast-write codec sees the reboot coming (#145). */
+                    config_server_schedule_reboot(RESTART_TRACKER_PLANNED_REASON_USER_REQUEST,
+                                                  RESTART_TRACKER_SOURCE_WEB_UI,
+                                                  RESTART_TRACKER_FLAG_NONE);
                 }
                 else
                 {
@@ -1274,6 +1371,14 @@ static esp_err_t system_commands_handler(httpd_req_t *req)
             }
             else if (strcmp(cmd, "force_update_obd") == 0)
             {
+                /* #145: reflashes the OBD chip and holds this (single) httpd task for the whole
+                 * update -- never during an ECU flash or a live NC Flash session. */
+                if (config_server_refuse_if_fenced(req, config_server_flash_fence(), "OBD chip update"))
+                {
+                    cJSON_Delete(root);
+                    free(buf);
+                    return ESP_OK;
+                }
                 elm327_update_obd(true);
             }
             else if (strcmp(cmd, "set_rtc_time") == 0)
@@ -1955,6 +2060,21 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     char filepath[FILE_PATH_MAX];
 	uint32_t total_size = 0;
 
+    /* #145: this handler disables CAN on its first line and ends in a reboot, so it is fenced
+     * before anything else runs. The OTA flag goes up FIRST and the fence is read after it: the
+     * fast-write codec does the mirror image (raises FLASH_ACTIVE_BIT, then reads this flag), so
+     * whichever of the two starts second is guaranteed to see the other and back off. */
+    config_server_ota_active_set(true);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    const flash_fence_t ota_fence = config_server_flash_fence();
+    if (ota_fence != FLASH_FENCE_CLEAR)
+    {
+        /* Lowered before the (slow) 409 send, so a flash starting meanwhile is not refused. */
+        config_server_ota_active_set(false);
+        config_server_refuse_if_fenced(req, ota_fence, "firmware update");
+        return ESP_OK;
+    }
+
     if(config_server_get_ble_config())
     {
     	ble_disable();
@@ -1967,6 +2087,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     if (!filename) {
         /* Respond with 500 Internal Server Error */
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Filename too long");
+        config_server_ota_active_set(false);
         return ESP_FAIL;
     }
 
@@ -1974,6 +2095,7 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     if (filename[strlen(filename) - 1] == '/') {
         ESP_LOGE(TAG, "Invalid filename : %s", filename);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Invalid filename");
+        config_server_ota_active_set(false);
         return ESP_FAIL;
     }
 
@@ -2005,10 +2127,10 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 	multipart_upload_config_t mp_cfg = multipart_upload_default_config();
 	mp_cfg.rx_buf_size = 4096;
 
-	/* Hold sleep off for the whole upload. Without this the sleep countdown can expire mid-transfer
-	 * and run wifi_mgr_deinit() straight through this live HTTP request, which crashed the bench
-	 * device. Raised BEFORE the transfer and lowered on every exit path below. */
-	config_server_ota_active_set(true);
+	/* The OTA flag (raised at the top of this handler, #145) also holds sleep off for the whole
+	 * upload. Without it the sleep countdown can expire mid-transfer and run wifi_mgr_deinit()
+	 * straight through this live HTTP request, which crashed the bench device. Lowered on every
+	 * exit path. */
 
 	esp_err_t mp_err = multipart_upload_handle(req, &handlers, &ctx, &mp_cfg);
 	if (mp_err != ESP_OK || ctx.err != ESP_OK || !ctx.started)
@@ -2170,6 +2292,15 @@ static esp_err_t upload_sd_handler(httpd_req_t *req)
 		return ESP_FAIL;
 	}
 
+	/* #145: a running fast-write streams its image from this directory block by block, and
+	 * CONFIG_FATFS_FS_LOCK=0 means nothing stops the unlink+rename below from replacing the file
+	 * under it. A failed or changed read after the erase aborts the flash mid-TransferData. Only a
+	 * running flash refuses: NC Flash uploads here itself while it holds the bus claim. */
+	if (config_server_refuse_if_fenced(req, flash_fence_for_sd(config_server_flash_fence()), "SD upload"))
+	{
+		return ESP_OK;
+	}
+
 	/* Extract <name> (drop any query string) and validate it. */
 	const char *name = req->uri + strlen(prefix);
 	char namebuf[97];
@@ -2243,6 +2374,15 @@ static esp_err_t upload_sd_handler(httpd_req_t *req)
 		else
 			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
 		return ESP_FAIL;
+	}
+
+	/* #145: checked again here -- the upload took seconds, and a flash may have started on this
+	 * very file meanwhile. The unlink below is what would pull it out from under the codec. */
+	if (flash_fence_for_sd(config_server_flash_fence()) != FLASH_FENCE_CLEAR)
+	{
+		unlink(tmppath);
+		config_server_refuse_if_fenced(req, FLASH_FENCE_FLASHING, "SD upload");
+		return ESP_OK;
 	}
 
 	/* Atomic publish: replace any prior staged copy of the same name. */
@@ -3526,6 +3666,23 @@ void vrestartTimerCallback( TimerHandle_t xTimer )
 	// reads restart_tracker's planned-reason), so nothing new touches this reset chokepoint. Events
 	// emitted before a reboot (UPDATE_DONE, etc.) are already fsync'd by the writer within ~1s of
 	// emission.
+	//
+	// #145 backstop: every entry point refuses a reboot while a flash runs, but a reboot accepted a
+	// moment BEFORE a flash began would otherwise fire straight into it. The timer auto-reloads
+	// (2 s), so returning here simply asks again. Only a running flash holds it (see
+	// flash_fence_reboot_may_fire). The codec clears FLASH_ACTIVE_BIT on every exit path; there is
+	// deliberately no time ceiling, so a codec that hung would hold the reboot until a power cycle
+	// -- the right trade, since a reboot here can brick the ECU. ESP_LOGW only: this runs on the FreeRTOS timer task
+	// (3 KB stack), which cannot afford event_log_emit's ~800 B of formatting.
+	if (!flash_fence_reboot_may_fire(config_server_flash_fence()))
+	{
+		if (!s_reboot_deferred_logged)
+		{
+			ESP_LOGW(TAG, "reboot postponed: an ECU flash is running, rebooting when it ends");
+			s_reboot_deferred_logged = true;
+		}
+		return;
+	}
 	restart_tracker_restart(s_reboot_reason, s_reboot_source, s_reboot_flags);
 }
 

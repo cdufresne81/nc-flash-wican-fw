@@ -27,6 +27,7 @@
 #include "esp_timer.h"
 #include "filesystem.h"
 #include "restart_tracker.h"
+#include "config_server.h"   /* config_server_flash_fence (#145) */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -68,6 +69,15 @@ static int cmd_factoryreset(int argc, char **argv)
             return 1;
         }
         
+        /* #145: a factory reset deletes the config and reboots -- never into a running ECU
+         * flash or a live NC Flash session. The pending confirmation is kept, so the user can
+         * confirm again once it is over. */
+        flash_fence_t fence = config_server_flash_fence();
+        if (fence != FLASH_FENCE_CLEAR) {
+            cmdline_printf("Refused: %s\n", flash_fence_message(fence));
+            return 1;
+        }
+
         cmdline_printf("Starting factory reset...\n");
         
         // Delete all configuration files

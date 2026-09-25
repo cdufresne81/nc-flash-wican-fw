@@ -23,6 +23,8 @@
 #pragma once
 #include "esp_tls_crypto.h"
 #include <esp_http_server.h>
+#include "flash_fence_logic.h"
+#include "restart_tracker.h"
 
 /* Product-wide maximum logging rate: ONE ceiling shared by the polled sweep
  * (POLLLOG_MIN_SWEEP_MS), the CSV grid (csv_grid_period_ms), the broadcast-column
@@ -222,6 +224,21 @@ int8_t config_server_get_can_wake(void);
  * CAN bus and does not cover a WiFi firmware update. */
 void config_server_ota_active_set(bool active);
 bool config_server_ota_active(void);
+
+/* ECU-flash fence (#145): may a person or a tool reboot, update or reconfigure the adapter right
+ * now? Levels and the reasoning behind them: flash_fence_logic.h. Every reboot, OTA and config-save
+ * path asks this and refuses (HTTP 409 on the web) unless it returns FLASH_FENCE_CLEAR; SD-card
+ * mutations pass it through flash_fence_for_sd() first. */
+flash_fence_t config_server_flash_fence(void);
+/* True from the moment a reboot is scheduled until it happens. The fast-write codec refuses to
+ * start a flash while this is set (flash_fence_write_may_start). */
+bool config_server_reboot_pending(void);
+/* Schedule a reboot through the one path the fence knows about: it raises the pending flag the
+ * fast-write codec checks, and the timer waits out a flash that got in first. Callers still ask
+ * config_server_flash_fence() before calling. False if the timer could not be started. */
+bool config_server_request_reboot(restart_tracker_planned_reason_t reason,
+                                  restart_tracker_source_t source,
+                                  uint32_t flags);
 int8_t config_server_get_ble_power(int8_t *power_dbm); // returns 0 on success
 //void config_server_set_ble_tempfn(char b);
 //char config_server_get_ble_tempfn(void);

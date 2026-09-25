@@ -3439,6 +3439,9 @@ async function postConfig() {
                 showNotification(msg || "Configuration applied (no reboot).", "green", 6000);
                 document.getElementById("submit_button").disabled = false;
             }
+        } else if (xhttp.status === 409) {
+            showNotification(flashFenceMessage(xhttp), "red", 9000);
+            document.getElementById("submit_button").disabled = false;
         } else {
             showNotification("Error saving configuration (HTTP " + xhttp.status + ")", "red");
             document.getElementById("submit_button").disabled = false;
@@ -3476,7 +3479,7 @@ function validateApSsid() {
     }
 }
 
-function otaClick() {
+async function otaClick() {
     const fileInput = document.getElementById("ota_file");
     const submitButton = document.getElementById("ota_submit_button");
     const otaForm = document.getElementById("ota_form");
@@ -3521,6 +3524,12 @@ function otaClick() {
     }
 
     if (submitButton) submitButton.disabled = true;
+    const refusal = await flashFenceRefusal();
+    if (refusal) {
+        showNotification(refusal, "red", 9000);
+        if (submitButton) submitButton.disabled = false;
+        return;
+    }
     setProgressVisible(true);
     setProgressState("normal");
     setProgress(0, "Starting upload...");
@@ -3645,6 +3654,8 @@ function otaClick() {
 
         if ((xhr.status >= 200 && xhr.status < 300) || (xhr.status === 0 && uploadCompleted)) {
             startPostUploadWait();
+        } else if (xhr.status === 409) {
+            failAndUnlock(flashFenceMessage(xhr));
         } else {
             failAndUnlock(`Update failed (HTTP ${xhr.status}). Try again after reconnecting.`);
         }
@@ -3653,11 +3664,45 @@ function otaClick() {
     xhr.send(formData);
 }
 
+// #145: the firmware refuses a reboot, a firmware update or a config save with HTTP 409 while an
+// ECU flash or an NC Flash session is running, and says why in `msg`.
+function flashFenceMessage(xhr) {
+    try {
+        const r = JSON.parse(xhr.responseText);
+        if (r && typeof r.msg === "string" && r.msg) return r.msg;
+    } catch (e) { /* not JSON */ }
+    return "The adapter is busy with the car's ECU. Try again when it has finished.";
+}
+
+// Ask before a firmware upload, so a refusal shows in a second instead of after sending the
+// whole image. The firmware's 409 is still the real fence; this only saves the wait. Resolves to
+// the refusal sentence, or "" when the adapter is clear or did not answer.
+async function flashFenceRefusal() {
+    try {
+        const r = await fetch("/datalog", { cache: "no-store" });
+        if (!r.ok) return "";
+        const s = await r.json();
+        if (s && s.flash_fence && s.flash_fence !== "clear") {
+            return s.flash_fence_msg || "The adapter is busy with the car's ECU.";
+        }
+    } catch (e) { /* older firmware or no answer: let the upload's own 409 decide */ }
+    return "";
+}
+
 function reboot() {
+    const btn = document.getElementById("reboot_button");
     const xhttp = new XMLHttpRequest();
-    document.getElementById("reboot_button").disabled = true;
-    showNotification("Rebooting please reconnect...", "yellow");
+    btn.disabled = true;
     xhttp.open("POST", "/system_reboot");
+    xhttp.onreadystatechange = function() {
+        if (xhttp.readyState !== 4) return;
+        if (xhttp.status === 409) {
+            showNotification(flashFenceMessage(xhttp), "red", 9000);
+            btn.disabled = false;
+            return;
+        }
+        showNotification("Rebooting please reconnect...", "yellow");
+    };
     xhttp.send("reboot");
 }
 
@@ -3746,6 +3791,15 @@ async function uploadCfg() {
                 }
                 const jsonData = JSON.parse(e.target.result);
                 let hasErrors = false;
+
+                // #145: /store_config is refused during an ECU flash or NC Flash session but
+                // /store_auto_data is not, so a restore would land half-applied. Ask first.
+                const refusal = await flashFenceRefusal();
+                if (refusal) {
+                    alert(refusal);
+                    fileInput.value = '';
+                    return;
+                }
 
                 for (const [key, endpoint] of Object.entries(endpointMap)) {
                     if (jsonData[key]) {

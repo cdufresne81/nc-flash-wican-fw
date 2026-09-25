@@ -33,6 +33,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "restart_tracker.h"
+#include "config_server.h"   /* config_server_flash_fence (#145) */
 
 static struct {
     struct arg_lit *latest;
@@ -168,6 +169,12 @@ static int cmd_restart_tracker(int argc, char **argv)
     }
 
     if (restart_tracker_args.panic->count > 0) {
+        /* #145: a panic is a reset like any other -- never into an ECU flash or NC Flash session. */
+        flash_fence_t fence = config_server_flash_fence();
+        if (fence != FLASH_FENCE_CLEAR) {
+            cmdline_printf("Refused: %s\n", flash_fence_message(fence));
+            return 1;
+        }
         cmdline_printf("Forcing panic now. The next boot should show reset=panic and increment unexpected resets.\n");
         vTaskDelay(pdMS_TO_TICKS(100));
         abort();
