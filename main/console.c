@@ -33,7 +33,6 @@
 #include "sleep_mode.h"
 #include "hw_config.h"
 #include "restart_tracker.h"
-#include "config_server.h"   /* config_server_flash_fence (#145) */
 #include "sdcard.h"
 #include "esp_heap_caps.h"
 #include <string.h>
@@ -293,13 +292,6 @@ static int cmd_system(int argc, char **argv)
 
     if (system_args.reboot->count > 0)
     {
-        /* #145: never reboot into a running ECU flash or a live NC Flash session. */
-        flash_fence_t fence = config_server_flash_fence();
-        if (fence != FLASH_FENCE_CLEAR)
-        {
-            console_printf("Refused: %s\n", flash_fence_message(fence));
-            return 1;
-        }
         console_printf("System will reboot now...\n");
         vTaskDelay(pdMS_TO_TICKS(2000));
 
