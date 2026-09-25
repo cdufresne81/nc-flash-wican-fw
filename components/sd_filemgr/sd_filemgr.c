@@ -28,6 +28,7 @@
 #include "sdcard.h"
 #include "csv_logger.h"
 #include "event_log.h"
+#include "config_server.h"   /* config_server_flash_fence (#145) */
 
 static const char *TAG = "SD_FILEMGR";
 
@@ -549,6 +550,20 @@ static esp_err_t sdfm_post_handler(httpd_req_t *req)
     const char *op   = cJSON_IsString(jop)   ? jop->valuestring   : "";
     const char *path = cJSON_IsString(jpath) ? jpath->valuestring : "";
     const char *name = cJSON_IsString(jname) ? jname->valuestring : "";
+
+    /* #145: a running fast-write streams its image from /sdcard/roms block by block, and
+     * CONFIG_FATFS_FS_LOCK=0 means FATFS will happily delete or rename a file that is open for
+     * reading. A failed or changed read after the erase aborts the flash mid-TransferData. Refused
+     * for every path, not just roms/: a flash takes minutes, and "which file is it reading" is not
+     * a question worth getting wrong. mkdir cannot disturb an open file and stays allowed. */
+    if ((strcmp(op, "delete") == 0 || strcmp(op, "rename") == 0) &&
+        flash_fence_for_sd(config_server_flash_fence()) != FLASH_FENCE_CLEAR)
+    {
+        event_log_emit(EVL_WARN, "refused SD %s: an ECU flash is running", op);  /* op lives in root */
+        cJSON_Delete(root);
+        return sdfm_reply(req, "409 Conflict",
+                          "{\"error\":\"An ECU flash is running. Wait for it to finish.\",\"fence\":\"flashing\"}");
+    }
 
     esp_err_t rc;
     if (strcmp(op, "mkdir") == 0)       { rc = sdfm_op_mkdir(req, path, name); }

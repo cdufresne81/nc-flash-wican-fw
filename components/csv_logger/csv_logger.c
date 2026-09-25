@@ -1274,6 +1274,12 @@ static char *datalog_state_json(void)
      * running car it reads ~0 forever and tells you nothing about whether a reap can fire. */
     cJSON_AddNumberToObject(root, "diag_idle_ms", can_diag_idle_ms());
     cJSON_AddBoolToObject(root, "stuck_flash_alarm", can_stuck_flash_alarm());
+    /* #145: the exact answer every reboot/update/config-save path uses ("clear" / "session" /
+     * "flashing"), so the web page can refuse BEFORE posting instead of deriving it from the raw
+     * flags above -- the raw claim flag outlives a dead host, the fence does not. */
+    const flash_fence_t fence = config_server_flash_fence();
+    cJSON_AddStringToObject(root, "flash_fence", flash_fence_name(fence));
+    cJSON_AddStringToObject(root, "flash_fence_msg", flash_fence_message(fence));
     char *out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return out;

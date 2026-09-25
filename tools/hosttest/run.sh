@@ -36,3 +36,11 @@ CC="${CC:-cc}"
     -o "$OUT/poll_gate_test"
 
 "$OUT/poll_gate_test"
+
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -I "$REPO/main" \
+    "$REPO/tools/hosttest/flash_fence_test.c" \
+    "$REPO/main/flash_fence_logic.c" \
+    -o "$OUT/flash_fence_test"
+
+"$OUT/flash_fence_test"

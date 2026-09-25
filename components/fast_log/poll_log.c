@@ -1429,9 +1429,9 @@ static void polllog_rx_task(void *arg)
              * nothing is maintaining them either way, and sleep is separately held off by the
              * same flag (sleep_mode.c:1055).
              *
-             * The two early returns above that flag (bad filename, trailing slash) leave the bus
-             * disabled and never raise it -- and those the self-heal SHOULD recover, which is
-             * what it now does. */
+             * The two early returns in that handler (bad filename, trailing slash) leave the bus
+             * disabled and lower the flag again on the way out (#145 raises it before the
+             * fence check) -- and those the self-heal SHOULD recover, which is what it does. */
             if (!config_server_ota_active() &&
                 (now_w - withheld_since_us) > (int64_t)POLLLOG_BUS_WITHHELD_MS * 1000)
             {
