@@ -139,10 +139,12 @@ static void t2_boot_loop_is_still_bounded(void)
  *   12:44:06  DATALOG_CLOSE (manual_stop)
  *   12:44:20  IGNITION_ON, 104s -> nothing recorded
  * ------------------------------------------------------------------------ */
-/* Is the trip over, given the three signs? Reads like the writer's call site. */
+/* Is the trip over, given the three signs? Reads like the writer's call site. AUTO would
+ * not be recording (auto_would_log = false): the engine gate closed with the ECU, which is
+ * what csv_require_engine (the default) does at key-off. T3c covers the other case. */
 static bool trip_over(bool ignition_on, bool ecu_silent, bool sleeping)
 {
-    return csv_trip_end_reason(ignition_on, ecu_silent, sleeping) != NULL;
+    return csv_trip_end_reason(ignition_on, ecu_silent, sleeping, false) != NULL;
 }
 
 static void t3_manual_stop_is_per_trip(void)
@@ -225,12 +227,32 @@ static void t3b_trip_ends_without_the_voltage(void)
           "bench FORCE_ON survives ECU silence and sleep");
 
     /* The event line names the sign that fired, most decisive first. */
-    CHECK(strcmp(csv_trip_end_reason(false, true, true), "going to sleep") == 0,
+    CHECK(strcmp(csv_trip_end_reason(false, true, true, false), "going to sleep") == 0,
           "sleep is named first");
-    CHECK(strcmp(csv_trip_end_reason(false, true, false), "ECU stopped answering") == 0,
+    CHECK(strcmp(csv_trip_end_reason(false, true, false, false), "ECU stopped answering") == 0,
           "then a silent ECU");
-    CHECK(strcmp(csv_trip_end_reason(false, false, false), "ignition is off") == 0,
+    CHECK(strcmp(csv_trip_end_reason(false, false, false, false), "ignition is off") == 0,
           "then the voltage, with the wording the event log already used");
+}
+
+/* ---------------------------------------------------------------------------
+ * T3c -- review of the #109 fix: a Stop must never clear straight back into recording.
+ * With csv_require_engine disabled, AUTO logs on voltage alone, so a silent ECU with the
+ * voltage still "on" would reopen a file the instant Stop cleared -- the press silently
+ * undone. The ECU sign waits for AUTO to be idle; sleep does not need to.
+ * ------------------------------------------------------------------------ */
+static void t3c_stop_never_clears_into_recording(void)
+{
+    banner("T3c: the ECU sign does not end the trip while AUTO would still record");
+
+    CHECK(csv_trip_end_reason(true, true, false, true) == NULL,
+          "silent ECU, but AUTO would log (voltage-only gate) -> Stop holds");
+    CHECK(csv_trip_end_reason(true, true, true, true) != NULL,
+          "a sleep still ends the trip -- it closes every session anyway");
+    CHECK(csv_trip_end_reason(false, false, false, false) != NULL,
+          "the voltage sign is unchanged (ignition off implies AUTO idle)");
+    CHECK(csv_trip_end_reason(true, false, false, true) == NULL,
+          "key on, ECU answering, AUTO logging -> the trip is not over");
 }
 
 /* ---------------------------------------------------------------------------
@@ -307,6 +329,7 @@ int main(void)
     t2_boot_loop_is_still_bounded();
     t3_manual_stop_is_per_trip();
     t3b_trip_ends_without_the_voltage();
+    t3c_stop_never_clears_into_recording();
     t4_gate_truth_table_is_unchanged();
     t5_countdown_and_boundaries();
 

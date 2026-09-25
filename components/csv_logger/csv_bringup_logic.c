@@ -69,10 +69,12 @@ bool csv_guard_clear_due(int64_t now_us, int64_t task_start_us)
     return (now_us - task_start_us) > CSV_GUARD_STABLE_US;
 }
 
-const char *csv_trip_end_reason(bool ignition_on, bool ecu_silent, bool sleeping)
+const char *csv_trip_end_reason(bool ignition_on, bool ecu_silent, bool sleeping,
+                                bool auto_would_log)
 {
-    if (sleeping)     { return "going to sleep"; }
-    if (ecu_silent)   { return "ECU stopped answering"; }
+    if (sleeping)       { return "going to sleep"; }
+    if (auto_would_log) { return NULL; }
+    if (ecu_silent)     { return "ECU stopped answering"; }
     if (!ignition_on) { return "ignition is off"; }
     return NULL;
 }

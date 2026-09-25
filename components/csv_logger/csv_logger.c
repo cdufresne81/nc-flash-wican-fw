@@ -597,17 +597,17 @@ void csv_logger_set_rate_fn(csv_rate_fn_t fn)
 }
 
 // Clear a manual Stop back to AUTO once the trip is over (#109). Called by the writer on every
-// ignition poll, and once by the sleep teardown: with Stop on there is no open session, so the
-// teardown does not wait for the writer, and the writer may never get a pass in before the
-// sleep freezes it. Both callers can only move OFF -> AUTO, so a race between them costs at
-// worst a duplicate event line.
-static void csv_manual_stop_rearm(bool ignition_on, bool sleeping)
+// pass with no session open, and once by the sleep teardown: with Stop on there is no open
+// session, so the teardown does not wait for the writer, and the writer may never get a pass in
+// before the sleep freezes it. Both callers can only move OFF -> AUTO, so a race between them
+// costs at worst a duplicate event line. auto_would_log: see csv_trip_end_reason().
+static void csv_manual_stop_rearm(bool ignition_on, bool auto_would_log, bool sleeping)
 {
     const int8_t mode = csv_manual_mode;
     if (mode != CSV_MANUAL_OFF) { return; }   // cheap exit; the rule itself is csv_manual_mode_next
 
     const bool ecu_silent = (csv_ecu_silent_fn != NULL) && csv_ecu_silent_fn();
-    const char *why = csv_trip_end_reason(ignition_on, ecu_silent, sleeping);
+    const char *why = csv_trip_end_reason(ignition_on, ecu_silent, sleeping, auto_would_log);
     const int8_t next = csv_manual_mode_next(mode, why != NULL, can_datalog_park_active());
     if (next != mode)
     {
@@ -708,14 +708,6 @@ static void csv_logger_task(void *pvParameters)
                 }
             }
             // VEHICLE_STATE_IGNITION_INVALID: keep last known state
-
-            // A manual Stop ends the TRIP, not auto-logging: one press used to silently
-            // disable every later key-on until someone rebooted, and a customer lost 104 s
-            // of a drive to exactly that. Evaluated as a LEVEL on every ignition poll
-            // rather than on the off EDGE -- an edge is consumed once, so an edge that
-            // landed under a host park lease would be the only one we ever saw and Stop
-            // would latch again. See csv_manual_mode_next().
-            csv_manual_stop_rearm(ignition_on, csv_sleep_requested);
         }
 
         // Log while ignition is on (engine running). Ignition is derived from battery
@@ -729,6 +721,18 @@ static void csv_logger_task(void *pvParameters)
         // The provider returns true when poll_log isn't the active mode, so this auto-degrades to the
         // voltage gate when RPM isn't available. FORCE_ON/FORCE_OFF still win for bench use.
         bool engine_ok = !require_engine || csv_engine_state_fn == NULL || csv_engine_state_fn();
+
+        // A manual Stop ends the TRIP, not auto-logging: one press used to silently disable
+        // every later key-on until someone rebooted, and a customer lost 104 s of a drive to
+        // exactly that. Evaluated as a LEVEL on every pass rather than on the off EDGE -- an
+        // edge is consumed once, so an edge that landed under a host park lease would be the
+        // only one we ever saw and Stop would latch again. See csv_manual_mode_next().
+        // Only once the stopped session is CLOSED: run before the close check below, a clear
+        // would turn this pass's OFF back into AUTO and the Stop would never close the file.
+        if (!csv_session_active)
+        {
+            csv_manual_stop_rearm(ignition_on, ignition_on && engine_ok, csv_sleep_requested);
+        }
         // The sleep request outranks even a manual FORCE_ON. Normally the ignition/engine gate has
         // already closed the session long before sleep, but with manual mode ON a session would
         // otherwise stay open across the whole sleep -- and since a wake now resumes in place
@@ -1640,9 +1644,10 @@ void csv_logger_set_sleep_requested(bool sleeping)
     csv_sleep_requested = sleeping;
     if (sleeping)
     {
-        // A sleep ends the trip. ignition_on is passed as true because the sleep sign alone
-        // decides it here -- the writer's voltage state is not ours to read from this task.
-        csv_manual_stop_rearm(true, true);
+        // A sleep ends the trip. ignition_on/auto_would_log are passed as true because the
+        // sleep sign alone decides it here -- the writer's gate state is not ours to read
+        // from this task. A host park still blocks it (csv_manual_mode_next).
+        csv_manual_stop_rearm(true, true, true);
     }
 }
 

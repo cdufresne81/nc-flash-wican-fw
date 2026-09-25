@@ -112,8 +112,16 @@ bool csv_guard_clear_due(int64_t now_us, int64_t task_start_us);
  * alternator is already charging when it wakes, so the voltage never read "off" and
  * a manual Stop swallowed the drive out and the drive back. With sleep_volt above the
  * OFF edge that miss is guaranteed, not bad luck -- so the ECU and sleep signs end the
- * trip without any help from the voltage. */
-const char *csv_trip_end_reason(bool ignition_on, bool ecu_silent, bool sleeping);
+ * trip without any help from the voltage.
+ *
+ * auto_would_log is the AUTO gate right now (ignition_on && engine_ok). While it is true
+ * the ECU sign does NOT end the trip: clearing Stop would drop straight back into
+ * recording, so the press would be silently undone. That happens with
+ * csv_require_engine disabled (voltage-only AUTO) or when the ECU is silent for some
+ * reason other than key-off. The voltage sign implies auto_would_log is false, and a
+ * sleep closes every session anyway, so neither needs the guard. */
+const char *csv_trip_end_reason(bool ignition_on, bool ecu_silent, bool sleeping,
+                                bool auto_would_log);
 
 /* The manual override mode for the next writer pass.
  *

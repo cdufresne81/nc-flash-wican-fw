@@ -282,7 +282,7 @@ three seconds, and the voltage falls below the engine-running level minus the hy
    solid blue.
 5. A manual Stop, if one was pressed, clears itself once the trip is over: when the ECU goes
    silent (section H), when the voltage says the key is off, or at the latest when the device
-   goes to sleep — so one press stops the current trip only, and the next key-on records
+   goes to sleep (unless a host still holds the datalog park) — so one press stops the current trip only, and the next key-on records
    normally again. One press used to silently
    disable every later key-on until someone rebooted, and a customer lost most of a drive to
    exactly that.
