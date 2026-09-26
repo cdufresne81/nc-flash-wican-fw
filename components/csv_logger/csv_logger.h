@@ -116,6 +116,18 @@ typedef bool (*csv_engine_state_fn_t)(void);
 void csv_logger_set_engine_state_fn(csv_engine_state_fn_t fn);
 
 /**
+ * @brief "The ECU stopped answering" predicate, one of the signs that end a trip (#109).
+ *
+ * Returns true only while the ECU is known to be silent. A true here clears a manual Stop, so
+ * the provider must FAIL CLOSED (false) whenever it cannot tell -- a false only means the Stop
+ * waits for the voltage or sleep sign instead. poll_log registers poll_log_ecu_silent(); same
+ * no-circular-dependency registration pattern as the engine-state predicate. Must be cheap and
+ * lock-free (called from the writer task and the sleep teardown).
+ */
+typedef bool (*csv_ecu_silent_fn_t)(void);
+void csv_logger_set_ecu_silent_fn(csv_ecu_silent_fn_t fn);
+
+/**
  * @brief Measured sample-rate provider for the "Auto" fixed-rate grid (issue #23).
  *
  * Returns the current fastest meaningful logging rate in Hz (poll_log registers its measured
@@ -152,7 +164,8 @@ bool csv_logger_bringup_skipped(void);
 /* Tell the writer task to close any open session (true) or that it may log again (false).
  * The sleep teardown sets it and the resume clears it, so a session never spans a sleep: a wake
  * resumes in place, so an open file would otherwise come back with its timers jumped by hours.
- * Overrides even a manual FORCE_ON. */
+ * Overrides even a manual FORCE_ON. Setting it also clears a manual Stop, because a sleep ends
+ * the trip (#109). */
 void csv_logger_set_sleep_requested(bool sleeping);
 
 /**

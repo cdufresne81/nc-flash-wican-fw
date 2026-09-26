@@ -137,6 +137,7 @@ static inline uint16_t polllog_rmba_size(const uint8_t *req)
 #define POLLLOG_FLIP_MIN_MS      2000     /* min dwell between mode flips (anti-thrash hysteresis) */
 #define POLLLOG_MAX_QUIESCE_MS   600000   /* 10 min: force NORMAL+repoll even with no frame (self-heal) */
 #define POLLLOG_RESUME_FRAMES    1        /* an RX frame triggers a PROBE-resume; confirmed only by a real OK */
+#define POLLLOG_SILENT_LOOP_FRESH_MS 2000 /* poll_log_ecu_silent(): older loop stamp = wedged task, not silence */
 #define POLLLOG_FLASH_PARK_MS    20       /* interlock park sleep while a flash owns the bus (task #36) */
 /* How long the CAN peripheral may sit disabled with NO owner before the datalogger re-enables it
  * itself. Long enough that a host clearing the bit a moment before it raises its lease is not
@@ -366,6 +367,10 @@ static volatile float    s_win_sweep_min_ms = 0, s_win_sweep_max_ms = 0;
  * contract as the status snapshot above; the getters below do plain reads. */
 static volatile bool    s_bus_normal     = true;  /* default true: non-poll modes never suppress logging */
 static volatile bool    s_quiesced       = false; /* true == bus currently flipped to LISTEN_ONLY */
+/* true from a quiesce that followed a CONFIRMED answer (the IGNITION_OFF line) until the next matched
+ * OK. Survives probe re-quiesces and the MAX_QUIESCE self-heal, so the car stays "silent" until the
+ * ECU really answers again. Only poll_log_ecu_silent() reads it (#109). */
+static volatile bool    s_quiesced_confirmed = false;
 static volatile int64_t s_last_ok_us     = 0;     /* esp_timer stamp of last matched OK reply (real ECU answer) */
 /* The ECU sent back a matching reply to a request WE transmitted, in the current NORMAL session.
  * Renamed from s_confirmed, which never said what was confirmed. Read it as "somebody is really
@@ -970,6 +975,7 @@ static bool polllog_poll_one(pid_data_t *pid)
                  * car at key-on with the engine not turning answers every request too (#98).
                  * It does NOT repeat "ignition on" -- the IGNITION_ON label already said that. */
                 s_ecu_answering = true;
+                s_quiesced_confirmed = false;
                 event_log_emit(EVL_IGNITION_ON, "ECU answering");
             }
             got = true;
@@ -1761,6 +1767,7 @@ static void polllog_rx_task(void *arg)
                     polllog_engine_stopped("ECU stopped answering");
                     if (was_confirmed)
                     {
+                        s_quiesced_confirmed = true;   /* a real key-off: poll_log_ecu_silent() */
                         ESP_LOGI(TAG, "ECU silent %dms -> LISTEN_ONLY quiesce (stop holding bus awake)",
                                  POLLLOG_ENGINE_OFF_MS);
                         /* Operational event (Task #24): once per confirmed on->off transition.
@@ -1938,6 +1945,7 @@ void poll_log_init(char *id, uint32_t log_period)
      * csv_logger, not the reverse. Registers the RECORDING gate, not poll_log_ignition_on --
      * see the WATCH vs FAST block near the top for why those are different questions. */
     csv_logger_set_engine_state_fn(poll_log_gate_open);
+    csv_logger_set_ecu_silent_fn(poll_log_ecu_silent);   /* ends the trip for a manual Stop (#109) */
 
     /* The gate's voltage threshold. Read once here rather than per sweep: changing engine_volt
      * goes through /store_config, which reboots, so it cannot change under a running task. */
@@ -2052,6 +2060,19 @@ static uint32_t polllog_loop_age_ms(void)
     if (!s_active || s_loop_ms == 0)
         return UINT32_MAX;
     return (uint32_t)((uint32_t)(esp_timer_get_time() / 1000) - s_loop_ms);
+}
+
+/* Trip-over sign for the CSV logger's manual Stop (#109). See poll_log.h for the polarity.
+ *   s_quiesced_confirmed -- this quiesce followed a CONFIRMED answer. A probe that never got an OK
+ *                           also quiesces, and a table the ECU never answers loops probe/quiesce
+ *                           every few seconds mid-drive -- that must not undo a Stop.
+ *   !can_should_park()   -- parked, nothing keeps s_quiesced fresh.
+ *   loop age             -- a wedged poll task freezes s_quiesced too. The quiesced loop runs every
+ *                           ~20 ms, so 2 s without a pass is a stall, not a slow pass. */
+bool poll_log_ecu_silent(void)
+{
+    return s_active && s_quiesced && s_quiesced_confirmed && !can_should_park() &&
+           polllog_loop_age_ms() < POLLLOG_SILENT_LOOP_FRESH_MS;
 }
 
 uint32_t poll_log_bus_idle_ms(void)
