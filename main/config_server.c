@@ -43,6 +43,7 @@
 #include <time.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include "ff.h"
 #include "filesystem.h"
 #if USE_FATFS	
@@ -3723,6 +3724,47 @@ static void register_server_uris(void)
 //static char* device_config = NULL;
 static uint8_t esp_fatfs_flag = 0;
 static httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+extern const char default_auto_pid_start[] asm("_binary_default_auto_pid_json_start");
+
+// Write the stock NC sensor list (main/default_auto_pid.json) when the device has no
+// auto_pid.json: a fresh device, a factory reset, or the first boot after moving from
+// firmware that never saved one. Without it the Logger page is empty and nothing is
+// polled. Only a MISSING file is seeded -- a list the user stored, even an empty one,
+// is never touched. Runs before poll_log_init() (main.c), so the first boot already
+// polls it. Written to a temp file and renamed, so a power cut can't leave a half
+// file behind that would parse as broken and then never be re-seeded.
+static void config_server_seed_default_sensors(void)
+{
+	const char *path = FS_MOUNT_POINT "/auto_pid.json";
+	const char *tmppath = FS_MOUNT_POINT "/auto_pid.json.tmp";
+	struct stat st;
+
+	// Only "no such file" means missing. Any other stat error leaves the file alone,
+	// so a filesystem hiccup can never replace a list the user stored.
+	if (stat(path, &st) == 0 || errno != ENOENT)
+	{
+		return;
+	}
+
+	FILE *f = fopen(tmppath, "w");
+	if (f == NULL)
+	{
+		ESP_LOGE(TAG, "default sensors: cannot open %s", tmppath);
+		return;
+	}
+	size_t len = strlen(default_auto_pid_start);
+	size_t written = fwrite(default_auto_pid_start, 1, len, f);
+	// LittleFS commits the data at close, so a failed close means a short file.
+	bool closed = (fclose(f) == 0);
+	if (written != len || !closed || rename(tmppath, path) != 0)
+	{
+		ESP_LOGE(TAG, "default sensors: write failed (%u/%u bytes)", (unsigned)written, (unsigned)len);
+		unlink(tmppath);
+		return;
+	}
+	ESP_LOGI(TAG, "auto_pid.json missing: wrote the default sensor list (%u bytes)", (unsigned)len);
+}
+
 static httpd_handle_t config_server_init(void)
 {
 //	const char* base_path = "/"; //useless?
@@ -3810,9 +3852,10 @@ static httpd_handle_t config_server_init(void)
 				ESP_LOGE(TAG, "Failed to allocate memory for config file");
 				fclose(f);
 			}
-			
+
 		}
 
+		config_server_seed_default_sensors();
 	}
 
     xrestartTimer= xTimerCreate
