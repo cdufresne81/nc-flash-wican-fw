@@ -90,6 +90,7 @@
 #include "sync_sys_time.h"   /* SYNC_SYS_TIME_DEFAULT_TZ + the TZ validator (issue #91) */
 #include "esp_littlefs.h"
 #include "csv_logger.h"
+#include "datalog_stream.h"
 #include "poll_log.h"
 #include "event_log.h"
 #include "wifi_diag.h"
@@ -1750,6 +1751,11 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	// LED, and this is what lets the flash/datalog indications be verified
 	// over HTTP.
 	cJSON_AddStringToObject(root, "led_indicator", led_indicator_get_state_str());
+	// Live datalog stream (issue #3).
+	cJSON_AddNumberToObject(root, "stream_port", WICAN_DATALOG_STREAM_PORT);
+	cJSON_AddBoolToObject(root, "stream_connected", datalog_stream_client_connected());
+	cJSON_AddNumberToObject(root, "stream_rows_sent", datalog_stream_rows_sent());
+	cJSON_AddNumberToObject(root, "stream_rows_dropped", datalog_stream_rows_dropped());
 	char uptime_str[32];
 	dev_status_format_uptime(uptime_str, sizeof(uptime_str));
 	if(uptime_str[0] == '\0')

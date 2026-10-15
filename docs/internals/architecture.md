@@ -153,6 +153,7 @@ flowchart LR
 
     BROWSER -->|"HTTP :80 — 25 endpoints"| DEV
     NCFLASH -->|"SLCAN over TCP :35001"| DEV
+    DEV -->|"live trip CSV, TCP :35002"| NCFLASH
     DEV <-->|"CAN / OBD-II"| ECU
     DEV <--> SD
 ```
@@ -178,6 +179,7 @@ main/                       31,002 lines — app + most inherited subsystems
   ncflash_*.c               NC Flash ROM read/write codecs        [fork]
   slcan_port.c              port 35001                            [fork]
   datalog_lease_task.c      dead-man reaper for the bus lease     [fork]
+  datalog_stream.c          port 35002: live trip-CSV tail        [fork]
   safemode.c                recovery AP + OTA form                [GUARDRAIL]
   multipart_upload.c        the parser OTA depends on             [GUARDRAIL]
   expression_parser.c       PID expression evaluator (Bn/Sn/Fn tokens)

@@ -48,6 +48,7 @@
 #include "comm_server.h"
 #include "slcan_port.h"   /* dedicated always-on SLCAN listener (no-reboot coexistence, task #36) */
 #include "datalog_lease_task.h"   /* dead-man's-switch reaper (brick-safe datalog auto-resume, task #36) */
+#include "datalog_stream.h"   /* live tail of the trip CSV on 35002 (issue #3) */
 #include "config_server.h"
 #include "slcan.h"
 #include "can.h"
@@ -839,6 +840,12 @@ void app_main(void)
 		{
 			log_period = 60;
 		}
+		/* Before the writer starts, so the first trip's header reaches the stream. PSRAM only;
+		 * if it fails, logging runs exactly as it would without a stream. */
+		if(datalog_stream_init() != 0)
+		{
+			ESP_LOGE(TAG, "live datalog stream unavailable");
+		}
 		if(config_server_get_csv_log() == 1)
 		{
 			csv_logger_start_at_boot();
@@ -908,6 +915,11 @@ void app_main(void)
 	 * mid-coexistence (lid close / crash / Wi-Fi drop). Reads coexistence state only; safe to
 	 * start regardless of whether the dedicated port came up. See WICAN_DEADMAN_AUTORESUME.md. */
 	datalog_lease_task_start();
+	/* Live datalog stream (issue #3): read-only, touches no CAN state. */
+	if(datalog_stream_start(WICAN_DATALOG_STREAM_PORT) != 0)
+	{
+		ESP_LOGE(TAG, "live datalog stream listener not started");
+	}
 	#endif
 
 	if(config_server_get_ble_config())
