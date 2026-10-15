@@ -1952,6 +1952,10 @@ function updateAllSampleHints() {
                      (pred ? '   ·   predicted after apply: ' + pred.toFixed(1) + ' ms' : '') + warn;
 }
 
+// Sensor-file format stamp, also carried by main/default_auto_pid.json. The boot code only
+// checks that the key exists; the value is for telling future formats apart.
+const AUTO_PID_FORMAT = "nc-flash-1";
+
 // Build the auto_pid.json POST body from the Logger-page DOM. Throws on a validation
 // failure (the caller surfaces the message). Split out of storeAutoTableData so the
 // same serialization can snapshot a load-time baseline for the skip-unchanged guard.
@@ -2117,6 +2121,11 @@ function buildAutoTableJson() {
     });
 
     return {
+        // Marks the file as saved by this firmware. At boot, a file WITHOUT it (and
+        // without "calculated") that holds no sensors came from the official MeatPi
+        // firmware, and is replaced by the default list
+        // (config_server_seed_default_sensors). Bump the number on a breaking change.
+        format: AUTO_PID_FORMAT,
         initialisation: initialisationValue,
         disable_on_sleep_voltage: disableOnSleepVoltageValue,
         pid_polling_min_voltage: pidPollingMinVoltageValue,

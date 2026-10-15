@@ -1,4 +1,5 @@
 {
+  "format": "nc-flash-1",
   "pids": [
     {
       "Name": "AAT",

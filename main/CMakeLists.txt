@@ -13,6 +13,7 @@ set(srcs
     "ncflash_fastread.c"
     "ncflash_fastwrite.c"
     "flash_fence_logic.c"
+    "auto_pid_seed_logic.c"
     "ble.c"
     "wifi_network.c"
     "wc_uart.c"
