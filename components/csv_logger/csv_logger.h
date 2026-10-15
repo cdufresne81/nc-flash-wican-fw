@@ -22,6 +22,7 @@
 #define __CSV_LOGGER_H__
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "esp_http_server.h"
@@ -137,6 +138,40 @@ void csv_logger_set_ecu_silent_fn(csv_ecu_silent_fn_t fn);
  */
 typedef float (*csv_rate_fn_t)(void);
 void csv_logger_set_rate_fn(csv_rate_fn_t fn);
+
+/**
+ * @brief Live-stream hook: a copy of every line the writer puts in the trip file (issue #3).
+ *
+ * main/datalog_stream.c registers one to feed the 35002 live tail; the logger cannot depend on
+ * main, hence the function pointer (same one-way pattern as the providers above). Called ONLY
+ * from the writer task, so the hook sees events in file order and needs no lock of its own.
+ * It must never block: it runs between SD writes, and a slow hook is a slow trip log.
+ *
+ *   OPEN  : a trip file just opened (also after a size rotation). file = full path, cols = the
+ *           channel-column count, line/len = the whole header line incl. '\n', or NULL/0 when
+ *           the header did not fit the row buffer.
+ *   ROW   : line/len = the row just written, incl. '\n'.
+ *   CLOSE : the trip file just closed (trip end, stop, SD removed, rotation, write error).
+ *   POLL  : once per writer-loop pass (at least every 250 ms) so the hook can answer a newly
+ *           connected client even when no trip is open. No data.
+ */
+typedef enum
+{
+    CSV_STREAM_EV_OPEN = 0,
+    CSV_STREAM_EV_ROW,
+    CSV_STREAM_EV_CLOSE,
+    CSV_STREAM_EV_POLL,
+} csv_stream_event_t;
+
+typedef void (*csv_stream_hook_t)(csv_stream_event_t ev, const char *file, int cols,
+                                  const char *line, size_t len);
+
+/* Register the live-stream hook. Call before csv_logger_start_at_boot() so the first trip's
+ * OPEN is seen; a hook registered later only learns about the NEXT trip. */
+void csv_logger_set_stream_hook(csv_stream_hook_t hook);
+
+/* True once the writer task exists (csv_log enabled at boot, or a manual Start). */
+bool csv_logger_running(void);
 
 /**
  * @brief Start the CSV datalogger at boot, crash-guard gated.
