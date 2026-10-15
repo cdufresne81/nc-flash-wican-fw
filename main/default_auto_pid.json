@@ -1,0 +1,408 @@
+{
+  "format": "nc-flash-1",
+  "pids": [
+    {
+      "Name": "AAT",
+      "Mode": "01",
+      "PID": "01461",
+      "Expression": "B3-40",
+      "Unit": "C",
+      "Class": "",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "",
+      "SampleEvery": 16,
+      "enabled": true,
+      "description": "Ambient Air Temperature"
+    },
+    {
+      "Name": "RPM",
+      "Mode": "01",
+      "PID": "010C1",
+      "Expression": "((B3*256)+B4)/4",
+      "Unit": "rpm",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": true
+    },
+    {
+      "Name": "LOAD",
+      "Mode": "01",
+      "PID": "01431",
+      "Expression": "((B3*256)+B4)*0.0039215684",
+      "Unit": "",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": true
+    },
+    {
+      "Name": "MAF",
+      "Mode": "01",
+      "PID": "01101",
+      "Expression": "((B3*256)+B4)*0.01",
+      "Unit": "g/s",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": true
+    },
+    {
+      "Name": "MAP",
+      "Mode": "01",
+      "PID": "010B1",
+      "Expression": "B3",
+      "Unit": "kPa",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": true
+    },
+    {
+      "Name": "SPARKADV",
+      "Mode": "01",
+      "PID": "010E1",
+      "Expression": "(B3*0.5)-64",
+      "Unit": "deg",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": true
+    },
+    {
+      "Name": "KNOCKR",
+      "Mode": "22",
+      "PID": "2217461",
+      "Expression": "B4*0.3521126761",
+      "Unit": "deg",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 2,
+      "enabled": true
+    },
+    {
+      "Name": "HIDET_SW",
+      "Mode": "22",
+      "PID": "2217061",
+      "Expression": "B4&1",
+      "Unit": "on/off",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 8,
+      "enabled": true
+    },
+    {
+      "Name": "FUEL_PW",
+      "Mode": "22",
+      "PID": "2214101",
+      "Expression": "((B4*256)+B5)*0.008",
+      "Unit": "ms",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": true
+    },
+    {
+      "Name": "EQ_RATIO_DSD",
+      "Mode": "01",
+      "PID": "01441",
+      "Expression": "((B3*256)+B4)*0.0000305175",
+      "Unit": "lambda",
+      "Class": "",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "",
+      "enabled": true,
+      "description": "Lambda Commanded"
+    },
+    {
+      "Name": "EQ_RATIO_ACT",
+      "Mode": "01",
+      "PID": "01341",
+      "Expression": "((B3*256)+B4)*0.0000305175",
+      "Unit": "lambda",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": true,
+      "description": "Measured AFR in lambda"
+    },
+    {
+      "Name": "STFT",
+      "Mode": "01",
+      "PID": "01061",
+      "Expression": "(B3*0.78125)-100",
+      "Unit": "%",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 8,
+      "enabled": true
+    },
+    {
+      "Name": "LTFT",
+      "Mode": "01",
+      "PID": "01071",
+      "Expression": "(B3*0.78125)-100",
+      "Unit": "%",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 8,
+      "enabled": true
+    },
+    {
+      "Name": "APP",
+      "Mode": "01",
+      "PID": "01491",
+      "Expression": "B3*0.39215686",
+      "Unit": "%",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": true
+    },
+    {
+      "Name": "VCT_ACT",
+      "Mode": "22",
+      "PID": "2216CD1",
+      "Expression": "((B4*256)+B5)*0.0625",
+      "Unit": "deg",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 4,
+      "enabled": true
+    },
+    {
+      "Name": "FUELSYS",
+      "Mode": "01",
+      "PID": "01031",
+      "Expression": "((B3*256)+B4)*0.00390625",
+      "Unit": "",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 8,
+      "enabled": true
+    },
+    {
+      "Name": "BARO",
+      "Mode": "01",
+      "PID": "01331",
+      "Expression": "B3",
+      "Unit": "kPa",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 16,
+      "enabled": true,
+      "description": "Atmospheric pressure"
+    },
+    {
+      "Name": "TPS",
+      "Mode": "01",
+      "PID": "01111",
+      "Expression": "B3*0.39215686",
+      "Unit": "%",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": false,
+      "description": "Throttle plate sensor"
+    },
+    {
+      "Name": "IAT",
+      "Mode": "01",
+      "PID": "010F1",
+      "Expression": "B3-40",
+      "Unit": "C",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 2,
+      "enabled": false,
+      "comment": "Deactivated, using the Broadcasted version instead"
+    },
+    {
+      "Name": "ECT",
+      "Mode": "01",
+      "PID": "01051",
+      "Expression": "B3-40",
+      "Unit": "C",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 2,
+      "enabled": false
+    },
+    {
+      "Name": "VSS",
+      "Mode": "01",
+      "PID": "010D1",
+      "Expression": "B3",
+      "Unit": "km/h",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "enabled": false
+    },
+    {
+      "Name": "MAF_Volt",
+      "Mode": "22",
+      "PID": "2211771",
+      "Expression": "((B4*256)+B5)*0.000244140625",
+      "Unit": "V",
+      "Class": "",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "",
+      "enabled": false,
+      "description": "MAF sensor voltage"
+    },
+    {
+      "Name": "BRAKE_W",
+      "Mode": "23",
+      "PID": "23FFFF711600021",
+      "Expression": "(B2*256)+B3",
+      "Unit": "",
+      "Class": "none",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": "200",
+      "SampleEvery": 2,
+      "enabled": false
+    }
+  ],
+  "can_filters": [
+    {
+      "frame_id": 513,
+      "parameters": [
+        {
+          "name": "VSS",
+          "expression": "([B4:B5]/100)-100",
+          "unit": "km/h",
+          "class": "speed",
+          "period": "100",
+          "min": "",
+          "max": "",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "frame_id": 576,
+      "parameters": [
+        {
+          "name": "ECT",
+          "expression": "B1-40",
+          "unit": "C",
+          "class": "temperature",
+          "period": "1000",
+          "min": "",
+          "max": "",
+          "enabled": true
+        },
+        {
+          "name": "IAT",
+          "expression": "B4-40",
+          "unit": "C",
+          "class": "temperature",
+          "period": "1000",
+          "min": "",
+          "max": "",
+          "enabled": true
+        },
+        {
+          "name": "TPS",
+          "expression": "B3/2.55",
+          "unit": "%",
+          "class": "none",
+          "period": "200",
+          "min": "",
+          "max": "",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "frame_id": 513,
+      "parameters": [
+        {
+          "name": "RPM",
+          "expression": "[B0:B1]/4",
+          "unit": "RPM",
+          "class": "frequency",
+          "period": "100",
+          "min": "",
+          "max": "",
+          "enabled": false
+        },
+        {
+          "name": "APP",
+          "expression": "B6/2",
+          "unit": "%",
+          "class": "none",
+          "period": "100",
+          "min": "",
+          "max": "",
+          "enabled": false
+        }
+      ]
+    }
+  ],
+  "calculated": [
+    {
+      "name": "BOOST",
+      "expression": "(MAP-BARO)*0.145038",
+      "unit": "PSI",
+      "enabled": true
+    },
+    {
+      "name": "AFR",
+      "expression": "EQ_RATIO_ACT*14.71",
+      "unit": "",
+      "enabled": true
+    },
+    {
+      "name": "FUEL_IDC",
+      "expression": "RPM*FUEL_PW*0.00083333",
+      "unit": "%",
+      "enabled": true
+    },
+    {
+      "name": "COMBINED_FT",
+      "expression": "LTFT+STFT",
+      "unit": "%",
+      "enabled": true
+    },
+    {
+      "name": "AAT_IAT_DELTA",
+      "expression": "IAT-AAT",
+      "unit": "C",
+      "enabled": true
+    }
+  ]
+}

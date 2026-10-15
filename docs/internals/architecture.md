@@ -629,6 +629,7 @@ Two stores, two very different behaviours. Confusing them causes real damage.
 | Read back by | `GET /load_config` (raw stored) | `GET /load_auto_pid` |
 | Contains | Wi-Fi, CAN, sleep, logger settings — **and credentials** | the sensor set: polled PIDs, CAN filters, calculated channels |
 | On save | reboots, **usually** — see below | **no reboot** — hot-swaps the live PID table |
+| When missing at boot | factory defaults (`device_config_default`) | the stock NC sensor list, `main/default_auto_pid.json` (`config_server_seed_default_sensors`). Also written over an empty or broken file, and over an official-firmware file with no sensors (old file kept on the device as `.bad` / `.official`, not reachable from the UI); a file our Logger page saved (`format` or `calculated` key) is never replaced -- rule in `auto_pid_seed_logic.c` |
 
 - `GET /check_status` is the **built** JSON with defaults applied;
   `GET /load_config` is the **raw stored file**. Legacy configs may lack new

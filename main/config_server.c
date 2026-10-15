@@ -43,6 +43,7 @@
 #include <time.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include "ff.h"
 #include "filesystem.h"
 #if USE_FATFS	
@@ -81,6 +82,7 @@
 #include "sleep_mode.h"
 #include "vehicle.h"   // VEHICLE_ENGINE_ON_VOLT_DEFAULT_STR: engine_volt default, single-sourced
 #include "autopid.h"
+#include "auto_pid_seed_logic.h"   /* when the default sensor list replaces auto_pid.json */
 #include "wc_mdns.h"
 #include "elm327.h"
 #include "hw_config.h"
@@ -3723,6 +3725,147 @@ static void register_server_uris(void)
 //static char* device_config = NULL;
 static uint8_t esp_fatfs_flag = 0;
 static httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+extern const char default_auto_pid_start[] asm("_binary_default_auto_pid_json_start");
+
+// No sensor file comes near this (the full NC list is ~9 KB); anything larger is left alone.
+#define AUTO_PID_SEED_MAX_READ (64 * 1024)
+
+// Count what the poller would poll from an auto_pid.json: pids, std_pids, and every
+// broadcast parameter. Non-array values count as nothing.
+static int auto_pid_count_sensors(const cJSON *root)
+{
+	int n = 0;
+	const cJSON *pids = cJSON_GetObjectItem(root, "pids");
+	const cJSON *std_pids = cJSON_GetObjectItem(root, "std_pids");
+	const cJSON *filters = cJSON_GetObjectItem(root, "can_filters");
+	if (cJSON_IsArray(pids)) n += cJSON_GetArraySize(pids);
+	if (cJSON_IsArray(std_pids)) n += cJSON_GetArraySize(std_pids);
+	if (cJSON_IsArray(filters))
+	{
+		const cJSON *filter;
+		cJSON_ArrayForEach(filter, filters)
+		{
+			const cJSON *params = cJSON_GetObjectItem(filter, "parameters");
+			if (cJSON_IsArray(params)) n += cJSON_GetArraySize(params);
+		}
+	}
+	return n;
+}
+
+// Look at the stored auto_pid.json and fill in what auto_pid_seed_decide() needs.
+static void auto_pid_seed_inspect(const char *path, auto_pid_seed_in_t *in)
+{
+	struct stat st;
+	memset(in, 0, sizeof(*in));
+	if (stat(path, &st) != 0)
+	{
+		in->stat_failed = (errno != ENOENT);
+		return;
+	}
+	in->exists = true;
+	if (st.st_size > AUTO_PID_SEED_MAX_READ)
+	{
+		in->too_big = true;
+		return;
+	}
+	if (st.st_size <= 0)
+	{
+		return;		// empty: parsed stays false
+	}
+
+	char *buf = heap_caps_malloc(st.st_size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	FILE *f = buf ? fopen(path, "r") : NULL;
+	if (f == NULL)
+	{
+		// Exists but can't be read right now: not a reason to replace it.
+		free(buf);
+		in->stat_failed = true;
+		return;
+	}
+	size_t got = fread(buf, 1, st.st_size, f);
+	fclose(f);
+	if (got != (size_t)st.st_size)
+	{
+		// A short read is a filesystem problem, not a broken file: keep it.
+		free(buf);
+		in->stat_failed = true;
+		return;
+	}
+	buf[got] = '\0';
+
+	cJSON *root = cJSON_ParseWithLength(buf, got);
+	free(buf);
+	if (cJSON_IsObject(root))
+	{
+		in->parsed = true;
+		in->has_format = cJSON_GetObjectItem(root, "format") != NULL;
+		in->has_calculated = cJSON_GetObjectItem(root, "calculated") != NULL;
+		in->sensors = auto_pid_count_sensors(root);
+	}
+	cJSON_Delete(root);
+}
+
+// Write the stock NC sensor list (main/default_auto_pid.json) at boot when the device
+// has no usable list, so the Logger page is never empty for a new owner. The rule is in
+// auto_pid_seed_logic.c: a MISSING file, an empty or broken one, or a file the OFFICIAL
+// MeatPi firmware wrote with no sensors in it (its "Submit Changes" button always
+// saves "pids": [], and a web OTA keeps the filesystem). A file our Logger page saved is
+// never touched, even an empty one. A replaced file is kept as a backup next to it.
+// Runs before poll_log_init() (main.c), so the first boot already polls the list.
+// The new list goes to a temp file first, so a power cut leaves either the old file,
+// no file (seeded again next boot), or the new one -- never half a file.
+static void config_server_seed_default_sensors(void)
+{
+	const char *path = FS_MOUNT_POINT "/auto_pid.json";
+	const char *tmppath = FS_MOUNT_POINT "/auto_pid.json.tmp";
+	auto_pid_seed_in_t in;
+
+	auto_pid_seed_inspect(path, &in);
+	auto_pid_seed_t action = auto_pid_seed_decide(&in);
+	if (action == AUTO_PID_SEED_KEEP)
+	{
+		return;
+	}
+	const char *backup = NULL;
+	if (action == AUTO_PID_SEED_REPLACE_BAD) backup = FS_MOUNT_POINT "/auto_pid.json.bad";
+	if (action == AUTO_PID_SEED_REPLACE_OFFICIAL) backup = FS_MOUNT_POINT "/auto_pid.json.official";
+
+	FILE *f = fopen(tmppath, "w");
+	if (f == NULL)
+	{
+		ESP_LOGE(TAG, "default sensors: cannot open %s", tmppath);
+		return;
+	}
+	size_t len = strlen(default_auto_pid_start);
+	size_t written = fwrite(default_auto_pid_start, 1, len, f);
+	// LittleFS commits the data at close, so a failed close means a short file.
+	bool closed = (fclose(f) == 0);
+	if (written != len || !closed)
+	{
+		ESP_LOGE(TAG, "default sensors: write failed (%u/%u bytes)", (unsigned)written, (unsigned)len);
+		unlink(tmppath);
+		return;
+	}
+	if (backup != NULL)
+	{
+		unlink(backup);
+		if (rename(path, backup) != 0)
+		{
+			ESP_LOGE(TAG, "default sensors: cannot back up %s, list left as is", path);
+			unlink(tmppath);
+			return;
+		}
+	}
+	if (rename(tmppath, path) != 0)
+	{
+		ESP_LOGE(TAG, "default sensors: rename failed");
+		unlink(tmppath);
+		return;
+	}
+	ESP_LOGI(TAG, "default sensor list written (%s, %u bytes)%s%s", auto_pid_seed_name(action),
+	         (unsigned)len, backup ? ", old file kept as " : "", backup ? backup : "");
+}
+
 static httpd_handle_t config_server_init(void)
 {
 //	const char* base_path = "/"; //useless?
@@ -3810,9 +3953,10 @@ static httpd_handle_t config_server_init(void)
 				ESP_LOGE(TAG, "Failed to allocate memory for config file");
 				fclose(f);
 			}
-			
+
 		}
 
+		config_server_seed_default_sensors();
 	}
 
     xrestartTimer= xTimerCreate

@@ -13,6 +13,7 @@ set(srcs
     "ncflash_fastread.c"
     "ncflash_fastwrite.c"
     "flash_fence_logic.c"
+    "auto_pid_seed_logic.c"
     "ble.c"
     "wifi_network.c"
     "wc_uart.c"
@@ -106,4 +107,8 @@ idf_component_register(
         # "obd_fw/V2.3.18.txt"
         "obd_fw/V2.3.22.txt"
         "logo.txt"
+        EMBED_TXTFILES
+        # Sensor list written at boot when auto_pid.json is missing (config_server.c).
+        # TXTFILES so the blob is NUL-terminated and can be strlen'd.
+        "default_auto_pid.json"
 )
