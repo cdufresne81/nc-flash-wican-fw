@@ -1647,7 +1647,7 @@ function loadAutoTable(jsonData) {
         const automateTable = document.getElementById("automate_table");
         if (!automateTable) {
             console.error("PID table not found");
-            return;
+            return false;
         }
 
         const setElementValue = (id, value, defaultValue = '') => {
@@ -1769,10 +1769,12 @@ function loadAutoTable(jsonData) {
         // autoTableSavedJson snapshot above so sampleLoadCommitted() has its anchor.
         pollSweepRefresh();
         console.log("loadAutoTable completed successfully");
+        return true;
 
     } catch (error) {
         console.error('Error in loadAutoTable:', error);
-        showNotification("Error loading table data: " + error.message, "red");
+        showNotification("Error loading table data: " + safe(error.message), "red");
+        return false;   // the tables may be half-filled -- callers must not trust them
     }
 }
 
@@ -2144,8 +2146,21 @@ function buildAutoTableJson() {
 // on every save even from the Settings page. When nothing in the logger/PID table
 // changed, skip the POST entirely — it otherwise fires a misleading "PID table applied"
 // toast and triggers a needless live PID-table hot-swap (RCU reload) on the poll task.
-// The dedicated Logger "Store" button calls with the default (false) and always posts.
+// The dedicated Logger "Store" button calls with the default (false) and always posts --
+// unless the tables never loaded (issue #155, see the guard below), when it refuses.
 async function storeAutoTableData(skipIfUnchanged = false) {
+    // Issue #155: the tables only hold the device's list once /load_auto_pid has come back
+    // and filled them. Before that (still loading), or after a load that failed, they are
+    // empty or half-filled, and a POST would overwrite the stored list with that. The
+    // skip-unchanged check below cannot catch it: its baseline is null then, so it never
+    // matches and always posts.
+    if (sensorsLoadState === 'pending' || sensorsLoadState === 'failed') {
+        if (skipIfUnchanged) return true;   // combined Submit: save the settings, leave the list alone
+        showNotification(sensorsLoadState === 'pending'
+            ? "The sensor list is still loading. Try again in a moment."
+            : "The sensor list did not load, so it was not saved. Reload the page first.", "red", 8000);
+        return false;
+    }
     try {
         const serialized = JSON.stringify(buildAutoTableJson(), null, 0);
 
@@ -2214,9 +2229,29 @@ const SENSORS_FILE_VERSION = 1;
 // is what keeps an exported-then-imported config byte-identical to the stored one.
 const SENSORS_DEFAULT_PERIOD = '200';
 const SENSORS_DEFAULT_CLASS = 'none';   // both restored by the importer; see emitSensorsYaml
-// Set once /load_auto_pid has populated the page. Import refuses until then, because the
-// settings it passes through are read from the live DOM.
-var sensorsPageLoaded = false;
+// What the Logger tables hold, set by loadautoPID():
+//   'pending' -- /load_auto_pid has not come back yet; the tables still hold the static HTML.
+//   'loaded'  -- filled from the stored auto_pid.json.
+//   'none'    -- the device has no auto_pid.json; the empty tables ARE its state.
+//   'failed'  -- the load (or a sensor import) broke; the tables are empty or half-filled.
+// Saving the tables needs 'loaded' or 'none' (issue #155). Import needs 'loaded', because
+// the settings it passes through are read from the live DOM.
+var sensorsLoadState = 'pending';
+
+// The tables do not hold the device's list: block every save of them and say so on the
+// Logger page, where an empty table would otherwise look like a valid, empty list.
+function sensorsLoadFailed(reason) {
+    sensorsLoadState = 'failed';
+    const msg = "The sensor list did not load (" + reason + "). The tables below may be " +
+                "empty or incomplete, so this page will not save them. Reload the page. If this " +
+                "keeps happening, the stored list may be damaged: restore a backup from System.";
+    const banner = document.getElementById("sensors_load_error");
+    if (banner) {
+        banner.textContent = msg;
+        banner.style.display = "";
+    }
+    showNotification(msg, "red", 10000);
+}
 
 // Blob -> browser download. Shared by the sensor export, the System-tab whole-device
 // downloadCfg(), and the Tactrix logcfg.txt exporter to come (issue #37).
@@ -2606,7 +2641,10 @@ function applySensorsFile(text) {
     // still hold the static HTML defaults, so importing into a half-loaded page would
     // capture a default voltage threshold and push it on the next Store -- the one thing
     // omitting those keys is supposed to prevent.
-    if (!sensorsPageLoaded) {
+    if (sensorsLoadState === 'failed') {
+        throw new Error("the current sensor list did not load. Reload the page first.");
+    }
+    if (sensorsLoadState !== 'loaded') {
         throw new Error("the page is still loading the current sensor set. Try again in a moment.");
     }
     if (/^\s*[{[]/.test(text)) {
@@ -2639,8 +2677,14 @@ function applySensorsFile(text) {
     // Restoring the pre-import value keeps that single meaning; pollSweepRefresh() is
     // re-run because loadAutoTable() already fired it against the clobbered baseline.
     const deviceBaseline = autoTableSavedJson;
-    loadAutoTable(autoPid);   // replaces all three tables -- see the resets there
+    const filled = loadAutoTable(autoPid);   // replaces all three tables -- see the resets there
     autoTableSavedJson = deviceBaseline;
+    if (!filled) {
+        // The old rows are already gone and the new ones are partial: neither Store nor
+        // Submit may save this (issue #155).
+        sensorsLoadFailed("the import stopped half-way");
+        throw new Error("the file could not be loaded into the tables. Reload the page before saving anything.");
+    }
     pollSweepRefresh();
     enableAutoStoreButton();
     submit_enable();
@@ -3274,18 +3318,42 @@ function loadautoPID() {
     const xhttp = new XMLHttpRequest();
     xhttp.onload = function() {
         console.log("Server response:", this.responseText);
-        if(this.responseText !== "NONE") {
-            const data = JSON.parse(this.responseText);
-            loadAutoTable(data);
-            sensorsPageLoaded = true;   // the import passthrough may now trust the page
-            document.getElementById("custom_pid_store").disabled = true;
-        } else {
+        // Every failure below leaves the tables empty or partial: sensorsLoadFailed() keeps
+        // Submit and Store from saving them over the stored list (issue #155).
+        if (this.status !== 200) {
+            sensorsLoadFailed("the device answered HTTP " + this.status);
+            return;
+        }
+        if (this.responseText === "NONE") {
             console.log("No PID data found on server");
             togglePidPollingMinVoltageRow();
+            // No file: the empty tables are the device's real state. Baseline them so the
+            // combined Submit only creates a file when the user actually added something.
+            try {
+                autoTableSavedJson = JSON.stringify(buildAutoTableJson(), null, 0);
+            } catch (e) {
+                autoTableSavedJson = null;
+            }
+            sensorsLoadState = 'none';
+            return;
         }
+        let data;
+        try {
+            data = JSON.parse(this.responseText);
+        } catch (e) {
+            sensorsLoadFailed("the device sent a reply this page cannot read");
+            return;
+        }
+        if (!loadAutoTable(data)) {
+            sensorsLoadFailed("the stored list could not be shown");
+            return;
+        }
+        sensorsLoadState = 'loaded';   // Store/Submit and the import passthrough may now trust the page
+        document.getElementById("custom_pid_store").disabled = true;
     };
     xhttp.onerror = function(error) {
         console.error("Error loading auto PID:", error);
+        sensorsLoadFailed("the request did not reach the device");
     };
     xhttp.open("GET", "/load_auto_pid");
     xhttp.send();
