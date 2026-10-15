@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NC Flash WiCAN Manual</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Barlow+Semi+Condensed:wght@600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column with a sticky contents rail on wide screens; steps are a real sequence, so they are numbered. */
+:root {
+  --bg: #f6f7fa;
+  --paper: #ffffff;
+  --ink: #1b2233;
+  --muted: #5b6478;
+  --line: #dde2ec;
+  --accent: #2a4590;      /* the WiCAN web page's navy */
+  --accent-soft: #e8edf8;
+  --warn: #9a5b00;
+  --warn-soft: #fff4e0;
+  --danger: #a5262b;
+  --danger-soft: #fdecec;
+  --ok: #2f7d3b;
+  --code-bg: #eef1f6;
+  --font-display: "Barlow Semi Condensed", "Arial Narrow", Arial, sans-serif;
+  --font-body: "Atkinson Hyperlegible", "Segoe UI", Roboto, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", Consolas, "Courier New", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11141b; --paper: #181c25; --ink: #e6e9f0; --muted: #9aa3b5; --line: #2b3242;
+    --accent: #8fa8ee; --accent-soft: #1f2840; --warn: #f0b45a; --warn-soft: #2b2316;
+    --danger: #f08a8e; --danger-soft: #2e1a1c; --ok: #7ccf88; --code-bg: #222837;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11141b; --paper: #181c25; --ink: #e6e9f0; --muted: #9aa3b5; --line: #2b3242;
+  --accent: #8fa8ee; --accent-soft: #1f2840; --warn: #f0b45a; --warn-soft: #2b2316;
+  --danger: #f08a8e; --danger-soft: #2e1a1c; --ok: #7ccf88; --code-bg: #222837;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 17px/1.6 var(--font-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 1120px; margin: 0 auto; padding-block: 40px 80px; display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 48px; }
+@media (max-width: 900px) { .wrap { grid-template-columns: minmax(0, 1fr); gap: 24px; padding-block: 24px 60px; } }
+
+nav.toc { position: sticky; top: calc(24px + env(safe-area-inset-top, 0px)); align-self: start; font-size: 15px; }
+nav.toc .label { font: 700 12px/1 var(--font-body); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; }
+nav.toc ol { list-style: none; margin: 0 0 20px; padding: 0; display: grid; gap: 6px; }
+nav.toc a { color: var(--ink); text-decoration: none; }
+nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); text-decoration: underline; }
+@media (max-width: 900px) {
+  nav.toc { position: static; background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  nav.toc ol { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+}
+
+main { min-width: 0; }
+header.top { border-bottom: 3px solid var(--accent); padding-bottom: 20px; margin-bottom: 8px; }
+.eyebrow { font: 700 12px/1 var(--font-body); letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
+h1, h2, h3 { font-family: var(--font-display); line-height: 1.15; text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(34px, 5vw, 48px); margin-top: 8px; }
+h2 { font-size: 32px; margin: 64px 0 12px; padding-top: 8px; }
+h3 { font-size: 23px; margin: 36px 0 8px; }
+p { margin: 0 0 14px; max-width: 68ch; }
+.lede { font-size: 19px; color: var(--muted); max-width: 62ch; margin-top: 12px; }
+.meta { font-size: 14px; color: var(--muted); margin-top: 10px; }
+a { color: var(--accent); }
+code, kbd { font-family: var(--font-mono); font-size: .86em; background: var(--code-bg); padding: 1px 6px; border-radius: 4px; overflow-wrap: anywhere; }
+kbd { border: 1px solid var(--line); border-bottom-width: 2px; }
+.ui { font-weight: 700; }            /* a label exactly as it appears on screen */
+ul, ol { padding-left: 1.3em; margin: 0 0 14px; max-width: 68ch; }
+li { margin-bottom: 6px; }
+
+/* Quick start steps */
+.steps { list-style: none; padding: 0; margin: 24px 0 0; max-width: none; counter-reset: step; display: grid; gap: 18px; }
+.step { counter-increment: step; background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 22px 24px 20px 76px; position: relative; margin: 0; }
+.step::before {
+  content: counter(step); position: absolute; left: 22px; top: 20px;
+  width: 38px; height: 38px; border-radius: 50%; background: var(--accent); color: var(--paper);
+  font: 700 20px/38px var(--font-display); text-align: center;
+}
+.step h3 { margin: 4px 0 8px; font-size: 22px; }
+.step p:last-child, .step ul:last-child { margin-bottom: 0; }
+@media (max-width: 560px) { .step { padding: 64px 18px 18px; } .step::before { left: 18px; top: 16px; } }
+
+figure { margin: 16px 0 22px; max-width: 760px; }
+figure.small { max-width: 560px; }
+figure a { display: block; }
+figure img { display: block; width: 100%; max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+figcaption { font-size: 14px; color: var(--muted); margin-top: 8px; }
+
+.note, .warn, .danger { border-radius: 8px; padding: 14px 18px; margin: 16px 0; max-width: 72ch; font-size: 16px; }
+.note { background: var(--accent-soft); }
+.warn { background: var(--warn-soft); border-left: 4px solid var(--warn); }
+.danger { background: var(--danger-soft); border-left: 4px solid var(--danger); }
+.note p:last-child, .warn p:last-child, .danger p:last-child, .warn ul:last-child, .danger ul:last-child { margin-bottom: 0; }
+.tag { font: 700 12px/1 var(--font-body); letter-spacing: .1em; text-transform: uppercase; display: block; margin-bottom: 6px; }
+.warn .tag { color: var(--warn); } .danger .tag { color: var(--danger); } .note .tag { color: var(--accent); }
+
+.table-wrap { overflow-x: auto; margin: 16px 0 22px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
+table { border-collapse: collapse; width: 100%; font-size: 15.5px; }
+th, td { text-align: left; vertical-align: top; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+th { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); background: var(--code-bg); }
+tr:last-child td { border-bottom: 0; }
+td:first-child { white-space: nowrap; }
+.err { font-family: var(--font-mono); font-size: 13.5px; white-space: normal; }
+
+.need { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 16px 0 0; }
+.need div { background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; font-size: 15.5px; }
+.need b { display: block; font-family: var(--font-display); font-size: 19px; margin-bottom: 2px; }
+hr { border: 0; border-top: 1px solid var(--line); margin: 56px 0 0; }
+footer { margin-top: 56px; font-size: 14px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="toc" aria-label="Contents">
+  <div class="label">Quick start</div>
+  <ol>
+    <li><a href="#need">What you need</a></li>
+    <li><a href="#quick">Six steps</a></li>
+  </ol>
+  <div class="label">Guide</div>
+  <ol>
+    <li><a href="#webpage">The WiCAN page</a></li>
+    <li><a href="#wifi">Wi-Fi setup</a></li>
+    <li><a href="#logging">Datalogging</a></li>
+    <li><a href="#triplogs">Logs in NC Flash</a></li>
+    <li><a href="#flash">Read &amp; flash the ECU</a></li>
+    <li><a href="#folders">NC Flash folders</a></li>
+    <li><a href="#sleep">Sleep mode</a></li>
+    <li><a href="#updates">Updates &amp; recovery</a></li>
+    <li><a href="#trouble">Troubleshooting</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="top">
+  <div class="eyebrow">Mazda MX-5 NC · WiCAN PRO · NC Flash</div>
+  <h1>NC Flash WiCAN Manual</h1>
+  <p class="lede">Set up the WiCAN PRO adapter to read, flash and datalog your NC over Wi-Fi, without a cable to the laptop.</p>
+  <p class="meta">Written for WiCAN firmware v1.25.1 and the current NC Flash release. For the MX-5 NC only.</p>
+</header>
+
+<!-- ============================ QUICK START ============================ -->
+<h2 id="need">What you need</h2>
+<div class="need">
+  <div><b>WiCAN PRO</b>The meatPi OBD-II adapter, plugged into the car's OBD port.</div>
+  <div><b>microSD card</b>FAT32, in the WiCAN. It stores trip logs and the ROM during a wireless flash.</div>
+  <div><b>Windows PC</b>With NC Flash installed, on the same Wi-Fi as the WiCAN.</div>
+  <div><b>A Wi-Fi network</b>Home or garage Wi-Fi. Or use the WiCAN's own hotspot.</div>
+</div>
+
+<h2 id="quick">Quick start</h2>
+<p>Do these once. After step 3, firmware updates install from the WiCAN page.</p>
+
+<ol class="steps">
+  <li class="step">
+    <h3>Download the firmware</h3>
+    <p>Open the <a href="https://github.com/cdufresne81/nc-flash-wican-fw/releases/latest">latest firmware release</a>. Under <span class="ui">Assets</span>, download <b>only</b> the file named <code>wican-fw_obd_pro_v…bin</code>. You do not need the other files; they are for USB flashing.</p>
+    <figure><a href="img/gh_assets.png"><img src="img/gh_assets.png" alt="GitHub release assets list. The file to download is wican-fw_obd_pro_v1_25_1.bin." loading="lazy"></a>
+      <figcaption>Take the <code>wican-fw_obd_pro_…bin</code> file (2.7 MB). Ignore bootloader, partition-table, ota_data and flasher_args.</figcaption></figure>
+  </li>
+
+  <li class="step">
+    <h3>Connect to the WiCAN</h3>
+    <p>Plug the WiCAN into the car. On your phone or PC, join its Wi-Fi network:</p>
+    <ul>
+      <li>Network name: <code>WiCAN_</code> followed by 12 letters and numbers</li>
+      <li>Password: <code>@meatpi#</code></li>
+    </ul>
+    <p>Then open <code>http://192.168.0.10</code> in a browser. Some older stock firmware uses <code>http://192.168.80.1</code>.</p>
+  </li>
+
+  <li class="step">
+    <h3>Install the NC Flash firmware</h3>
+    <p>A new WiCAN runs the stock meatPi firmware, so its page looks different from the screenshots here. Find its firmware update box (under <span class="ui">About</span> or <span class="ui">System</span>, depending on the version). Choose the <code>.bin</code> file, press <span class="ui">Update</span>, and wait about 30 seconds while it restarts.</p>
+    <p>When the page comes back with the black <b>NC</b> logo, the firmware is installed.</p>
+  </li>
+
+  <li class="step">
+    <h3>Put the WiCAN on your Wi-Fi</h3>
+    <p>Go to <span class="ui">Settings</span>:</p>
+    <ul>
+      <li><span class="ui">Mode</span>: choose <b>AP+Station</b>.</li>
+      <li><span class="ui">AP Password</span>: change it. The page will not save while the default <code>@meatpi#</code> is still there.</li>
+      <li><span class="ui">Network Configuration</span>: press <span class="ui">Scan</span> or type your Wi-Fi name (<span class="ui">SSID</span>), then its <span class="ui">Password</span>.</li>
+      <li>Press <span class="ui">Submit Changes</span> at the bottom. The WiCAN restarts.</li>
+    </ul>
+    <figure><a href="img/web_wifi.png"><img src="img/web_wifi.png" alt="WiCAN Settings page, AP Config and Network Configuration sections." loading="lazy"></a>
+      <figcaption>Settings → AP Config and Network Configuration. The hotspot name (AP SSID) is optional.</figcaption></figure>
+    <p>Join your normal Wi-Fi again and open the WiCAN by its new address. To find the address, open <span class="ui">Status</span> while you are still on the WiCAN's hotspot, or look in your router's device list. <span class="ui">Station IP</span> is the number to use. <span class="ui">mDNS</span> is a name that also works in Chrome.</p>
+    <figure><a href="img/web_status.png"><img src="img/web_status.png" alt="WiCAN Status page showing Station IP and the mDNS name." loading="lazy"></a>
+      <figcaption>Status → Station IP and mDNS. Write the Station IP down; NC Flash needs it.</figcaption></figure>
+  </li>
+
+  <li class="step">
+    <h3>Point NC Flash at the WiCAN</h3>
+    <p>Install NC Flash from its <a href="https://github.com/cdufresne81/nc-flash/releases/latest">releases page</a> (<code>NCFlash-…-Setup.exe</code>). If Windows SmartScreen stops it, click <span class="ui">More info</span> → <span class="ui">Run anyway</span>.</p>
+    <p>Open <span class="ui">Edit → Settings…</span> and make two changes:</p>
+    <ol>
+      <li><span class="ui">ECU → Adapter</span>: set <span class="ui">ECU Adapter</span> to <b>WiCAN (WiFi)</b>. This is the step people miss: NC Flash uses the wired J2534 cable by default.</li>
+      <li><span class="ui">ECU → WiCAN</span>: press <span class="ui">Scan…</span> and pick your WiCAN, or type its Station IP. Press <span class="ui">Test Connection</span>. You should see <span class="ui">Connection OK</span>.</li>
+    </ol>
+    <figure class="small"><a href="img/ncf_adapter.png"><img src="img/ncf_adapter.png" alt="NC Flash Settings, ECU Adapter set to WiCAN (WiFi)." loading="lazy"></a>
+      <figcaption>Settings → ECU → Adapter → <b>WiCAN (WiFi)</b>.</figcaption></figure>
+    <figure><a href="img/ncf_wican.png"><img src="img/ncf_wican.png" alt="NC Flash Settings, ECU WiCAN page with Host/IP, Scan, Test Connection and Trip Logs options." loading="lazy"></a>
+      <figcaption>Settings → ECU → WiCAN. Enter the host, then Test Connection.</figcaption></figure>
+  </li>
+
+  <li class="step">
+    <h3>Connect to the car and back up your ROM</h3>
+    <p>Ignition <b>ON</b>, engine <b>OFF</b>. In NC Flash open <span class="ui">Tools → ECU Programming…</span> (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>). It connects by itself and shows battery, engine and ECU.</p>
+    <p>Before anything else, press <span class="ui">Read ROM</span> to save your stock ROM. Keep that file somewhere safe; it is how you go back to factory. A full read takes about 4 minutes over Wi-Fi.</p>
+  </li>
+</ol>
+
+<div class="note"><span class="tag">Last step: turn on logging</span><p>Logging is off on a new WiCAN. Open <span class="ui">Logger</span>, set <span class="ui">Logging</span> to <b>Enable</b>, and press <span class="ui">Submit Changes</span>. From then on, every drive is logged to the SD card. The rest of this manual explains each part.</p></div>
+
+<!-- ============================ GUIDE ============================ -->
+<hr>
+<h2 id="webpage">The WiCAN page</h2>
+<p>Open the WiCAN's address in a browser. The menu on the left has seven pages:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Page</th><th>What it is for</th></tr></thead>
+  <tbody>
+    <tr><td class="ui">Console</td><td>Start or stop a trip by hand, and download recent trip logs. The top bar shows SD card, Wi-Fi, firmware version and battery voltage.</td></tr>
+    <tr><td class="ui">Files</td><td>Browse, download or delete files on the SD card.</td></tr>
+    <tr><td class="ui">Logger</td><td>When to log, how fast, and which sensors. See <a href="#logging">Datalogging</a>.</td></tr>
+    <tr><td class="ui">Settings</td><td>Wi-Fi, sleep mode, time zone, LED. Press <span class="ui">Submit Changes</span> to save.</td></tr>
+    <tr><td class="ui">Status</td><td>Station IP, mDNS name, Wi-Fi state, battery, uptime.</td></tr>
+    <tr><td class="ui">System</td><td>Firmware update, reboot, back up or restore the settings.</td></tr>
+    <tr><td class="ui">About</td><td>Version information.</td></tr>
+  </tbody>
+</table></div>
+<figure><a href="img/web_console.png"><img src="img/web_console.png" alt="WiCAN Field Console with Trip Recorder and Recent Trips." loading="lazy"></a>
+  <figcaption>The Console page: trip recorder on the left, recent trips on the right.</figcaption></figure>
+
+<h2 id="wifi">Wi-Fi setup</h2>
+<h3>The three modes</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Mode</th><th>What happens</th><th>Use it when</th></tr></thead>
+  <tbody>
+    <tr><td><b>AP+Station</b></td><td>Joins your Wi-Fi. When your Wi-Fi is out of range (on the road), it makes its own hotspot instead.</td><td>Most people. Recommended.</td></tr>
+    <tr><td><b>AP Mode</b></td><td>Only its own hotspot, at <code>192.168.0.10</code>.</td><td>No Wi-Fi where the car is. Connect the laptop to the hotspot.</td></tr>
+    <tr><td><b>Station Mode</b></td><td>Only your Wi-Fi. No hotspot.</td><td>The car never leaves your Wi-Fi.</td></tr>
+  </tbody>
+</table></div>
+<ul>
+  <li><span class="ui">Auto-Disable AP</span>: turns the hotspot off while the WiCAN is on your Wi-Fi, and back on when it is not. Leave it on <b>Enable</b>. It avoids Wi-Fi trouble.</li>
+  <li><span class="ui">AP SSID</span>: tick the box to give the hotspot your own name, for example <code>MyMiata</code>.</li>
+  <li><span class="ui">Backup Networks</span>: up to 5 more Wi-Fi networks (a shop, a phone hotspot). The WiCAN tries them when the main one fails.</li>
+  <li>NC Flash works with any of the three modes. Just use the address the laptop can reach.</li>
+</ul>
+<div class="note"><span class="tag">Address</span><p>On your Wi-Fi, use the <span class="ui">Station IP</span> from the Status page (for example <code>192.168.1.169</code>). The <code>wican_….local</code> name works in Chrome but not in every program. When it fails, use the IP.</p></div>
+
+<h2 id="logging">Datalogging</h2>
+<p>Once <span class="ui">Logging</span> is enabled, the WiCAN logs to its SD card by itself. A log starts when the engine runs and ends when you stop it. You do not need the laptop in the car.</p>
+<figure><a href="img/web_logger.png"><img src="img/web_logger.png" alt="WiCAN Logger page: logging settings, Sensor Set import and export, Polled PIDs list." loading="lazy"></a>
+  <figcaption>The Logger page. Two save buttons: <span class="ui">Submit Changes</span> saves the settings at the top; <span class="ui">Store</span> saves the sensor list.</figcaption></figure>
+<h3>Logger settings</h3>
+<ul>
+  <li><span class="ui">Logging</span>: <b>Enable</b> to record trips.</li>
+  <li><span class="ui">Require Engine Running</span>: <b>On</b> logs only while the engine runs, one file per drive. <b>Off</b> logs whenever the WiCAN has power (bench use).</li>
+  <li><span class="ui">Engine-On Voltage</span>: the battery voltage that means "engine running" (alternator charging). The default, 13.0 V, suits most cars.</li>
+  <li><span class="ui">Polling Rate</span>: leave <b>Auto (fastest)</b> ticked. The WiCAN measures how fast your sensor list can go and logs at that rate.</li>
+</ul>
+<h3>Sensors</h3>
+<p>The firmware ships a ready-made NC sensor list. There are three kinds:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Kind</th><th>What it is</th><th>Examples</th></tr></thead>
+  <tbody>
+    <tr><td><b>Polled</b></td><td>Asked from the ECU on each sweep: standard OBD (Mode 01), Mazda extended (Mode 22) or a memory read (Mode 23).</td><td>RPM, LOAD, MAF, SPARKADV, STFT, LTFT</td></tr>
+    <tr><td><b>Broadcast</b></td><td>Read from messages the car already sends on its CAN bus (the dashboard data). Nothing is asked, so they are fast.</td><td><code>0x201</code> speed, <code>0x240</code> coolant</td></tr>
+    <tr><td><b>Calculated</b></td><td>Made from other sensors with a formula.</td><td>BOOST, AFR, FUEL_IDC</td></tr>
+  </tbody>
+</table></div>
+<ul>
+  <li>Untick <span class="ui">Enabled</span> on sensors you do not need. Fewer polled sensors means a faster log.</li>
+  <li><span class="ui">Export Sensors</span> saves the whole list as a <code>.yaml</code> file: a backup, or a way to share it. <span class="ui">Import Sensors</span> loads one. Nothing is saved on the WiCAN until you press <span class="ui">Store</span>.</li>
+  <li>If a red note at the top says the list did not load, reload the page before you change anything.</li>
+</ul>
+<h3>Manual trips</h3>
+<p>On the <span class="ui">Console</span>, <span class="ui">Start Trip</span> records right away, even with the engine off. Press it again to stop. Each trip is one <code>.csv</code> file named by date and time.</p>
+
+<h2 id="triplogs">Logs in NC Flash</h2>
+<p>NC Flash downloads trip logs from the SD card over Wi-Fi. Open <span class="ui">Tools → WiCAN Trip Logs…</span> (this menu item only shows when the adapter is set to WiCAN).</p>
+<figure><a href="img/ncf_triplogs.png"><img src="img/ncf_triplogs.png" alt="NC Flash WiCAN Trip Logs window listing CSV logs with size, date and status." loading="lazy"></a>
+  <figcaption>Press <span class="ui">Download New Logs</span>. Files go to the Trip Logs folder (see <a href="#folders">folders</a>).</figcaption></figure>
+<ul>
+  <li>Downloads run at about 0.7 MB/s. The window shows a time estimate first.</li>
+  <li>At startup, NC Flash checks for new logs and asks before it downloads (<span class="ui">Check for new trip logs at startup</span>).</li>
+  <li>If MegaLogViewerHD is installed, NC Flash offers to open the new logs in it.</li>
+  <li><span class="ui">Delete trip logs from the WiCAN after download</span> keeps the SD card from filling up. It only deletes files it has checked, and keeps the newest few (<span class="ui">Trips to keep on the WiCAN</span>, 5 by default).</li>
+</ul>
+<p>Live data on the laptop while driving is not available yet. Logs are recorded on the WiCAN and read afterwards.</p>
+
+<h2 id="flash">Read &amp; flash the ECU</h2>
+<div class="danger"><span class="tag">Before you flash</span>
+<ul>
+  <li><b>Back up your stock ROM first</b> with <span class="ui">Read ROM</span>. Without it you cannot go back to factory.</li>
+  <li>Ignition <b>ON</b>, engine <b>OFF</b>. NC Flash blocks the flash if the engine runs.</li>
+  <li>Battery at <b>12.0 V or more</b>. Use a charger or battery maintainer. A voltage drop during a flash can leave the ECU unable to start the car.</li>
+  <li>Keep the laptop near the car, and do not turn the key off until NC Flash says it is done.</li>
+</ul></div>
+<figure><a href="img/ncf_ecu.png"><img src="img/ncf_ecu.png" alt="NC Flash ECU Programming window: Connected, battery 12.6 V OK, engine OFF safe to flash, ECU ID, Flash Current ROM button." loading="lazy"></a>
+  <figcaption>The ECU Programming window (example values). Green cards mean it is safe to flash.</figcaption></figure>
+<h3>The buttons</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Button</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td class="ui">Flash Current ROM</td><td>Flashes the ROM open in the editor. <b>(Full)</b> writes everything. <b>(Dynamic)</b> writes only the changed blocks; it appears after the first flash of a project.</td></tr>
+    <tr><td class="ui">Full Flash…</td><td>Writes a complete ROM file.</td></tr>
+    <tr><td class="ui">Read ROM</td><td>Saves the ECU's ROM to a file in the <code>reads</code> folder, then opens that folder.</td></tr>
+    <tr><td class="ui">Read DTCs / Clear DTCs</td><td>Shows or clears stored trouble codes.</td></tr>
+    <tr><td class="ui">Read RAM</td><td>Saves the ECU's live memory to a file. For advanced use.</td></tr>
+  </tbody>
+</table></div>
+<h3>How a wireless flash works</h3>
+<p>NC Flash first uploads the ROM to the WiCAN's SD card and checks it. Only then does the WiCAN flash the ECU itself, over the car's wiring. Wi-Fi is not used while the ECU is being written, so a Wi-Fi drop cannot stop the flash halfway. NC Flash also tests the Wi-Fi link first and refuses to start on a bad link.</p>
+<p>When it finishes, the ECU restarts by itself. Turning the key OFF and back ON afterwards is a good check that the new ROM starts.</p>
+<div class="note"><span class="tag">Flash Security</span><p>Reading and flashing need NC Flash's flash security module. Check <span class="ui">Settings → ECU → Flash Security</span>. If it says <span class="ui">Not installed</span>, contact the project maintainer.</p></div>
+
+<h2 id="folders">NC Flash folders</h2>
+<p>By default NC Flash keeps everything in <code>%APPDATA%\NCFlash</code>, and the open and save windows start in its <code>roms</code> folder. To work from your own folder, open <span class="ui">Settings → General → Paths</span>:</p>
+<ul>
+  <li><span class="ui">Workspace Directory</span> moves everything at once.</li>
+  <li><span class="ui">ROMs Directory</span> is where open and save windows start.</li>
+  <li><span class="ui">Trip Logs Directory</span> is where WiCAN logs are saved.</li>
+</ul>
+<figure><a href="img/ncf_paths.png"><img src="img/ncf_paths.png" alt="NC Flash Settings, General Paths page with workspace, ROMs, metadata, projects, export, screenshots and trip logs folders." loading="lazy"></a>
+  <figcaption>Settings → General → Paths. Use <span class="ui">Browse…</span> to pick a folder.</figcaption></figure>
+
+<h2 id="sleep">Sleep mode</h2>
+<p>The WiCAN stays plugged in, so it sleeps to protect the battery. Settings → <span class="ui">Sleep Mode</span>:</p>
+<ul>
+  <li><span class="ui">Sleep Voltage</span>: <b>13.0 V</b>. Below this the engine is off, and the WiCAN starts counting. Do not set it near 12.4 V: a resting battery sits above that, so the WiCAN would never sleep.</li>
+  <li><span class="ui">Sleep After</span>: minutes below the sleep voltage before it sleeps. The default is 5.</li>
+  <li><span class="ui">Wake on CAN</span>: <b>Enable</b>. The WiCAN wakes when the car's network wakes up (key on).</li>
+</ul>
+<p>The WiCAN never sleeps during an ECU flash or a firmware update. While it sleeps, the page and NC Flash cannot reach it. Turn the key to wake it.</p>
+
+<h2 id="updates">Updates &amp; recovery</h2>
+<h3>WiCAN firmware</h3>
+<p>Download the new <code>wican-fw_obd_pro_…bin</code> as in step 1. Then open <span class="ui">System → Firmware Update</span>, choose the file, press <span class="ui">Update</span>. Your settings and sensors are kept. The WiCAN refuses to update while a flash is running.</p>
+<figure><a href="img/web_update.png"><img src="img/web_update.png" alt="WiCAN System page, Firmware Update section with Choose File and Update buttons." loading="lazy"></a>
+  <figcaption>System → Firmware Update.</figcaption></figure>
+<p><b>If an update fails:</b> hold the WiCAN's button for 5 seconds. It starts a recovery hotspot named <code>WiCAN_…</code> (password <code>@meatpi#</code>). Join it, open <code>http://192.168.0.10</code>, and upload the firmware again. This only repairs the WiCAN. It has nothing to do with the car's ECU.</p>
+<h3>NC Flash</h3>
+<p>NC Flash checks GitHub for a new version once a day and offers to install it. You can also use <span class="ui">Help → Check for Updates</span>.</p>
+<h3>Back up your settings</h3>
+<p><span class="ui">System → Download Configuration</span> saves all WiCAN settings to a file. <span class="ui">Upload Configuration</span> puts them back.</p>
+
+<h2 id="trouble">Troubleshooting</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>You see</th><th>Cause</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td class="err">J2534 bridge: PassThruOpen failed: code 8</td><td>NC Flash is still set to the wired cable.</td><td>Settings → ECU → Adapter → <b>WiCAN (WiFi)</b>.</td></tr>
+    <tr><td class="err">Connection Refused … nothing is listening on SLCAN port 35001</td><td>The WiCAN runs stock or old firmware.</td><td>Install the NC Flash firmware (steps 1–3).</td></tr>
+    <tr><td class="err">Firmware Too Old</td><td>The firmware is older than NC Flash needs.</td><td>Update the firmware: System → Firmware Update.</td></tr>
+    <tr><td class="err">Connection Failed / Could not reach the WiCAN</td><td>Wrong address, WiCAN asleep, or a different network.</td><td>Turn the key on. Check the Station IP on the Status page. Same Wi-Fi as the PC.</td></tr>
+    <tr><td class="err">No Devices Found (Scan…)</td><td>Different network, or a firewall blocks UDP port 5353.</td><td>Type the Station IP instead.</td></tr>
+    <tr><td class="err">AP password MUST be changed from default</td><td>The hotspot still uses <code>@meatpi#</code>.</td><td>Set a new AP Password (8 to 63 characters), then Submit.</td></tr>
+    <tr><td class="err">wican_….local does not open</td><td>Not every browser or program finds <code>.local</code> names.</td><td>Use the Station IP.</td></tr>
+    <tr><td class="err">ECU stopped answering. Check the ignition is ON</td><td>Key off, or the ECU went quiet.</td><td>Ignition ON, then Connect again.</td></tr>
+    <tr><td class="err">Engine Running — Flash Blocked</td><td>The engine is running.</td><td>Engine off, ignition ON.</td></tr>
+    <tr><td class="err">Low Battery Voltage</td><td>Battery under 12.0 V.</td><td>Connect a charger and try again.</td></tr>
+    <tr><td class="err">WiCAN not reachable (device off or asleep)</td><td>The WiCAN is asleep or out of range.</td><td>Turn the key on, wait a few seconds, press Refresh.</td></tr>
+    <tr><td class="err">Logger list is empty or shows a red note</td><td>The page did not load the sensors.</td><td>Reload the page. Do not press Store on an empty list.</td></tr>
+  </tbody>
+</table></div>
+
+<footer>
+  NC Flash WiCAN firmware is a fork of <a href="https://github.com/meatpiHQ/wican-fw">meatpiHQ/wican-fw</a> (GPL v3).
+  Firmware: <a href="https://github.com/cdufresne81/nc-flash-wican-fw">cdufresne81/nc-flash-wican-fw</a> ·
+  NC Flash: <a href="https://github.com/cdufresne81/nc-flash">cdufresne81/nc-flash</a>.
+  Questions and bugs: open an issue on GitHub.
+</footer>
+</main>
+</div>
+</body>
+</html>
