@@ -919,6 +919,14 @@
             color: var(--primary-dark)
         }
 
+        .guard-note.load-error {
+            margin-top: 0;
+            margin-bottom: 1rem;
+            background: #fee2e2;
+            border: 1px solid #ef4444;
+            color: #991b1b
+        }
+
         .console-events-card {
             margin-top: 16px
         }
@@ -1650,6 +1658,7 @@
         </div>
         <div class="tabcontent" id="logger">
             <div class="section-title">Logger</div>
+            <div class="guard-note load-error" id="sensors_load_error" style="display:none"></div>
             <table class="form-table">
                 <tbody>
                     <tr>
