@@ -188,6 +188,20 @@ static csv_ecu_silent_fn_t csv_ecu_silent_fn = NULL;
 // lock-free on grid ticks.
 static csv_rate_fn_t csv_rate_fn = NULL;
 
+// Live-stream hook (registered by main/datalog_stream.c, issue #3). Written once at boot; called
+// only from the writer task. NULL = no stream, and every call site is a no-op.
+static volatile csv_stream_hook_t csv_stream_hook = NULL;
+
+static inline void csv_stream_notify(csv_stream_event_t ev, const char *file, int cols,
+                                     const char *line, size_t len)
+{
+    const csv_stream_hook_t hook = csv_stream_hook;
+    if (hook != NULL)
+    {
+        hook(ev, file, cols, line, len);
+    }
+}
+
 // Distinct diagnostics -- do NOT overload csv_rows_dropped (which means "queue full"):
 static uint32_t csv_cols_unmatched = 0;   // WIDE record whose (source,name) isn't a column
 static uint32_t csv_pending_drops  = 0;   // records lost while a WIDE session waited for enum
@@ -262,6 +276,25 @@ static void csv_sanitize_field(char *s)
     }
 }
 
+// Append s to the header copy in csv_line_buf. Once a piece does not fit (keeping room for the
+// NUL), *fits goes false and stays false: the stream then announces the header as unavailable.
+static void csv_hdr_mirror(size_t *len, bool *fits, const char *s)
+{
+    if (!*fits)
+    {
+        return;
+    }
+    const size_t n = strlen(s);
+    if (*len + n + 1 > CSV_WIDE_LINE_BUF)
+    {
+        *fits = false;
+        return;
+    }
+    memcpy(csv_line_buf + *len, s, n);
+    *len += n;
+    csv_line_buf[*len] = '\0';
+}
+
 static esp_err_t csv_open_new_file(void)
 {
     struct stat st;
@@ -318,9 +351,16 @@ static esp_err_t csv_open_new_file(void)
     // identical header, so every rotated file is self-describing. Stream column-by-column (no
     // buffer bound here). The two system columns are emitted in the same fixed order by
     // csv_emit_wide_row(), so header and rows stay aligned.
+    //
+    // The live stream (issue #3) needs the same header as ONE line, so each piece is also copied
+    // into csv_line_buf, which is free until the first row. The SD writes themselves are
+    // unchanged. A header too long for the buffer is sent as "unavailable", never torn.
+    size_t hdr_len = 0;
+    bool hdr_fits = (csv_line_buf != NULL);
     csv_file_bytes = 0;
     int n = fprintf(csv_file, "timestamp_ms,datetime,BATT_V");
     if (n > 0) csv_file_bytes += (size_t)n;
+    csv_hdr_mirror(&hdr_len, &hdr_fits, "timestamp_ms,datetime,BATT_V");
     for (int c = 0; c < csv_col_count; c++)
     {
         char hdr[CSV_LOGGER_NAME_MAX + CSV_LOGGER_SOURCE_MAX + 4];
@@ -331,13 +371,18 @@ static esp_err_t csv_open_new_file(void)
         csv_sanitize_field(hdr);   // sanitize a COPY; the column table keeps the raw name
         n = fprintf(csv_file, ",%s", hdr);
         if (n > 0) csv_file_bytes += (size_t)n;
+        csv_hdr_mirror(&hdr_len, &hdr_fits, ",");
+        csv_hdr_mirror(&hdr_len, &hdr_fits, hdr);
     }
     n = fprintf(csv_file, ",mark");          /* FINAL column: one-shot event marker (see csv_mark_pending) */
     if (n > 0) csv_file_bytes += (size_t)n;
     n = fprintf(csv_file, "\n");
     if (n > 0) csv_file_bytes += (size_t)n;
+    csv_hdr_mirror(&hdr_len, &hdr_fits, ",mark\n");
     csv_files_count++;
     ESP_LOGI(TAG, "CSV log started: %s (wide, %d cols)", csv_file_path, csv_col_count);
+    csv_stream_notify(CSV_STREAM_EV_OPEN, csv_file_path, csv_col_count,
+                      hdr_fits ? csv_line_buf : NULL, hdr_fits ? hdr_len : 0);
     return ESP_OK;
 }
 
@@ -352,6 +397,7 @@ static void csv_close_file(void)
                  csv_file_path, (unsigned)csv_rows_written, (unsigned)csv_file_bytes);
         csv_file = NULL;
         csv_file_bytes = 0;
+        csv_stream_notify(CSV_STREAM_EV_CLOSE, NULL, 0, NULL, 0);
     }
 }
 
@@ -500,6 +546,7 @@ static bool csv_emit_wide_row(int64_t ts_ms)
     if (w < 0) return false;
     csv_file_bytes += (size_t)w;
     csv_rows_written++;
+    csv_stream_notify(CSV_STREAM_EV_ROW, NULL, 0, buf, len);
     return true;
 }
 
@@ -617,6 +664,16 @@ static void csv_manual_stop_rearm(bool ignition_on, bool auto_would_log, bool sl
     }
 }
 
+void csv_logger_set_stream_hook(csv_stream_hook_t hook)
+{
+    csv_stream_hook = hook;
+}
+
+bool csv_logger_running(void)
+{
+    return csv_queue != NULL;
+}
+
 // Current FIXED-grid period in ms. Manual mode derives it from the latched csv_grid_hz; Auto
 // mode (issue #23) re-derives it from the provider's live measured rate on EVERY call, clamped
 // to the same 1-100 Hz envelope as the manual range, so the grid follows the real sweep rate as
@@ -683,6 +740,7 @@ static void csv_logger_task(void *pvParameters)
             if (gp < 250u) rx_to = pdMS_TO_TICKS(gp);
         }
         bool got_record = (xQueueReceive(csv_queue, &rec, rx_to) == pdPASS);
+        csv_stream_notify(CSV_STREAM_EV_POLL, NULL, 0, NULL, 0);
 
         // Track ignition with debounce on the off transition.
         if (wc_timer_is_expired(&ignition_poll_timer))
