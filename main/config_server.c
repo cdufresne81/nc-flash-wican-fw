@@ -91,6 +91,7 @@
 #include "esp_littlefs.h"
 #include "csv_logger.h"
 #include "datalog_stream.h"
+#include "datalog_session.h"
 #include "poll_log.h"
 #include "event_log.h"
 #include "wifi_diag.h"
@@ -1579,10 +1580,27 @@ static esp_err_t store_auto_data_handler(httpd_req_t *req)
 	// ---- Honest envelope (issue #39) -----------------------------------------
 	// The file is written, so the new table applies at next boot regardless. Decide
 	// whether it ALSO applies live:
+	//   temporary list    -> defer, and queue NOTHING: NC Flash is logging its own channel
+	//                         list (docs/internals/datalog_session.md), which stands in for
+	//                         this file until that session ends. Ending it queues the reload.
+	//                         A reload queued here would re-parse the temporary list, and sit
+	//                         as reload_pending under the open trip, which is exactly what the
+	//                         PC watches to know its list has been applied.
 	//   !queued            -> not POLL_LOG mode: only a reboot can load it.
 	//   trip open          -> defer: the swap runs when the current CSV trip closes
 	//                         (its columns stay frozen mid-trip) or on reboot.
 	//   otherwise          -> live: the swap runs at the poll task's next safe point.
+	// Asked AFTER the write, on purpose. A session that ended before this point either
+	// re-parsed after our write (it has the new file) or before it (the list is gone, so we
+	// queue the reload ourselves below). One that ends after this point queues its reload
+	// after our write. Asked before the write, the first of those would be missed.
+	if (autopid_session_list_active())
+	{
+		config_server_send_apply_envelope(req, false, "deferred",
+			"Saved. NC Flash is logging its own temporary channel list -- the saved list takes effect when that ends (or on reboot).");
+		ESP_LOGI(TAG, "store_auto_data_handler completed: written=%d bytes, temporary list in use", received);
+		return ESP_OK;
+	}
 	bool queued = poll_log_request_reload();
 	if (!queued)
 	{
@@ -1855,6 +1873,10 @@ static esp_err_t host_caps_handler(httpd_req_t *req)
 	/* A constant now, and kept ONLY because it is a host contract -- NC Flash reads this key.
 	 * There is no stored mode left to report: the device compiles in one mode. */
 	cJSON_AddStringToObject(root, "protocol", "poll_log");
+	/* POST /datalog_session exists: NC Flash can hand over a temporary channel list for one
+	 * logging run instead of overwriting the saved one (docs/internals/datalog_session.md).
+	 * A host contract like the two above; absent on every build before this one. */
+	cJSON_AddNumberToObject(root, "session_list", 1);
 
 	char *resp_str = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
@@ -3722,6 +3744,7 @@ static void register_server_uris(void)
 	httpd_register_uri_handler(server, &csv_control_uri);
 	httpd_register_uri_handler(server, &datalog_control_uri);   /* POST /datalog?op=pause|resume (task #36.C) */
 	httpd_register_uri_handler(server, &datalog_status_uri);    /* GET  /datalog -> live coexistence state */
+	datalog_session_register_handlers(server);                  /* POST+GET /datalog_session -> temporary channel list */
 	httpd_register_uri_handler(server, &sd_files_get_uri);
 	httpd_register_uri_handler(server, &sd_files_post_uri);
 	event_log_register_handlers(server);   // GET /event_log* (Task #24) -- before the catch-all wildcard
@@ -3988,6 +4011,7 @@ static httpd_handle_t config_server_init(void)
 	// NOTE: the catch-all "/*" file server (get_uri_common) is registered LAST, so it
 	// must fit within this cap. The 3 CSV-logger endpoints pushed the total past 38,
 	// which silently dropped "/*" and 404'd every embedded asset (main.js, etc.).
+	// Count when /datalog_session was added: 34 of 48.
 	config.max_uri_handlers = 48;
 	config.stack_size = (10*1024);
 	config.max_open_sockets = 15;

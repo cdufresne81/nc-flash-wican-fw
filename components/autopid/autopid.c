@@ -301,6 +301,14 @@ void autopid_file_lock(void)
         xSemaphoreTake(s_autopid_file_lock, portMAX_DELAY);
 }
 
+bool autopid_file_trylock(uint32_t wait_ms)
+{
+    if (!s_autopid_file_lock)
+        return true;   // same no-op-until-created rule as autopid_file_lock()
+    const TickType_t ticks = (wait_ms == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
+    return xSemaphoreTake(s_autopid_file_lock, ticks) == pdTRUE;
+}
+
 void autopid_file_unlock(void)
 {
     if (s_autopid_file_lock)

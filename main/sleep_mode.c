@@ -606,6 +606,7 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
 #include "poll_log.h"
 #include "fast_log.h"
 #include "csv_logger.h"
+#include "datalog_session.h"   /* end an NC Flash logging session at sleep entry */
 
 #define ADC_UNIT          ADC_UNIT_1
 #define ADC_CONV_MODE     ADC_CONV_SINGLE_UNIT_1
@@ -1210,6 +1211,12 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
      * ignition/engine gate closed it long ago; this covers manual FORCE_ON, where a file would
      * otherwise stay open across the sleep and come back with its timers jumped. Best-effort: if
      * the writer does not get there in time the file is still closed cleanly on the next pass. */
+    /* An NC Flash logging session ends here too, BEFORE the request below: it hands back the
+     * manual mode it had forced on, so the sleep's own clean-up sees the owner's mode. A wake
+     * resumes in place, and without this the temporary channel list and the forced-on logger
+     * would both still be there in the morning. The sleep fence is already up, so no new
+     * session can begin behind this (datalog_session.c refuses while it is raised). */
+    datalog_session_end_for_sleep();
     csv_logger_set_sleep_requested(true);
     for(int i = 0; i < (SLEEP_CSV_CLOSE_WAIT_MS / 20) && csv_logger_session_active(); i++)
     {

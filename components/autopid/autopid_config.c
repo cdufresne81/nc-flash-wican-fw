@@ -390,10 +390,82 @@ static int count_car_data_pids(void)
     return count;
 }
 
-static int count_auto_pid_pids(void)
+// ---- Temporary ("session") channel list ---------------------------------------
+// A RAM copy of an auto_pid document that replaces auto_pid.json as the table source while
+// NC Flash is logging (docs/internals/datalog_session.md). The file is never touched.
+//
+// s_session_json / s_session_json_len: written by autopid_session_list_set() (httpd task,
+//   the 1 Hz datalog lease task, or the sleep task) and read by load_auto_pid_root() (the
+//   poll task, during a reload). Both sides hold the autopid file lock, so the reader can
+//   never parse a buffer that is being freed.
+// s_session_set: lock-free mirror of "s_session_json != NULL" for status readers on any
+//   task. A plain aligned bool, written only under the same lock.
+static char *s_session_json = NULL;
+static size_t s_session_json_len = 0;
+static uint32_t s_session_token = 0;   // same lock; names the session s_session_json belongs to
+static volatile bool s_session_set = false;
+
+esp_err_t autopid_session_list_set(const char *json, size_t len, uint32_t token, uint32_t wait_ms)
+{
+    char *copy = NULL;
+    if (json != NULL && len > 0)
+    {
+        copy = heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (copy == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(copy, json, len);
+        copy[len] = '\0';
+    }
+
+    if (!autopid_file_trylock(wait_ms))
+    {
+        free(copy);
+        return ESP_ERR_TIMEOUT;
+    }
+    char *old = s_session_json;
+    s_session_json = copy;
+    s_session_json_len = (copy != NULL) ? len : 0;
+    s_session_token = (copy != NULL) ? token : 0;
+    s_session_set = (copy != NULL);
+    autopid_file_unlock();
+
+    free(old);
+    return ESP_OK;
+}
+
+bool autopid_session_list_active(void)
+{
+    return s_session_set;
+}
+
+// The auto_pid document for this load: the temporary list when one is set, else the file.
+// Called ONCE per load, and the same root feeds both the count and the parse, so the two
+// can never disagree about sizes whatever happens to the source in between.
+// The caller holds the autopid file lock (every load after boot does; at boot no list can
+// exist yet). *from_session says which source it was, including when the parse failed, and
+// *token which session's list it was (0 for the file).
+static cJSON *load_auto_pid_root(bool *from_session, uint32_t *token)
+{
+    *from_session = (s_session_json != NULL);
+    *token = *from_session ? s_session_token : 0;
+    if (!*from_session)
+    {
+        return load_json_root_from_mount("auto_pid.json");
+    }
+
+    cJSON *root = cJSON_ParseWithLength(s_session_json, s_session_json_len);
+    if (!root)
+    {
+        ESP_LOGW(TAG, "Failed to parse the temporary channel list");
+    }
+    return root;
+}
+
+static int count_auto_pid_pids(const cJSON *root)
 {
     int count = 0;
-    cJSON *root = load_json_root_from_mount("auto_pid.json");
     if (!root)
         return 0;
 
@@ -409,19 +481,19 @@ static int count_auto_pid_pids(void)
         count += cJSON_GetArraySize(std_pids);
     }
 
-    cJSON_Delete(root);
     return count;
 }
 
 static void autopid_cfg_append_can_filters_from_array(autopid_config_t *cfg, const cJSON *can_filters_arr, bool is_vehicle_specific);
 static void autopid_cfg_parse_calculated_from_array(autopid_config_t *cfg, const cJSON *calc_arr);
 
-static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index)
+// `root` is the document load_auto_pid_root() returned -- the same one count_auto_pid_pids()
+// sized pids[] from. Owned by the caller; not freed here.
+static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index, cJSON *root)
 {
     if (!autopid_config || !pid_index)
         return;
 
-    cJSON *root = load_json_root_from_mount("auto_pid.json");
     if (!root)
         return;
 
@@ -559,6 +631,12 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
             {
                 strcpy(curr_pid->cmd, pid_item->valuestring);
                 strcat(curr_pid->cmd, "\r");
+            }
+            else if (curr_pid->cmd)
+            {
+                // "PID":"" or a single character: nothing was copied. Terminate it so the
+                // poller reads an empty (unpollable) command instead of heap garbage.
+                curr_pid->cmd[0] = '\0';
             }
 
             if (period_item && period_item->valuestring && strlen(period_item->valuestring) > 0)
@@ -702,11 +780,14 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                 if (curr_pid->parameters->name != NULL && strlen(curr_pid->parameters->name) > 0)
                 {
                     const std_pid_t *pid_info = get_pid_from_string(curr_pid->parameters->name);
-                    if (pid_info)
+                    // A name with no "-" (e.g. "0C") resolves to a PID but names no parameter;
+                    // strchr() is then NULL and NULL + 1 must never reach strcmp.
+                    const char *dash = strchr(curr_pid->parameters->name, '-');
+                    if (pid_info && dash)
                     {
                         for (int i = 0; i < pid_info->num_params; i++)
                         {
-                            if (strcmp(pid_info->params[i].name, strchr(curr_pid->parameters->name, '-') + 1) == 0)
+                            if (strcmp(pid_info->params[i].name, dash + 1) == 0)
                             {
                                 // parse_parameter_object already strdup'd "none"
                                 // defaults into class/unit; free them before the
@@ -750,7 +831,6 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
     }
 
     *pid_index = idx;
-    cJSON_Delete(root);
 }
 
 // ---- CAN filters parsing/merge helpers ----
@@ -1033,36 +1113,59 @@ autopid_config_t *load_autopid_config(void)
     int car_data_pids = 0;
     int auto_pids = 0;
 
+    // Counted FIRST, so its JSON tree is freed before the auto_pid one below exists: the two
+    // are never in memory together (cJSON nodes are small allocations -> internal RAM).
     car_data_pids = count_car_data_pids();
-    auto_pids = count_auto_pid_pids();
+
+    // One read of the auto_pid document for the whole load (count AND parse below).
+    bool from_session = false;
+    uint32_t session_token = 0;
+    cJSON *auto_root = load_auto_pid_root(&from_session, &session_token);
+    if (from_session && !auto_root)
+    {
+        // The file may legitimately be missing; a temporary list that will not parse is a
+        // fault (out of memory). Fail the load so a reload keeps the table it has, rather
+        // than swapping in an empty one mid-drive.
+        return NULL;
+    }
+
+    auto_pids = count_auto_pid_pids(auto_root);
 
     total_pids = car_data_pids + auto_pids;
 
     ESP_LOGI(TAG, "Allocating memory for %d pids...", total_pids);
     autopid_config_t *autopid_config = (autopid_config_t *)heap_caps_calloc(1, sizeof(autopid_config_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
     if (!autopid_config)
+    {
+        cJSON_Delete(auto_root);
         return NULL;
+    }
 
     autopid_config->last_successful_pid_time = 0;
     autopid_config->can_filters = NULL;
     autopid_config->can_filters_count = 0;
+    autopid_config->from_session_list = from_session;
+    autopid_config->session_token = session_token;
 
     if (total_pids == 0)
     {
         ESP_LOGE(TAG, "No PIDs found in car_data.json or auto_pid.json");
+        cJSON_Delete(auto_root);
         return autopid_config;
     }
 
     autopid_config->pids = (pid_data_t *)heap_caps_calloc(total_pids, sizeof(pid_data_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
     if (!autopid_config->pids)
     {
+        cJSON_Delete(auto_root);
         free(autopid_config);
         return NULL;
     }
     int pid_index = 0;
 
-    ESP_LOGI(TAG, "Loading auto_pid.json pids...");
-    parse_auto_pid_json(autopid_config, &pid_index);
+    ESP_LOGI(TAG, "Loading %s pids...", from_session ? "temporary list" : "auto_pid.json");
+    parse_auto_pid_json(autopid_config, &pid_index, auto_root);
+    cJSON_Delete(auto_root);
 
     parse_car_data_json(autopid_config, &pid_index);
 

@@ -640,7 +640,9 @@ Two stores, two very different behaviours. Confusing them causes real damage.
   load → modify → post the full object.
 - The `/store_auto_data` reply says which path ran: `"applied":"live"`, or
   `"applied":"deferred"` when a CSV trip was open (it retries when the trip
-  closes).
+  closes) or while NC Flash is logging a temporary channel list (the saved
+  file takes effect when that ends — see
+  [datalog_session.md](datalog_session.md)).
 
 ```mermaid
 flowchart TB

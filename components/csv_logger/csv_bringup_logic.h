@@ -159,4 +159,34 @@ bool csv_logging_active(bool sleep_requested, int8_t manual_mode,
  * the auto-start state instead, which is the thing that actually knows. */
 uint32_t csv_autostart_remaining_ms(uint32_t now_ms, uint32_t deadline_ms);
 
+/* ---- Reload hold (trip roll for a channel-list change) ----------------------
+ * How long a raised hold keeps the writer from recording before it lapses on its own. The
+ * poll task normally lowers it within one pass of the trip closing; this is only the
+ * fail-safe for a holder that never comes back (parked by a host session, asleep, wedged),
+ * so a stuck hold can cost a few seconds of log and never the rest of the drive. */
+#define CSV_RELOAD_HOLD_MS 5000u
+
+/* Is the reload hold in force right now?
+ *
+ * While it is, the writer closes any open trip (reason "channel_list") and opens no new
+ * one, so the poll task can swap the channel table between two trips instead of waiting for
+ * the engine to stop. Raised without a live deadline it is simply not a hold.
+ *
+ * Same 32-bit wraparound-safe compare as csv_autostart_remaining_ms, for the same reason:
+ * the deadline is written on one core and read on the other. */
+bool csv_reload_hold_active(bool raised, uint32_t now_ms, uint32_t deadline_ms);
+
+/* Where a manual mode handed back by an ending NC Flash logging session must go.
+ *
+ * While a host holds the datalog park lease the forced-off state belongs to that host
+ * session (see csv_manual_mode_next): the mode itself must not move, or the producer could
+ * restart under a parked host. The value is parked in the pre-pause slot instead, which is
+ * what datalog_restore_mode() applies when the park ends. */
+typedef enum
+{
+    CSV_RESTORE_APPLY_NOW,      /* no park: write the manual mode */
+    CSV_RESTORE_TO_PREPAUSE,    /* parked: write the park's pre-pause slot, leave the mode */
+} csv_restore_target_t;
+csv_restore_target_t csv_manual_restore_target(bool datalog_parked);
+
 #endif /* CSV_BRINGUP_LOGIC_H */

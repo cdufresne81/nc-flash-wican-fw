@@ -4,7 +4,8 @@
 # Covers the decision logic that used to be unreachable from any test: the CSV
 # datalogger's RTC crash-guard bring-up chain, the manual-override lifetime and the
 # logging gate, plus poll_log's recording gate (does the ENGINE actually turn), the
-# ECU-flash fence, and when the default sensor list may replace auto_pid.json.
+# ECU-flash fence, when the default sensor list may replace auto_pid.json, and the
+# NC Flash logging session's lease and token rules.
 # Everything under test lives in components/csv_logger/csv_bringup_logic.c and
 # components/fast_log/poll_gate_logic.c, both deliberately free of ESP-IDF includes so a
 # stock compiler can build them.
@@ -53,3 +54,11 @@ CC="${CC:-cc}"
     -o "$OUT/auto_pid_seed_test"
 
 "$OUT/auto_pid_seed_test"
+
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -I "$REPO/main" \
+    "$REPO/tools/hosttest/datalog_session_test.c" \
+    "$REPO/main/datalog_session_logic.c" \
+    -o "$OUT/datalog_session_test"
+
+"$OUT/datalog_session_test"

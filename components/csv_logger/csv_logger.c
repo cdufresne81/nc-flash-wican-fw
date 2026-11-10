@@ -257,6 +257,17 @@ static inline uint32_t csv_uptime_ms(void)
 // session before the CPU halts; see the note where logging_active is computed.
 static volatile bool csv_sleep_requested = false;
 
+// Reload hold: "close the open trip and do not open another until I say" -- how the channel
+// table is swapped between two trips instead of waiting for the engine to stop (see
+// csv_logger_reload_hold). Raised by the poll task at its reload safe point, and by the httpd
+// task when an NC Flash logging session begins; lowered by the poll task only. Read by the
+// writer task every pass. Two aligned 32-bit/bool words, the deadline always written BEFORE
+// the flag, so a reader that sees the flag sees a deadline at least as new. Two raisers racing
+// can only leave the later of two near-identical deadlines; a raise racing the lower leaves
+// either state, and the deadline bounds the bad one to CSV_RELOAD_HOLD_MS.
+static volatile uint32_t s_reload_hold_deadline_ms = 0;
+static volatile bool     s_reload_hold_raised = false;
+
 static bool csv_time_is_valid(void)
 {
     time_t now = time(NULL);
@@ -798,8 +809,13 @@ static void csv_logger_task(void *pvParameters)
         // jump of hours. Closing here means one clean file per awake period.
         // The expression itself lives in csv_bringup_logic.c, pinned by a host test: the
         // v1.18 investigation cleared this truth table, so a change here is a regression.
-        bool logging_active = csv_logging_active(csv_sleep_requested, csv_manual_mode,
-                                                 ignition_on, engine_ok);
+        const bool gate_active = csv_logging_active(csv_sleep_requested, csv_manual_mode,
+                                                    ignition_on, engine_ok);
+        // The reload hold sits on top of the gate rather than inside it: it closes the trip
+        // for a channel-list change and keeps the next one from opening until the poll task
+        // has swapped the table, so no file ever mixes two column sets. It lapses by itself.
+        const bool reload_hold = csv_logger_reload_hold_active();
+        bool logging_active = gate_active && !reload_hold;
 
         // Session close: logging stopped (ignition off / disabled) or SD was pulled.
         if (csv_session_active && (!logging_active || !sdcard_is_mounted()))
@@ -815,7 +831,10 @@ static void csv_logger_task(void *pvParameters)
             //   "engine_off"   -> engine_ok (poll_log_gate_open: voltage + RPM) went false: the key may
             //                     still be on, but the engine is not turning.
             // Merging them would destroy the one distinction this expression exists to record.
+            // "channel_list" -> nothing stopped the trip but the reload hold: the channel list
+            //                   is being changed and a new trip opens right after the swap.
             const char *why = !sdcard_is_mounted()             ? "sd_removed"
+                            : (gate_active && reload_hold)        ? "channel_list"
                             : (csv_manual_mode == CSV_MANUAL_OFF) ? "manual_stop"
                             : (!ignition_on)                      ? "ignition_off"
                                                                   : "engine_off";
@@ -1026,6 +1045,30 @@ esp_err_t csv_logger_set_manual_override(bool enable)
         csv_manual_mode = CSV_MANUAL_OFF;
     }
     return ESP_OK;
+}
+
+int8_t csv_logger_manual_mode(void)
+{
+    return csv_manual_mode;
+}
+
+void csv_logger_reload_hold(bool hold)
+{
+    if (hold)
+    {
+        s_reload_hold_deadline_ms = csv_uptime_ms() + CSV_RELOAD_HOLD_MS;   // deadline first
+        s_reload_hold_raised = true;
+    }
+    else
+    {
+        s_reload_hold_raised = false;
+    }
+}
+
+bool csv_logger_reload_hold_active(void)
+{
+    return csv_reload_hold_active(s_reload_hold_raised, csv_uptime_ms(),
+                                  s_reload_hold_deadline_ms);
 }
 
 char *csv_logger_get_status_json(void)
@@ -1390,6 +1433,68 @@ void datalog_restore_mode(void)
     else
     {
         csv_manual_mode = s_datalog_prepause_mode;  // AUTO/OFF: no init, just restore the gate
+    }
+}
+
+// Write a manual mode directly: ON goes through the override so a writer that was never
+// started (csv_log disabled at boot) is created; AUTO/OFF only move the gate.
+static void csv_manual_mode_apply(int8_t mode)
+{
+    if (mode == CSV_MANUAL_ON)
+    {
+        csv_logger_set_manual_override(true);
+    }
+    else
+    {
+        csv_manual_mode = (mode == CSV_MANUAL_OFF) ? CSV_MANUAL_OFF : CSV_MANUAL_AUTO;
+    }
+}
+
+// Hand back the manual mode an NC Flash logging session borrowed (main/datalog_session.c).
+// Called by whichever task ends the session: httpd (op=end), the 1 Hz lease task (the host
+// vanished) or the sleep task.
+//
+// THE PARK RULE: while a host holds the datalog park lease, csv_manual_mode is that host
+// session's forced-off and must not move -- an ignition-on would otherwise restart the producer
+// under a parked host. The value goes into the pre-pause slot instead, and datalog_restore_mode()
+// applies it when the park ends.
+//
+// KNOWN RACE, deliberately not locked. The park flag belongs to /datalog?op=pause and op=resume
+// on the httpd task and is not locked against us; when this runs on the lease or sleep task
+// the two can interleave. Each write below is followed by a second look at the flag, which
+// narrows the window to a few instructions but does not close it -- not even for two parties:
+//   restore vs pause : the pause can snapshot the session's forced-ON, or arm the park just
+//                      after our last look, leaving the mode the session saved in force under a
+//                      park, or ON in the pre-pause slot;
+//   restore vs resume: the resume can read the slot just before we write it and apply the
+//                      session's forced-ON after we have finished.
+// Either needs a session ending (lease expiry or sleep) within microseconds of a host pause or
+// resume. The worst outcome is a manual mode left ON or OFF until the next Start/Stop, trip
+// end (OFF only) or reboot. It can never cause a transmit: the poller is parked by the park
+// flag itself, which this function only reads. Closing it needs a lock inside the pause/resume
+// handlers, which are the flash-coexistence path and are left alone on purpose.
+void csv_logger_restore_manual_mode(int8_t mode)
+{
+    if (csv_manual_restore_target(can_datalog_park_active()) == CSV_RESTORE_TO_PREPAUSE)
+    {
+        s_datalog_prepause_mode = mode;
+        if (can_datalog_park_active())
+        {
+            return;   // still parked: the resume (or the reaper) will read the slot we wrote
+        }
+        // The park ended while we wrote. Its restore may have read the slot before our value
+        // landed, so apply the mode ourselves as well.
+    }
+
+    csv_manual_mode_apply(mode);
+
+    if (can_datalog_park_active())
+    {
+        // A pause landed around our write: it either snapshotted the mode the session had
+        // forced, or had its forced-off overwritten by ours. Put both right (best effort --
+        // see KNOWN RACE above).
+        s_datalog_prepause_mode = mode;
+        csv_manual_mode = CSV_MANUAL_OFF;
     }
 }
 

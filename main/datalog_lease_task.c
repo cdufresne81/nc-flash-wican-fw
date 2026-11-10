@@ -36,6 +36,7 @@
 #include "can.h"
 #include "csv_logger.h"
 #include "datalog_lease_task.h"
+#include "datalog_session.h"
 #include "event_log.h"
 
 #define TAG "datalog_reaper"
@@ -49,6 +50,15 @@ static void datalog_lease_task(void *arg)
     for (;;)
     {
         vTaskDelay(pdMS_TO_TICKS(COEXIST_REAPER_TICK_MS));
+
+        /* NC Flash logging session lease (docs/internals/datalog_session.md): a separate
+         * dead-man from the two below, riding this tick because it needs the same 1 Hz and no
+         * task of its own. First, and unconditionally -- the stuck-flash and claim branches
+         * `continue`, and a vanished host's temporary channel list must not outlive its lease
+         * because a flash happens to be running. It touches no CAN state: it drops a RAM list,
+         * hands back the CSV manual mode (through the park's pre-pause slot while parked) and
+         * leaves a reload request for the poll task, which serves it only once unparked. */
+        datalog_session_tick();
 
         can_coexist_snapshot_t s;
         can_coexist_snapshot(&s);

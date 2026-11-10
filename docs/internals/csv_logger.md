@@ -78,3 +78,31 @@ There used to be a 20 s wait before the writer task was even created, with no st
 `POST /csv_logger?op=start|stop` — starts/stops a session immediately (also the guard-recovery path above). Trip files are listed by `/csv_list` and fetched by `/download_csv`.
 
 **Stop is per-trip.** `CSV_MANUAL_OFF` is cleared back to `CSV_MANUAL_AUTO` once the trip is over, so the following key-on records normally. Any one of three signs ends the trip (`csv_trip_end_reason()`): the device is going to sleep, the ECU stopped answering after a confirmed answer (`poll_log_ecu_silent()`), or the debounced voltage ignition is off. The ECU sign only counts while AUTO would not be recording anyway (`ignition_on && engine_ok` false); otherwise, e.g. with `csv_require_engine` disabled, clearing Stop would reopen a file at once and silently undo the press. The voltage sign alone was not enough (#109): a battery fresh from a drive can rest above the `engine_volt` OFF edge until the device sleeps, and with `sleep_volt` above that edge it always will, so Stop used to swallow the next drive too. The writer checks on every pass with no session open (`csv_manual_stop_rearm()`), so the Stop always closes its file first, and the sleep teardown checks once more, because with Stop on it does not wait for the writer. With `csv_require_engine` disabled the ECU sign rarely counts, so the sleep is the real clear there, and a device that never sleeps is back to the voltage sign alone. It used to hold until a reboot, which meant one press of Stop silently disabled auto-logging for every subsequent trip. `CSV_MANUAL_ON` is deliberately *not* cleared that way — bench work needs FORCE_ON to survive a voltage flapping across the ignition threshold. The rearm never fires while a host holds the datalog park lease (`can_datalog_park_active()`), the sleep sign included: un-parking belongs to `datalog_restore_mode()` alone.
+
+## The reload hold: rolling a trip for a channel-list change
+
+A trip's columns are frozen when it opens, so the channel table is only ever swapped between
+trips. A saved-list edit simply waits for the trip to end. An NC Flash logging session
+([datalog_session.md](datalog_session.md)) cannot wait, so it **rolls** the trip:
+
+- `csv_logger_reload_hold()` raised: the writer closes any open trip on its next pass, with close
+  reason `channel_list`, and opens no new one. Records that arrive meanwhile are dropped, exactly
+  as they are with logging off.
+- Lowered: the next record opens a trip, enumerating columns from the table loaded at that moment.
+
+The hold sits on top of the logging gate, not inside it — `csv_logging_active()` and its pinned
+truth table are unchanged. `channel_list` is only reported when the gate itself would still be
+recording; a trip that was ending anyway keeps its own reason.
+
+It **lapses by itself** after `CSV_RELOAD_HOLD_MS` (`csv_reload_hold_active()`, host-tested), so a
+holder that never comes back cannot stop logging for good. The poll task owns it and lowers it
+after the swap; see [poll_log.md](poll_log.md) for that side. The one other caller is a session
+beginning, which raises it just before forcing logging on, so that no trip opens on the old columns
+in the gap.
+
+## The manual mode and an NC Flash logging session
+
+A session forces `CSV_MANUAL_ON` for as long as it runs and hands the previous mode back when it
+ends, through `csv_logger_restore_manual_mode()`. That function obeys the same park rule as the
+Stop rearm above: while a host holds the datalog park lease the mode is not touched, and the value
+goes into the park's pre-pause slot for `datalog_restore_mode()` to apply.
