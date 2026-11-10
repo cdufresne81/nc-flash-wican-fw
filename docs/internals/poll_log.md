@@ -203,7 +203,7 @@ The Auto (fastest) logging rate is a **measurement, not an estimate** — this i
  "sweep_min_ms":38.2,"sweep_max_ms":52.7,"fast_ms":49.6,"fast_hz":20.15,
  "win_ok":1197,"win_timeout":0,"win_txfail":0,
  "ignition_on":true,"quiesced":false,"bus_idle_ms":4294967295,
- "reload_ok":true,"reload_pending":false,
+ "reload_ok":true,"reload_pending":false,"session_list":false,
  "state":"fast","gate_open":true,"fast_sweep":true,
  "gate_volt":13.2,"rpm_known":true,"rpm_seen":true,"rpm_age_ms":38,
  "rpm_configured":true,"rpm":2150,"engine_running":true,"loop_age_ms":12}
@@ -225,7 +225,41 @@ The divisor fields (issue #29) are the whole diagnostic surface for the feature 
 | `pace_sweeps` / `min_sweep_ms` | Sweeps held back by the 100 Hz cap, and the cap itself in ms. `pace_sweeps` climbing means the config is asking for more than 100 Hz and getting 100. |
 | `sweep_min_ms` / `sweep_max_ms` | Sweep-duration spread over the 3 s window — the phasing-quality readout. A wide spread means divisor groups are co-firing. |
 | `fast_ms` / `fast_hz` | Fastest channel's cadence = mean executed sweep × `sched_min_n`. **This**, not `sweep_hz`, is what the Auto CSV grid tracks. |
-| `reload_pending` | A live hot-reload is armed but not yet applied (deferred under an open trip). |
+| `reload_pending` | A live hot-reload is armed but not yet applied: deferred under an open trip, waiting for a rolled trip to close, or waiting out a park. |
+| `reload_ok` | Outcome of the **last** reload that ran. Only meaningful once `reload_pending` is false; before that it still describes the previous one. |
+| `session_list` | The loaded table came from NC Flash's temporary channel list, not from `auto_pid.json` (see [datalog_session.md](datalog_session.md)). |
+
+## Live reload of the sensor table
+
+The table is swapped in exactly one place: the poll task's safe point at the top of its loop,
+**after** the `can_should_park()` park and the withheld-bus branch, above the sweep, where the task
+holds no pointer into the table. Other tasks only OR bits into `s_reload_req`; the poll task takes
+the whole request with one atomic exchange before it parses, so a request that lands during the
+parse is still there on the next pass. The swap never happens while a CSV trip is open, so a
+file's columns never change under it. `autopid_reload_config()` re-checks that under the config
+mutex and answers `AUTOPID_RELOAD_DEFERRED` if a trip opened mid-parse.
+
+Two kinds of request:
+
+| Request | Raised by | With a trip open |
+|---|---|---|
+| plain — `poll_log_request_reload()` | `POST /store_auto_data` | waits for the trip to end by itself |
+| roll — `poll_log_request_reload_roll()` | an NC Flash logging session beginning or ending | closes the trip now, swaps, and the next record opens a new one |
+
+A roll raises the CSV writer's reload hold (`csv_logger_reload_hold()`, see
+[csv_logger.md](csv_logger.md)), then keeps sweeping and checks again each pass — it never blocks —
+until `csv_logger_session_active()` is false. Then it reloads and lowers the hold. Bench-unverified
+as of this writing; the cases it is built to survive:
+
+- **A park starts after the hold was raised.** The safe point is not reached, the hold lapses by
+  itself (`CSV_RELOAD_HOLD_MS`), and the request is still set when the park ends. No trip can open
+  meanwhile: the poll task is the only producer of records, and it is parked.
+- **The hold lapses with the trip still open.** It is raised again, at most
+  `POLLLOG_ROLL_MAX_HOLDS` times; after that the roll is dropped to a plain request and one
+  warning goes to the event log.
+- **A trip opens mid-parse** (`AUTOPID_RELOAD_DEFERRED`). The request is put back; a hold that is
+  still raised closes that trip on the writer's next pass.
+- **The table is rejected.** The old one keeps running, the hold is lowered, `reload_ok` is false.
 
 The recording-gate fields. `req_s` alone is ambiguous once the gate exists — ~15 req/s is healthy in WATCH and alarming in FAST — so read `state` first:
 

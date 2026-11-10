@@ -132,4 +132,16 @@ bool     poll_log_ecu_silent(void);
  */
 bool     poll_log_request_reload(void);
 
+/*
+ * The same reload, applied NOW: an open CSV trip is closed for it (close reason "channel_list")
+ * and the next record opens a new trip on the new columns. Used when an NC Flash logging session
+ * begins or ends (docs/internals/datalog_session.md). Still only a flag -- the poll task does the
+ * work at the same safe point, never blocking, and falls back to waiting for the trip to end if
+ * the file will not close. Returns false when POLL_LOG isn't running.
+ */
+bool     poll_log_request_reload_roll(void);
+
+/* True once the poll task is running, i.e. a reload request would be accepted. */
+bool     poll_log_active(void);
+
 #endif /* POLL_LOG_H */

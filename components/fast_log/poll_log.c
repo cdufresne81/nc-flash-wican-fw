@@ -323,14 +323,29 @@ static void polllog_stats_reset(void)
  * refresh once per stats window. Plain aligned 32-bit fields -> atomic enough for a status
  * readout across the poll task and the httpd handler, so no mutex is needed. */
 static volatile bool     s_active = false;
-/* Live PID-table hot-swap (issue #39). s_reload_requested is set by the httpd handler
- * (poll_log_request_reload) and drained on THIS task at the top-of-loop safe point.
+/* Live PID-table hot-swap (issue #39). s_reload_req is raised by other tasks
+ * (poll_log_request_reload / _roll: the httpd handlers, and the lease and sleep tasks when
+ * they end an NC Flash logging session) and drained on THIS task at the top-of-loop safe
+ * point. It is one word holding both "reload" and "roll the trip for it", so the poll task
+ * can take the whole request in a single atomic exchange: with two separate flags a request
+ * landing between the two reads was either lost or left half-set, and a half-set request
+ * shows up as reload_pending:true for the rest of the trip. Requesters only ever OR bits in;
+ * only the poll task clears them.
  * s_pid_count is a cross-task-safe mirror of s_cfg->pid_count so GET /poll_status never
- * dereferences the swappable s_cfg. s_last_reload_ok publishes the true outcome (the
- * handler answers optimistically before this task validates). */
-static volatile bool     s_reload_requested = false;
+ * dereferences the swappable s_cfg, and s_session_list mirrors s_cfg->from_session_list the
+ * same way. Both are written by the poll task only (init, then each swap). s_last_reload_ok
+ * publishes the true outcome (the handler answers optimistically before this task validates). */
+#define POLLLOG_RELOAD_PLAIN     0x1u     /* swap when no trip is open; wait for the trip otherwise */
+#define POLLLOG_RELOAD_ROLL      0x2u     /* ...and close the open trip to make that happen now */
+/* Holds one roll may raise before it gives up and waits for the trip to end like a plain
+ * reload. A hold normally lasts well under a second; needing a second one means the first
+ * lapsed (CSV_RELOAD_HOLD_MS) with the trip still open, and a writer that slow must not be
+ * made to open and close files in a loop. */
+#define POLLLOG_ROLL_MAX_HOLDS   3
+static volatile uint32_t s_reload_req = 0;
 static volatile bool     s_last_reload_ok = true;
 static volatile uint32_t s_pid_count = 0;
+static volatile bool     s_session_list = false;
 static volatile uint32_t s_cum_ok = 0, s_cum_timeout = 0, s_cum_txfail = 0;
 static volatile uint32_t s_win_ok = 0, s_win_timeout = 0, s_win_txfail = 0;
 static volatile float    s_win_rtt_avg_ms = 0, s_win_rtt_min_ms = 0, s_win_rtt_max_ms = 0, s_win_req_s = 0;
@@ -1368,6 +1383,7 @@ static void polllog_rx_task(void *arg)
     s_norm_start_us = start_us;   /* boot enters NORMAL probing; arm the probe/off-detect window from t=0 */
     bool guard_cleared = false;
     int64_t withheld_since_us = 0;   /* when the bus was first seen disabled with no owner; 0 = not */
+    uint8_t roll_holds = 0;          /* reload holds raised for the pending roll; see POLLLOG_ROLL_MAX_HOLDS */
     int64_t stats_t = start_us;
     polllog_stats_reset();
 
@@ -1387,6 +1403,7 @@ static void polllog_rx_task(void *arg)
         {
             vTaskDelay(pdMS_TO_TICKS(POLLLOG_FLASH_PARK_MS));
             withheld_since_us = 0;   /* an owner holds the bus: not a withheld bus, a parked one */
+            roll_holds = 0;          /* a hold that lapsed under a park is not a failed roll */
             continue;
         }
 
@@ -1466,35 +1483,93 @@ static void polllog_rx_task(void *arg)
 
         /* Live PID-table hot-swap safe point (issue #39): we own the poll task and hold
          * no table pointer here (this is above the sweep). Do the swap here and nowhere
-         * else. Defer while a CSV trip is open so the wide columns stay frozen for the
-         * trip -- the flag stays set and drains at the first safe point after it closes. */
-        if (s_reload_requested && !csv_logger_session_active())
+         * else, and only while no CSV trip is open, so a file's wide columns never change
+         * under it.
+         *
+         * A PLAIN request (a saved list from /store_auto_data) waits for the trip to end by
+         * itself: the request stays set and drains at the first safe point after the close.
+         *
+         * A ROLL request (an NC Flash logging session starting or ending) does not wait: it
+         * raises the CSV writer's reload hold, which closes the open trip and keeps the next
+         * one from opening, and this task comes back round -- sweeping normally in between,
+         * never blocking -- until the trip is closed. Then it swaps and lowers the hold, and
+         * the next record opens a trip on the new columns.
+         *
+         * Everything that can go wrong leaves the old table running and logging:
+         *   - a park (flash, host pause, bus claim, sleep) starting after the hold was raised:
+         *     we never get here, the hold lapses by itself, and the request is still set when
+         *     the park ends. Nothing can open a trip meanwhile -- we are the only producer;
+         *   - the hold lapsing with the trip still open: raised again, at most
+         *     POLLLOG_ROLL_MAX_HOLDS times, then the roll is dropped to a plain reload;
+         *   - a rejected table: kept out, hold lowered, reload_ok false. */
+        const uint32_t reload_peek = s_reload_req;
+        if (reload_peek != 0)
         {
-            s_reload_requested = false;
-            autopid_config_t *n = autopid_reload_config();
-            if (n == AUTOPID_RELOAD_DEFERRED)
+            if ((reload_peek & POLLLOG_RELOAD_ROLL) && !csv_logger_reload_hold_active())
             {
-                /* A CSV trip opened between our check above and the swap (issue #43 P1).
-                 * Not a rejection: re-arm so the swap retries at the next safe point once
-                 * the trip closes. Leave s_last_reload_ok untouched (no outcome yet). */
-                s_reload_requested = true;
+                if (roll_holds < POLLLOG_ROLL_MAX_HOLDS)
+                {
+                    csv_logger_reload_hold(true);
+                    roll_holds++;
+                }
+                else
+                {
+                    __atomic_fetch_and(&s_reload_req, ~POLLLOG_RELOAD_ROLL, __ATOMIC_SEQ_CST);
+                    csv_logger_reload_hold(false);
+                    roll_holds = 0;
+                    event_log_emit(EVL_WARN, "channel list change is waiting for the trip to end "
+                                             "-- the log file did not close in time");
+                    ESP_LOGW(TAG, "reload roll gave up after %d holds -- deferring to trip end",
+                             POLLLOG_ROLL_MAX_HOLDS);
+                }
             }
-            else if (n != NULL)
+
+            if (!csv_logger_session_active())
             {
-                s_cfg = n;
-                /* Re-derive the divisor schedule for the NEW table (issue #29). Runs on the
-                 * poll task, before this iteration's sweep, and nothing outside this task
-                 * reads sample_ctr -- so the publish window is empty. Phases are deterministic
-                 * from the JSON, so an unrelated edit re-derives them identically. */
-                polllog_prepare_schedule(n);
-                s_pid_count = n->pid_count;
-                s_last_reload_ok = true;
-                ESP_LOGI(TAG, "PID table hot-reloaded: %u pids", (unsigned)s_pid_count);
-            }
-            else
-            {
-                s_last_reload_ok = false;
-                ESP_LOGW(TAG, "PID reload rejected -- keeping old table");
+                /* Claim the whole request BEFORE the parse: one that lands from here on stays
+                 * set for the next pass, and one that landed just before is served by this
+                 * parse, because every requester changes the source before it raises a bit. */
+                const uint32_t claimed = __atomic_exchange_n(&s_reload_req, 0u, __ATOMIC_SEQ_CST);
+                autopid_config_t *n = autopid_reload_config();
+                if (n == AUTOPID_RELOAD_DEFERRED)
+                {
+                    /* A CSV trip opened between our check above and the swap (issue #43 P1).
+                     * Not a rejection: re-arm so the swap retries at the next safe point once
+                     * the trip closes. Leave s_last_reload_ok untouched (no outcome yet). For
+                     * a roll the hold stays as it is: still raised, it closes that trip on the
+                     * writer's next pass; lapsed, the next pass here raises it again. */
+                    __atomic_fetch_or(&s_reload_req, claimed, __ATOMIC_SEQ_CST);
+                }
+                else
+                {
+                    if (n != NULL)
+                    {
+                        s_cfg = n;
+                        /* Re-derive the divisor schedule for the NEW table (issue #29). Runs on
+                         * the poll task, before this iteration's sweep, and nothing outside this
+                         * task reads sample_ctr -- so the publish window is empty. Phases are
+                         * deterministic from the JSON, so an unrelated edit re-derives them
+                         * identically. */
+                        polllog_prepare_schedule(n);
+                        s_pid_count = n->pid_count;
+                        s_session_list = n->from_session_list;
+                        s_last_reload_ok = true;
+                        ESP_LOGI(TAG, "PID table hot-reloaded: %u pids%s", (unsigned)s_pid_count,
+                                 n->from_session_list ? " (temporary list)" : "");
+                    }
+                    else
+                    {
+                        s_last_reload_ok = false;
+                        ESP_LOGW(TAG, "PID reload rejected -- keeping old table");
+                    }
+                    /* Swapped or refused, the roll is over: let the writer record again. Done
+                     * for every roll, including a hold the session-begin handler raised. */
+                    if (claimed & POLLLOG_RELOAD_ROLL)
+                    {
+                        csv_logger_reload_hold(false);
+                    }
+                    roll_holds = 0;
+                }
             }
         }
 
@@ -1895,6 +1970,7 @@ void poll_log_init(char *id, uint32_t log_period)
         return;
     }
     s_pid_count = s_cfg->pid_count;   /* cross-task mirror for GET /poll_status (issue #39) */
+    s_session_list = s_cfg->from_session_list;   /* always false at boot: a temporary list is RAM-only */
     /* Seed the divisor schedule (issue #29) before the poll task exists -- no race. */
     polllog_prepare_schedule(s_cfg);
     if (s_cfg->pid_count == 0)
@@ -2127,7 +2203,7 @@ char *poll_log_get_status_json(void)
              "\"sweep_min_ms\":%.1f,\"sweep_max_ms\":%.1f,\"fast_ms\":%.1f,\"fast_hz\":%.2f,"
              "\"win_ok\":%u,\"win_timeout\":%u,\"win_txfail\":%u,"
              "\"ignition_on\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s,"
-             "\"reload_pending\":%s,"
+             "\"reload_pending\":%s,\"session_list\":%s,"
              "\"state\":\"%s\",\"gate_open\":%s,\"fast_sweep\":%s,"
              "\"gate_volt\":%.1f,\"rpm_known\":%s,\"rpm_seen\":%s,\"rpm_configured\":%s,"
              "\"rpm_age_ms\":%u,"
@@ -2150,7 +2226,8 @@ char *poll_log_get_status_json(void)
              s_quiesced ? "true" : "false",
              (unsigned)poll_log_bus_idle_ms(),
              s_last_reload_ok ? "true" : "false",
-             s_reload_requested ? "true" : "false",
+             (s_reload_req != 0) ? "true" : "false",
+             s_session_list ? "true" : "false",
              state,
              s_gate_open ? "true" : "false",
              s_fast_sweep ? "true" : "false",
@@ -2181,6 +2258,22 @@ bool poll_log_request_reload(void)
 {
     if (!s_active)
         return false;
-    s_reload_requested = true;
+    __atomic_fetch_or(&s_reload_req, POLLLOG_RELOAD_PLAIN, __ATOMIC_SEQ_CST);
     return true;
+}
+
+/* The same request, but the poll task closes an open CSV trip to apply it now instead of
+ * waiting for the trip to end (see the safe point). For an NC Flash logging session starting
+ * or ending -- never for a saved-list edit, which must not split a drive. Any task. */
+bool poll_log_request_reload_roll(void)
+{
+    if (!s_active)
+        return false;
+    __atomic_fetch_or(&s_reload_req, POLLLOG_RELOAD_PLAIN | POLLLOG_RELOAD_ROLL, __ATOMIC_SEQ_CST);
+    return true;
+}
+
+bool poll_log_active(void)
+{
+    return s_active;
 }

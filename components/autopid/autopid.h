@@ -171,6 +171,9 @@ typedef struct
     char* vehicle_model;
     uint32_t cycle;     //To be removed when std pid gets its own period
     time_t last_successful_pid_time;  // Timestamp in seconds since epoch of last successful PID response
+    // True when this table was parsed from the temporary session list (RAM) instead of
+    // auto_pid.json. Set once by load_autopid_config(), never changed afterwards.
+    bool from_session_list;
     // NB: no per-config mutex -- serialization is via the file-static s_autopid_mutex in
     // autopid.c (created once, never destroyed, so it stays valid across live table swaps).
 } autopid_config_t;
@@ -243,6 +246,23 @@ autopid_config_t *autopid_reload_config(void);
 // around load_autopid_config(). No-op if the lock was never created (non-autopid modes).
 void autopid_file_lock(void);
 void autopid_file_unlock(void);
+
+// --- Temporary ("session") channel list ---------------------------------------
+// A RAM-only auto_pid document that stands in for auto_pid.json while NC Flash is logging
+// (docs/internals/datalog_session.md). While one is set, load_autopid_config() parses it
+// instead of the file; the file itself is never touched. car_data.json is unaffected.
+//
+// Setting or clearing it changes nothing by itself: the caller must then queue a reload
+// (poll_log_request_reload_roll) so the poll task re-parses at its safe point.
+//
+// autopid_session_list_set() copies `json` (len bytes, need not be NUL-terminated) into
+// PSRAM; NULL or len 0 clears. It takes the autopid file lock, so it can wait for a reload's
+// parse or a /store_auto_data write to finish: call it from a task that may block, never
+// from the poll task or the CSV writer. ESP_ERR_NO_MEM leaves the previous list in place.
+esp_err_t autopid_session_list_set(const char *json, size_t len);
+// True while a temporary list is set. Lock-free; a hint for status and for deciding whether a
+// save should reload. What the poller has actually LOADED is autopid_config_t.from_session_list.
+bool autopid_session_list_active(void);
 
 // --- Live per-row Test under POLL_LOG (issue #41) -----------------------------
 // The Polled-PID and Broadcast (CAN-filter) "Test" buttons POST to /autopid/test_pid and

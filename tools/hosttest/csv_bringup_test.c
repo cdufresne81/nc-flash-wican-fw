@@ -322,6 +322,41 @@ static void t5_countdown_and_boundaries(void)
           "the window is measured from task start, not from boot");
 }
 
+/* ---------------------------------------------------------------------------
+ * T6 -- the reload hold (trip roll for a channel-list change) and where an ending
+ * NC Flash logging session may put the manual mode back.
+ * ------------------------------------------------------------------------ */
+static void t6_reload_hold_and_mode_restore(void)
+{
+    banner("T6: the reload hold always lapses; a park owns the manual mode");
+
+    CHECK(csv_reload_hold_active(false, 1000, 1000 + CSV_RELOAD_HOLD_MS) == false,
+          "not raised is never a hold, whatever the deadline says");
+    CHECK(csv_reload_hold_active(true, 1000, 1000 + CSV_RELOAD_HOLD_MS) == true,
+          "raised and inside the deadline holds");
+    CHECK(csv_reload_hold_active(true, 1000 + CSV_RELOAD_HOLD_MS - 1, 1000 + CSV_RELOAD_HOLD_MS) == true,
+          "still held one millisecond before the deadline");
+
+    /* The fail-safe: a holder that never comes back (parked, asleep, wedged) must not be
+     * able to stop logging for good. */
+    CHECK(csv_reload_hold_active(true, 1000 + CSV_RELOAD_HOLD_MS, 1000 + CSV_RELOAD_HOLD_MS) == false,
+          "lapses exactly on the deadline");
+    CHECK(csv_reload_hold_active(true, 1000 + 3600000u, 1000 + CSV_RELOAD_HOLD_MS) == false,
+          "an hour later it has long lapsed");
+
+    /* Same rollover trap as the T5 countdown. */
+    CHECK(csv_reload_hold_active(true, 0xFFFFFF00u, 0xFFFFFF00u + CSV_RELOAD_HOLD_MS) == true,
+          "a hold straddling the ms rollover still holds");
+    CHECK(csv_reload_hold_active(true, 0xFFFFFF00u + CSV_RELOAD_HOLD_MS + 1u,
+                                 0xFFFFFF00u + CSV_RELOAD_HOLD_MS) == false,
+          "and still lapses across the rollover");
+
+    CHECK(csv_manual_restore_target(false) == CSV_RESTORE_APPLY_NOW,
+          "no park: the mode is put back directly");
+    CHECK(csv_manual_restore_target(true) == CSV_RESTORE_TO_PREPAUSE,
+          "parked: the mode must not move -- the value waits in the pre-pause slot");
+}
+
 int main(void)
 {
     printf("# csv_logger bring-up host tests\n");
@@ -332,6 +367,7 @@ int main(void)
     t3c_stop_never_clears_into_recording();
     t4_gate_truth_table_is_unchanged();
     t5_countdown_and_boundaries();
+    t6_reload_hold_and_mode_restore();
 
     printf("1..%d\n", g_checks);
     if (g_failures != 0)

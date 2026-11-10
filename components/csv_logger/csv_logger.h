@@ -203,6 +203,30 @@ bool csv_logger_bringup_skipped(void);
  * the trip (#109). */
 void csv_logger_set_sleep_requested(bool sleeping);
 
+/* The manual mode right now: CSV_MANUAL_AUTO / _ON / _OFF (csv_bringup_logic.h). A snapshot. */
+int8_t csv_logger_manual_mode(void);
+
+/* Put back a manual mode that an NC Flash logging session borrowed (it forces ON while it runs).
+ * Not a general setter: it obeys the park rule -- while a host holds the datalog park lease the
+ * mode is left alone and the value goes into the park's pre-pause slot, which the park's own
+ * restore applies. Any task that may block briefly; never touches a CAN bit. */
+void csv_logger_restore_manual_mode(int8_t mode);
+
+/* Reload hold: roll the trip for a channel-list change.
+ *
+ * true : the writer closes any open trip on its next pass (close reason "channel_list") and
+ *        opens no new one. Lapses by itself after CSV_RELOAD_HOLD_MS, so a holder that never
+ *        comes back cannot stop logging for good. Raising it again restarts that clock.
+ * false: recording may resume; the next record opens a trip with the columns of the table
+ *        loaded at that moment.
+ *
+ * Owned by the poll task, which raises it at its reload safe point and lowers it once the swap
+ * is done. The one other caller is an NC Flash logging session beginning, which raises it just
+ * before forcing the logger on so that no trip can open on the old columns in the gap; the poll
+ * task lowers that one too. Non-blocking; two word writes. */
+void csv_logger_reload_hold(bool hold);
+bool csv_logger_reload_hold_active(void);
+
 /**
  * @brief Queue one decoded parameter sample for CSV logging.
  *

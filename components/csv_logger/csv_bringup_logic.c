@@ -102,3 +102,13 @@ uint32_t csv_autostart_remaining_ms(uint32_t now_ms, uint32_t deadline_ms)
     const int32_t remaining = (int32_t)(deadline_ms - now_ms);
     return (remaining > 0) ? (uint32_t)remaining : 0u;
 }
+
+bool csv_reload_hold_active(bool raised, uint32_t now_ms, uint32_t deadline_ms)
+{
+    return raised && ((int32_t)(deadline_ms - now_ms) > 0);
+}
+
+csv_restore_target_t csv_manual_restore_target(bool datalog_parked)
+{
+    return datalog_parked ? CSV_RESTORE_TO_PREPAUSE : CSV_RESTORE_APPLY_NOW;
+}

@@ -7,6 +7,8 @@ set(srcs
     "comm_server.c"
     "slcan_port.c"
     "datalog_lease_task.c"
+    "datalog_session.c"
+    "datalog_session_logic.c"
     "datalog_stream.c"
     "config_server.c"
     "slcan.c"
