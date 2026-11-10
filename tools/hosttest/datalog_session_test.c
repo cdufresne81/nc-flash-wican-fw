@@ -10,6 +10,9 @@
  *   D6  A lease that is not renewed runs out, including across the 32-bit ms rollover.
  *   D7  Ending records why, hands back the saved mode, and retires the token for good.
  *   D8  Reason names are the HTTP contract.
+ *   D10 ttl_s / token text that is not a number is "not sent", never 0.
+ *   D11 A list may only make the adapter send read services 01, 22 and 23, judged on the
+ *       bytes that would go out, not on the row's Mode key.
  *   D9  The nesting bound: a real list passes, a nesting bomb does not, brackets inside
  *       strings do not count.
  *
@@ -55,7 +58,7 @@ int main(void)
     printf("# D1 ttl_s default and clamp\n");
     CHECK(dls_clamp_ttl_s(false, 0)   == 30,  "absent -> 30");
     CHECK(dls_clamp_ttl_s(false, 999) == 30,  "absent ignores the value");
-    CHECK(dls_clamp_ttl_s(true, 0)    == 10,  "0 (or unparseable) -> 10");
+    CHECK(dls_clamp_ttl_s(true, 0)    == 10,  "0 -> 10");
     CHECK(dls_clamp_ttl_s(true, 9)    == 10,  "below the floor");
     CHECK(dls_clamp_ttl_s(true, 10)   == 10,  "the floor");
     CHECK(dls_clamp_ttl_s(true, 45)   == 45,  "in range is kept");
@@ -88,7 +91,8 @@ int main(void)
     CHECK(dls_remaining_ms(&st, 123456) == 0, "no session: nothing remaining");
     CHECK(dls_end_name(st.last_end)[0] == '\0', "no session yet: last_end is empty");
 
-    const uint32_t t1 = dls_begin(&st, 1000, 30, MODE_AUTO, 0);
+    const uint32_t t1 = dls_new_token(&st, 0);
+    dls_begin(&st, 1000, 30, MODE_AUTO, t1);
     CHECK(t1 != 0, "a zero seed still yields a non-zero token");
     CHECK(st.active, "active after begin");
     CHECK(st.saved_mode == MODE_AUTO, "the owner's mode is saved");
@@ -96,7 +100,8 @@ int main(void)
     CHECK(dls_remaining_ms(&st, 11000) == 20000, "counts down");
 
     printf("# D4 a second begin keeps the first saved mode\n");
-    const uint32_t t2 = dls_begin(&st, 5000, 60, MODE_ON, t1);   /* seed collides on purpose */
+    const uint32_t t2 = dls_new_token(&st, t1);   /* seed collides on purpose */
+    dls_begin(&st, 5000, 60, MODE_ON, t2);
     CHECK(t2 != 0 && t2 != t1, "a replace never reissues the token the host already holds");
     CHECK(st.saved_mode == MODE_AUTO, "the mode the session forced is NOT saved over the owner's");
     CHECK(dls_remaining_ms(&st, 5000) == 60000, "the lease restarts with the new ttl");
@@ -121,7 +126,7 @@ int main(void)
         dls_state_t w;
         memset(&w, 0, sizeof(w));
         const uint32_t near = 0xFFFFFF00u;   /* 256 ms before the uint32 ms rollover */
-        dls_begin(&w, near, 10, MODE_AUTO, 7);
+        dls_begin(&w, near, 10, MODE_AUTO, dls_new_token(&w, 7));
         CHECK(!dls_expired(&w, near + 9999u), "a lease straddling the rollover is still alive");
         CHECK(dls_remaining_ms(&w, near + 4000u) == 6000, "and counts down across it");
         CHECK(dls_expired(&w, near + 10000u), "and still runs out");
@@ -134,7 +139,8 @@ int main(void)
     CHECK(!dls_token_matches(&st, t2), "the ended session's token is stale");
     CHECK(!dls_keepalive(&st, t2, 1), "and cannot revive it");
     CHECK(dls_remaining_ms(&st, 1) == 0, "nothing remaining after end");
-    const uint32_t t3 = dls_begin(&st, 200000, 30, MODE_OFF, t2);
+    const uint32_t t3 = dls_new_token(&st, t2);
+    dls_begin(&st, 200000, 30, MODE_OFF, t3);
     CHECK(t3 != t2, "the next session never reuses the last token");
     CHECK(st.saved_mode == MODE_OFF, "a NEW session saves the mode afresh");
     CHECK(st.last_end == DLS_END_NONE, "and clears the last end reason");
@@ -162,6 +168,53 @@ int main(void)
         CHECK(!dls_json_depth_ok(bomb, sizeof(bomb), DLS_JSON_MAX_DEPTH), "a nesting bomb is refused");
     }
     CHECK(!dls_json_depth_ok(NULL, 0, DLS_JSON_MAX_DEPTH), "NULL is refused");
+
+    printf("# D10 query numbers\n");
+    {
+        uint32_t v = 77;
+        CHECK(dls_parse_u32("30", &v) && v == 30, "plain number");
+        CHECK(dls_parse_u32("0", &v) && v == 0, "zero");
+        CHECK(dls_parse_u32("4294967295", &v) && v == 0xFFFFFFFFu, "largest token");
+        v = 77;
+        CHECK(!dls_parse_u32("4294967296", &v) && v == 77, "one past 32 bits is refused, out untouched");
+        CHECK(!dls_parse_u32("abc", &v), "letters: not a number, so ttl_s falls to the DEFAULT, not the minimum");
+        CHECK(!dls_parse_u32("", &v),    "empty");
+        CHECK(!dls_parse_u32("12x", &v), "trailing junk");
+        CHECK(!dls_parse_u32("-5", &v),  "a sign");
+        CHECK(!dls_parse_u32(" 5", &v),  "a blank");
+        CHECK(!dls_parse_u32(NULL, &v),  "NULL");
+    }
+
+    printf("# D11 a channel list may only send read services\n");
+    CHECK(dls_pid_service_ok("010C"),            "01: current data");
+    CHECK(dls_pid_service_ok("221746"),          "22: read data by identifier");
+    CHECK(dls_pid_service_ok("23FFFF90000004"),  "23: read memory by address");
+    CHECK(dls_pid_service_ok("010C1"),           "a trailing frames hint does not matter");
+    CHECK(dls_pid_service_ok(" 01 0C"),          "blanks are skipped, as the poller skips them");
+    CHECK(dls_pid_service_ok("0 1 0C"),          "even inside the service byte");
+    CHECK(dls_pid_service_ok("22f190"),          "lower-case hex");
+    CHECK(!dls_pid_service_ok("1003"),           "10: session control");
+    CHECK(!dls_pid_service_ok("1101"),           "11: ECU reset");
+    CHECK(!dls_pid_service_ok("14FFFFFF"),       "14: clear fault codes");
+    CHECK(!dls_pid_service_ok("2701"),           "27: security access");
+    CHECK(!dls_pid_service_ok("2E1746FF"),       "2E: write data by identifier");
+    CHECK(!dls_pid_service_ok("3101FF00"),       "31: routine control");
+    CHECK(!dls_pid_service_ok("3400"),           "34: request download");
+    CHECK(!dls_pid_service_ok("3D"),             "3D: write memory");
+    CHECK(!dls_pid_service_ok("04"),             "04: clear codes (OBD)");
+    CHECK(!dls_pid_service_ok("0A0C"),           "0A is not 01");
+    CHECK(!dls_pid_service_ok("1 0C"),           "the blank does not hide that this sends 0x10");
+    CHECK(!dls_pid_service_ok("0x010C"),         "the poller stops at the x: one nibble, nothing sendable");
+    CHECK(!dls_pid_service_ok("ATZ"),            "an AT command: A is hex, T is not -> no byte");
+    CHECK(!dls_pid_service_ok(""),               "empty");
+    CHECK(!dls_pid_service_ok("0"),              "one character");
+    CHECK(!dls_pid_service_ok("  "),             "only blanks");
+    CHECK(!dls_pid_service_ok(NULL),             "not a string");
+    CHECK(!dls_row_count_ok(0),   "an empty list is refused");
+    CHECK(dls_row_count_ok(1),    "one row");
+    CHECK(dls_row_count_ok(DLS_PIDS_MAX_ROWS),      "the cap");
+    CHECK(!dls_row_count_ok(DLS_PIDS_MAX_ROWS + 1), "one past the cap");
+    CHECK(!dls_row_count_ok(-1),  "no pids array");
 
     if (g_failures)
     {

@@ -68,9 +68,21 @@ static inline uint32_t dls_now_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
+/* How long the 1 Hz lease tick may wait for the session lock, and then for the autopid file
+ * lock. It runs on the dead-man reaper's task, which must never be stalled behind a table
+ * parse or an SD write; if either lock is busy the tick gives up and the next one tries again. */
+#define DLS_TICK_WAIT_MS   20
+#define DLS_WAIT_FOREVER   UINT32_MAX
+
+static bool dls_lock_for(uint32_t wait_ms)
+{
+    const TickType_t ticks = (wait_ms == DLS_WAIT_FOREVER) ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
+    return s_lock != NULL && xSemaphoreTake(s_lock, ticks) == pdTRUE;
+}
+
 static bool dls_lock(void)
 {
-    return s_lock != NULL && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE;
+    return dls_lock_for(DLS_WAIT_FOREVER);
 }
 
 static void dls_unlock(void)
@@ -79,13 +91,18 @@ static void dls_unlock(void)
 }
 
 /* End the active session. Caller holds s_lock and has checked s_st.active.
- * Order matters: the list goes first, so the reload queued last can only find the saved file. */
-static void dls_end_locked(dls_end_t reason)
+ * Order matters: the list goes first, so the reload queued last can only find the saved file.
+ * list_wait_ms bounds the wait for the autopid file lock; if it runs out NOTHING has changed
+ * (false) and the caller tries again later. */
+static bool dls_end_locked(dls_end_t reason, uint32_t list_wait_ms)
 {
+    if (autopid_session_list_set(NULL, 0, 0, list_wait_ms) != ESP_OK)
+    {
+        return false;
+    }
     const int8_t saved_mode = dls_end(&s_st, reason);
     s_active = false;
 
-    autopid_session_list_set(NULL, 0);
     /* Obeys the park rule: under a host park the mode is left alone and the value goes into
      * the park's pre-pause slot, so the producer cannot restart under a parked host. */
     csv_logger_restore_manual_mode(saved_mode);
@@ -97,24 +114,29 @@ static void dls_end_locked(dls_end_t reason)
                    (reason == DLS_END_HOST)    ? "logging stopped" :
                    (reason == DLS_END_EXPIRED) ? "NC Flash stopped answering" :
                                                  "going to sleep");
+    return true;
 }
 
 void datalog_session_tick(void)
 {
-    if (!s_active || !dls_lock()) { return; }
+    /* s_active is only a hint to skip the lock on the common no-session tick: a stale false
+     * costs one second, never a missed expiry. Both waits are short (see DLS_TICK_WAIT_MS). */
+    if (!s_active || !dls_lock_for(DLS_TICK_WAIT_MS)) { return; }
     if (dls_expired(&s_st, dls_now_ms()))
     {
-        dls_end_locked(DLS_END_EXPIRED);
+        (void)dls_end_locked(DLS_END_EXPIRED, DLS_TICK_WAIT_MS);   /* busy: next tick */
     }
     dls_unlock();
 }
 
 void datalog_session_end_for_sleep(void)
 {
-    if (!s_active || !dls_lock()) { return; }
+    /* The lock, not the s_active hint, decides: this is the last chance before the CPU halts,
+     * and a begin that is finishing on the httpd task right now must be seen. */
+    if (!dls_lock()) { return; }
     if (s_st.active)
     {
-        dls_end_locked(DLS_END_SLEEP);
+        (void)dls_end_locked(DLS_END_SLEEP, DLS_WAIT_FOREVER);
     }
     dls_unlock();
 }
@@ -146,8 +168,7 @@ static bool dls_query_u32(const char *query, const char *key, uint32_t *out)
 {
     char buf[16];
     if (httpd_query_key_value(query, key, buf, sizeof(buf)) != ESP_OK) { return false; }
-    *out = (uint32_t)strtoul(buf, NULL, 10);
-    return true;
+    return dls_parse_u32(buf, out);   /* not a number counts as not sent */
 }
 
 /* Read the whole body into a PSRAM buffer (NUL-terminated). NULL on any failure, with *why set
@@ -188,20 +209,58 @@ static char *dls_read_body(httpd_req_t *req, int *len_out, const char **why)
     return buf;
 }
 
-/* Is this a channel list we are willing to hand to the table parser? Returns the number of
- * rows in "pids", or -1. The parser itself tolerates missing can_filters / calculated and odd
- * values; what it is not asked to survive is deep nesting (it recurses, and runs again on the
- * poll task) or a document with no "pids" array at all, which would silently log nothing. */
-static int dls_validate_list(const char *json, int len)
+/* Is this a channel list we are willing to store? Returns NULL and sets *rows_out, or a fixed
+ * sentence saying why not. Checked here, before anything is stored, because from then on the
+ * list decides what this adapter transmits to the ECU:
+ *   - nesting is bounded (the parser recurses, and runs again on the poll task);
+ *   - "pids" must be an array of 1..DLS_PIDS_MAX_ROWS rows;
+ *   - every row -- enabled or not -- must send service 01, 22 or 23 (dls_pid_service_ok);
+ *   - "std_pids" is refused outright: NC Flash never sends them, and although such a row can
+ *     only ever send service 01, accepting them would be a second, uncounted list of rows;
+ * Missing or empty can_filters / calculated are fine; they only decode, they never transmit. */
+static const char *dls_validate_list(const char *json, int len, int *rows_out)
 {
-    if (!dls_json_depth_ok(json, (size_t)len, DLS_JSON_MAX_DEPTH)) { return -1; }
-
+    if (!dls_json_depth_ok(json, (size_t)len, DLS_JSON_MAX_DEPTH))
+    {
+        return "The channel list is nested too deeply.";
+    }
     cJSON *root = cJSON_ParseWithLength(json, (size_t)len);
-    if (root == NULL) { return -1; }
+    if (root == NULL)
+    {
+        return "The channel list is not valid JSON.";
+    }
+
+    const char *why = NULL;
     const cJSON *pids = cJSON_IsObject(root) ? cJSON_GetObjectItem(root, "pids") : NULL;
     const int rows = cJSON_IsArray(pids) ? cJSON_GetArraySize(pids) : -1;
+    if (rows < 0)
+    {
+        why = "The channel list has no pids array.";
+    }
+    else if (!dls_row_count_ok(rows))
+    {
+        why = "The channel list must have between 1 and 128 polled channels.";
+    }
+    else if (cJSON_GetObjectItem(root, "std_pids") != NULL)
+    {
+        why = "The channel list must not contain std_pids.";
+    }
+    else
+    {
+        const cJSON *row;
+        cJSON_ArrayForEach(row, pids)
+        {
+            const cJSON *pid = cJSON_GetObjectItem(row, "PID");
+            if (!dls_pid_service_ok(cJSON_IsString(pid) ? pid->valuestring : NULL))
+            {
+                why = "Every channel's PID must be a mode 01, 22 or 23 read request.";
+                break;
+            }
+        }
+    }
     cJSON_Delete(root);
-    return rows;
+    *rows_out = rows;
+    return why;
 }
 
 static esp_err_t dls_handle_begin(httpd_req_t *req, const char *query)
@@ -215,12 +274,12 @@ static esp_err_t dls_handle_begin(httpd_req_t *req, const char *query)
                    ? dls_send_error(req, "400 Bad Request", "bad_request", why)
                    : dls_send_error(req, "500 Internal Server Error", "internal", "Out of memory.");
     }
-    const int rows = dls_validate_list(body, len);
-    if (rows < 0)
+    int rows = 0;
+    const char *bad = dls_validate_list(body, len, &rows);
+    if (bad != NULL)
     {
         free(body);
-        return dls_send_error(req, "400 Bad Request", "bad_request",
-                              "The channel list is not valid JSON with a pids array.");
+        return dls_send_error(req, "400 Bad Request", "bad_request", bad);
     }
 
     uint32_t ttl_s = 0;
@@ -273,7 +332,10 @@ static esp_err_t dls_handle_begin(httpd_req_t *req, const char *query)
                               "The trip logger could not be started.");
     }
 
-    const esp_err_t set_err = autopid_session_list_set(body, (size_t)len);
+    /* The token goes in with the list, so the table parsed from it carries it and
+     * /poll_status can say WHOSE list is loaded (session_token). */
+    const uint32_t token = dls_new_token(&s_st, esp_random());
+    const esp_err_t set_err = autopid_session_list_set(body, (size_t)len, token, DLS_WAIT_FOREVER);
     free(body);
     if (set_err != ESP_OK)
     {
@@ -285,7 +347,7 @@ static esp_err_t dls_handle_begin(httpd_req_t *req, const char *query)
         return dls_send_error(req, "500 Internal Server Error", "internal", "Out of memory.");
     }
 
-    const uint32_t token = dls_begin(&s_st, dls_now_ms(), ttl_s, mode_before, esp_random());
+    dls_begin(&s_st, dls_now_ms(), ttl_s, mode_before, token);
     s_active = true;
     /* Cannot fail: poll_log_active() was true above and the poller never stops once started. */
     poll_log_request_reload_roll();
@@ -346,7 +408,7 @@ static esp_err_t datalog_session_post_handler(httpd_req_t *req)
     else
     {
         ok = dls_token_matches(&s_st, token);
-        if (ok) { dls_end_locked(DLS_END_HOST); }
+        if (ok) { (void)dls_end_locked(DLS_END_HOST, DLS_WAIT_FOREVER); }
         snprintf(out, sizeof(out), "{\"ok\":true,\"active\":false}");
     }
     dls_unlock();

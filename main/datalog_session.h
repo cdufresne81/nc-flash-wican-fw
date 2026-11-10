@@ -28,8 +28,14 @@
  * ends when the PC says so, when it stops sending keepalives, when the adapter sleeps, or at a
  * reboot -- and the adapter then goes back to its saved list by itself.
  *
- * It only changes WHICH read-only requests the poller sends and whether the CSV writer
- * records. It never touches FLASH_ACTIVE_BIT, a park or claim lease, SLCAN or a flash path. */
+ * WHAT IT CAN MAKE THE ADAPTER DO, and what enforces it. A session changes which requests the
+ * poller sends and whether the CSV writer records -- nothing else. The requests are not taken on
+ * trust: begin refuses any list with a row whose request would not start with service 01, 22
+ * or 23 (the three read services; dls_pid_service_ok() in datalog_session_logic.c, judged on
+ * the bytes sent, not on the row's Mode key), any list with std_pids, and any list outside
+ * 1..DLS_PIDS_MAX_ROWS rows. The saved list written through /store_auto_data is NOT checked
+ * that way and never was; that is a separate, older path.
+ * It never touches FLASH_ACTIVE_BIT, a park or claim lease, SLCAN or a flash path. */
 
 #include "esp_http_server.h"
 
@@ -39,7 +45,8 @@
 void datalog_session_register_handlers(httpd_handle_t server);
 
 /* End the session if its lease has run out. Called once a second by datalog_lease_task; a
- * single flag read when no session is active. */
+ * single flag read when no session is active. Never waits more than a few tens of ms: if a lock
+ * it needs is busy it returns and the next tick tries again. */
 void datalog_session_tick(void);
 
 /* End the session because the adapter is going to sleep. A wake resumes in place with RAM

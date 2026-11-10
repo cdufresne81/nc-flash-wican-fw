@@ -1459,12 +1459,20 @@ static void csv_manual_mode_apply(int8_t mode)
 // under a parked host. The value goes into the pre-pause slot instead, and datalog_restore_mode()
 // applies it when the park ends.
 //
-// The park flag is not ours and is not locked against us: /datalog?op=pause and op=resume run
-// on the httpd task, this can run on another. Each write is therefore followed by a second
-// look at the flag, and the result corrected if the park changed underneath it. That closes
-// every two-party ordering (the worked cases are in docs/internals/datalog_session.md). It
-// never touches a CAN bit or a lease, so the worst any remaining interleaving can do is leave
-// the wrong manual mode -- never a transmit under a host.
+// KNOWN RACE, deliberately not locked. The park flag belongs to /datalog?op=pause and op=resume
+// on the httpd task and is not locked against us; when this runs on the lease or sleep task
+// the two can interleave. Each write below is followed by a second look at the flag, which
+// narrows the window to a few instructions but does not close it -- not even for two parties:
+//   restore vs pause : the pause can snapshot the session's forced-ON, or arm the park just
+//                      after our last look, leaving the mode the session saved in force under a
+//                      park, or ON in the pre-pause slot;
+//   restore vs resume: the resume can read the slot just before we write it and apply the
+//                      session's forced-ON after we have finished.
+// Either needs a session ending (lease expiry or sleep) within microseconds of a host pause or
+// resume. The worst outcome is a manual mode left ON or OFF until the next Start/Stop, trip
+// end (OFF only) or reboot. It can never cause a transmit: the poller is parked by the park
+// flag itself, which this function only reads. Closing it needs a lock inside the pause/resume
+// handlers, which are the flash-coexistence path and are left alone on purpose.
 void csv_logger_restore_manual_mode(int8_t mode)
 {
     if (csv_manual_restore_target(can_datalog_park_active()) == CSV_RESTORE_TO_PREPAUSE)
@@ -1483,7 +1491,8 @@ void csv_logger_restore_manual_mode(int8_t mode)
     if (can_datalog_park_active())
     {
         // A pause landed around our write: it either snapshotted the mode the session had
-        // forced, or had its forced-off overwritten by ours. Put both right.
+        // forced, or had its forced-off overwritten by ours. Put both right (best effort --
+        // see KNOWN RACE above).
         s_datalog_prepause_mode = mode;
         csv_manual_mode = CSV_MANUAL_OFF;
     }

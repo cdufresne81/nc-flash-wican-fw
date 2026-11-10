@@ -29,6 +29,65 @@ uint32_t dls_clamp_ttl_s(bool given, uint32_t ttl_s)
     return ttl_s;
 }
 
+bool dls_parse_u32(const char *text, uint32_t *out)
+{
+    if (text == NULL || text[0] == '\0') { return false; }
+    uint32_t v = 0;
+    for (const char *p = text; *p != '\0'; p++)
+    {
+        if (*p < '0' || *p > '9') { return false; }
+        const uint32_t d = (uint32_t)(*p - '0');
+        if (v > (0xFFFFFFFFu - d) / 10u) { return false; }   /* would not fit 32 bits */
+        v = v * 10u + d;
+    }
+    *out = v;
+    return true;
+}
+
+static int dls_hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
+
+bool dls_pid_service_ok(const char *pid_text)
+{
+    int nib[2];
+    int n = 0;
+
+    if (pid_text == NULL) { return false; }
+    /* The parser only keeps PID text longer than one character. */
+    if (pid_text[0] == '\0' || pid_text[1] == '\0') { return false; }
+
+    for (const char *p = pid_text; *p != '\0' && n < 2; p++)
+    {
+        const int v = dls_hex_nibble(*p);
+        if (v >= 0)
+        {
+            nib[n++] = v;
+        }
+        else if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        {
+            continue;   /* the poller skips these */
+        }
+        else
+        {
+            break;      /* and stops at anything else */
+        }
+    }
+    if (n < 2) { return false; }
+
+    const int service = nib[0] * 16 + nib[1];
+    return service == 0x01 || service == 0x22 || service == 0x23;
+}
+
+bool dls_row_count_ok(int rows)
+{
+    return rows >= 1 && rows <= DLS_PIDS_MAX_ROWS;
+}
+
 dls_begin_check_t dls_begin_check(const dls_begin_in_t *in)
 {
     if (in == NULL) { return DLS_BEGIN_BUSY; }
@@ -48,14 +107,15 @@ const char *dls_begin_refusal_msg(dls_begin_check_t why)
         return "NC Flash is using the car's ECU, or the adapter is going to sleep. "
                "Logging can start when that is finished.";
     case DLS_BEGIN_INACTIVE:
-        return "The datalogger is not running on this adapter, so it cannot switch channel lists.";
+        return "The adapter's own saved list has no polled channel, so its datalogger is not "
+               "running. Add one channel on the adapter's Logger page, save and reboot it, "
+               "then start logging again.";
     default:
         return "";
     }
 }
 
-uint32_t dls_begin(dls_state_t *st, uint32_t now_ms, uint32_t ttl_s, int8_t current_mode,
-                   uint32_t seed)
+uint32_t dls_new_token(const dls_state_t *st, uint32_t seed)
 {
     uint32_t token = seed;
     /* 0 means "no token", and a replace must not hand the host the token it already has: it
@@ -64,7 +124,12 @@ uint32_t dls_begin(dls_state_t *st, uint32_t now_ms, uint32_t ttl_s, int8_t curr
     {
         token++;
     }
+    return token;
+}
 
+void dls_begin(dls_state_t *st, uint32_t now_ms, uint32_t ttl_s, int8_t current_mode,
+               uint32_t token)
+{
     if (!st->active)
     {
         st->saved_mode = current_mode;
@@ -74,7 +139,6 @@ uint32_t dls_begin(dls_state_t *st, uint32_t now_ms, uint32_t ttl_s, int8_t curr
     st->token = token;
     st->ttl_ms = ttl_s * 1000u;
     st->deadline_ms = now_ms + st->ttl_ms;
-    return token;
 }
 
 bool dls_token_matches(const dls_state_t *st, uint32_t token)
@@ -98,7 +162,7 @@ int8_t dls_end(dls_state_t *st, dls_end_t reason)
 {
     st->active = false;
     st->last_end = reason;
-    /* The token is kept on purpose: dls_begin() then never reissues it, so a host still
+    /* The token is kept on purpose: dls_new_token() then never reissues it, so a host still
      * holding it cannot be mistaken for the owner of the next session. */
     return st->saved_mode;
 }

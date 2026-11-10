@@ -342,10 +342,27 @@ static volatile bool     s_active = false;
  * lapsed (CSV_RELOAD_HOLD_MS) with the trip still open, and a writer that slow must not be
  * made to open and close files in a loop. */
 #define POLLLOG_ROLL_MAX_HOLDS   3
+/* Going back to the saved list after an NC Flash session must not be given up on after one
+ * failed parse (out of memory at that instant): the temporary table would then be polled until
+ * a reboot. A failed revert is tried again every POLLLOG_REVERT_RETRY_MS, at most
+ * POLLLOG_REVERT_MAX_RETRIES times -- bounded, so a saved file that can never load cannot keep
+ * the poll task parsing it for ever. */
+#define POLLLOG_REVERT_RETRY_MS     2000
+#define POLLLOG_REVERT_MAX_RETRIES  5
 static volatile uint32_t s_reload_req = 0;
+/* True from just before the poll task claims a request until the outcome of that reload is
+ * published. Without it reload_pending read false DURING the ~100 ms parse (the request word
+ * is already cleared), and a host polling in that window saw "not pending" with the old table
+ * still loaded. Written by the poll task only. Raised BEFORE the request word is cleared and
+ * lowered AFTER reload_ok and the mirrors are written, and the status reader looks at the
+ * request word first and this second, so it can never see both clear mid-reload. */
+static volatile bool     s_reload_busy = false;
 static volatile bool     s_last_reload_ok = true;
 static volatile uint32_t s_pid_count = 0;
 static volatile bool     s_session_list = false;
+/* Token of the NC Flash session whose list the loaded table was parsed from; 0 when the loaded
+ * table is the saved list. Same single-writer mirror as s_session_list. */
+static volatile uint32_t s_session_token = 0;
 static volatile uint32_t s_cum_ok = 0, s_cum_timeout = 0, s_cum_txfail = 0;
 static volatile uint32_t s_win_ok = 0, s_win_timeout = 0, s_win_txfail = 0;
 static volatile float    s_win_rtt_avg_ms = 0, s_win_rtt_min_ms = 0, s_win_rtt_max_ms = 0, s_win_req_s = 0;
@@ -1384,6 +1401,8 @@ static void polllog_rx_task(void *arg)
     bool guard_cleared = false;
     int64_t withheld_since_us = 0;   /* when the bus was first seen disabled with no owner; 0 = not */
     uint8_t roll_holds = 0;          /* reload holds raised for the pending roll; see POLLLOG_ROLL_MAX_HOLDS */
+    uint8_t revert_retries = 0;      /* failed reverts to the saved list so far; see POLLLOG_REVERT_MAX_RETRIES */
+    int64_t revert_retry_at_us = 0;  /* when to try the revert again; 0 = no retry armed */
     int64_t stats_t = start_us;
     polllog_stats_reset();
 
@@ -1502,6 +1521,15 @@ static void polllog_rx_task(void *arg)
          *   - the hold lapsing with the trip still open: raised again, at most
          *     POLLLOG_ROLL_MAX_HOLDS times, then the roll is dropped to a plain reload;
          *   - a rejected table: kept out, hold lowered, reload_ok false. */
+        if (revert_retry_at_us != 0 && esp_timer_get_time() >= revert_retry_at_us)
+        {
+            /* A revert to the saved list failed earlier (see the rejection branch below).
+             * Ask again, as a roll: the trip being written has the temporary columns. */
+            revert_retry_at_us = 0;
+            __atomic_fetch_or(&s_reload_req, POLLLOG_RELOAD_PLAIN | POLLLOG_RELOAD_ROLL,
+                              __ATOMIC_SEQ_CST);
+        }
+
         const uint32_t reload_peek = s_reload_req;
         if (reload_peek != 0)
         {
@@ -1529,6 +1557,7 @@ static void polllog_rx_task(void *arg)
                 /* Claim the whole request BEFORE the parse: one that lands from here on stays
                  * set for the next pass, and one that landed just before is served by this
                  * parse, because every requester changes the source before it raises a bit. */
+                s_reload_busy = true;   /* before the claim: reload_pending must not dip */
                 const uint32_t claimed = __atomic_exchange_n(&s_reload_req, 0u, __ATOMIC_SEQ_CST);
                 autopid_config_t *n = autopid_reload_config();
                 if (n == AUTOPID_RELOAD_DEFERRED)
@@ -1553,7 +1582,10 @@ static void polllog_rx_task(void *arg)
                         polllog_prepare_schedule(n);
                         s_pid_count = n->pid_count;
                         s_session_list = n->from_session_list;
+                        s_session_token = n->session_token;
                         s_last_reload_ok = true;
+                        revert_retries = 0;
+                        revert_retry_at_us = 0;
                         ESP_LOGI(TAG, "PID table hot-reloaded: %u pids%s", (unsigned)s_pid_count,
                                  n->from_session_list ? " (temporary list)" : "");
                     }
@@ -1561,6 +1593,24 @@ static void polllog_rx_task(void *arg)
                     {
                         s_last_reload_ok = false;
                         ESP_LOGW(TAG, "PID reload rejected -- keeping old table");
+                        /* The table we keep is a temporary list whose session is over: this
+                         * was the revert to the saved list, and it must not be dropped. */
+                        if (s_session_list && !autopid_session_list_active())
+                        {
+                            if (revert_retries < POLLLOG_REVERT_MAX_RETRIES)
+                            {
+                                revert_retries++;
+                                revert_retry_at_us = esp_timer_get_time() +
+                                                     (int64_t)POLLLOG_REVERT_RETRY_MS * 1000;
+                            }
+                            else if (revert_retries == POLLLOG_REVERT_MAX_RETRIES)
+                            {
+                                revert_retries++;   /* say it once */
+                                event_log_emit(EVL_WARN, "could not go back to the saved channel "
+                                               "list -- still logging NC Flash's list, reboot "
+                                               "the adapter to restore it");
+                            }
+                        }
                     }
                     /* Swapped or refused, the roll is over: let the writer record again. Done
                      * for every roll, including a hold the session-begin handler raised. */
@@ -1570,6 +1620,15 @@ static void polllog_rx_task(void *arg)
                     }
                     roll_holds = 0;
                 }
+                /* Everything this reload publishes is written; only now may pending drop. */
+                s_reload_busy = false;
+
+                /* Back to the top, through can_should_park(), before anything is sent. The
+                 * parse above takes ~100 ms and nothing looked at the park flags meanwhile: a
+                 * host that claimed the bus during it must not get a sweep of 0x7E0 requests
+                 * first. Nothing below is owed to this pass -- the schedule, the mirrors and
+                 * the hold were all dealt with above, and a pending Test waits one pass. */
+                continue;
             }
         }
 
@@ -1971,6 +2030,7 @@ void poll_log_init(char *id, uint32_t log_period)
     }
     s_pid_count = s_cfg->pid_count;   /* cross-task mirror for GET /poll_status (issue #39) */
     s_session_list = s_cfg->from_session_list;   /* always false at boot: a temporary list is RAM-only */
+    s_session_token = s_cfg->session_token;
     /* Seed the divisor schedule (issue #29) before the poll task exists -- no race. */
     polllog_prepare_schedule(s_cfg);
     if (s_cfg->pid_count == 0)
@@ -2193,6 +2253,9 @@ char *poll_log_get_status_json(void)
                       : s_fast_sweep   ? "fast"
                                        : "watch";
 
+    /* Request word FIRST, busy flag second -- the order s_reload_busy's comment depends on. */
+    const bool reload_requested = (s_reload_req != 0);
+    const bool reload_pending = reload_requested || s_reload_busy;
     int n = snprintf(buf, POLLLOG_STATUS_JSON_SZ,
              "{\"active\":%s,\"ok\":%u,\"timeout\":%u,\"txfail\":%u,"
              "\"rtt_avg_ms\":%.2f,\"rtt_min_ms\":%.2f,\"rtt_max_ms\":%.2f,\"req_s\":%.1f,"
@@ -2203,7 +2266,7 @@ char *poll_log_get_status_json(void)
              "\"sweep_min_ms\":%.1f,\"sweep_max_ms\":%.1f,\"fast_ms\":%.1f,\"fast_hz\":%.2f,"
              "\"win_ok\":%u,\"win_timeout\":%u,\"win_txfail\":%u,"
              "\"ignition_on\":%s,\"quiesced\":%s,\"bus_idle_ms\":%u,\"reload_ok\":%s,"
-             "\"reload_pending\":%s,\"session_list\":%s,"
+             "\"reload_pending\":%s,\"session_list\":%s,\"session_token\":%u,"
              "\"state\":\"%s\",\"gate_open\":%s,\"fast_sweep\":%s,"
              "\"gate_volt\":%.1f,\"rpm_known\":%s,\"rpm_seen\":%s,\"rpm_configured\":%s,"
              "\"rpm_age_ms\":%u,"
@@ -2226,8 +2289,9 @@ char *poll_log_get_status_json(void)
              s_quiesced ? "true" : "false",
              (unsigned)poll_log_bus_idle_ms(),
              s_last_reload_ok ? "true" : "false",
-             (s_reload_req != 0) ? "true" : "false",
+             reload_pending ? "true" : "false",
              s_session_list ? "true" : "false",
+             (unsigned)s_session_token,
              state,
              s_gate_open ? "true" : "false",
              s_fast_sweep ? "true" : "false",

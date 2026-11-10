@@ -49,6 +49,10 @@
  * again on the poll task, so the depth is bounded before any parser sees it. */
 #define DLS_JSON_MAX_DEPTH   16
 
+/* Most channels one list may carry. A logging run is a few dozen; every row costs a request
+ * per sweep and internal RAM while the list is parsed. */
+#define DLS_PIDS_MAX_ROWS    128
+
 /* Why the last session ended. Names (dls_end_name) are part of the HTTP contract. */
 typedef enum {
     DLS_END_NONE = 0,   /* no session has ended since the current one began, or since boot */
@@ -68,6 +72,29 @@ typedef struct {
 
 /* ttl_s as the session will use it: the default when the host sent none, else clamped. */
 uint32_t dls_clamp_ttl_s(bool given, uint32_t ttl_s);
+
+/* A query value as an unsigned decimal number. False for anything else -- empty, a sign,
+ * letters, trailing junk, more than 32 bits -- so the caller can treat "ttl_s=abc" as not sent
+ * (the default) rather than as 0 (the minimum), and "token=abc" as no token. */
+bool dls_parse_u32(const char *text, uint32_t *out);
+
+/* ---- What a channel list may ask the ECU ------------------------------------
+ * A session list arrives over the network and decides what this adapter transmits to the engine
+ * computer, so the requests are checked here rather than trusted: each row may only send
+ * service 0x01 (read current data), 0x22 (read data by identifier) or 0x23 (read memory by
+ * address). Those three only read. Anything else -- 0x10 session control, 0x11 reset, 0x2E/0x3D
+ * writes, 0x31 routines, 0x34.. programming -- is refused before the list is stored.
+ *
+ * The test is on the bytes that would be SENT, not on the row's "Mode" key, which is
+ * informational: the poller frames the request from the PID text (polllog_req_bytes), taking
+ * hex digits, skipping blanks, stopping at anything else. This reads the first byte exactly
+ * that way. Text that yields no first byte is refused too -- it could only ever be an
+ * unpollable row. */
+bool dls_pid_service_ok(const char *pid_text);
+
+/* Is this a row count a session accepts? 1..DLS_PIDS_MAX_ROWS. An empty list would force the
+ * logger on to record nothing. */
+bool dls_row_count_ok(int rows);
 
 /* May a session begin right now? BUSY and INACTIVE are both HTTP 409. */
 typedef enum {
@@ -92,14 +119,18 @@ dls_begin_check_t dls_begin_check(const dls_begin_in_t *in);
 /* One plain sentence for the refusal ("" for DLS_BEGIN_OK). */
 const char *dls_begin_refusal_msg(dls_begin_check_t why);
 
-/* Begin, or replace, a session. Returns the new token (never 0, never the previous one).
+/* The token the next begin will use: never 0, never the previous one. Separate from dls_begin()
+ * because the token is stored with the list before the session is recorded.
+ * seed is any number (a hardware random word on the device). */
+uint32_t dls_new_token(const dls_state_t *st, uint32_t seed);
+
+/* Begin, or replace, a session with a token from dls_new_token().
  *
  * current_mode is saved ONLY when no session was active. A second begin is the same logging
  * run with a new list, and by then the "current" mode is the ON this session forced -- saving
- * it would make the session hand back its own override and leave the logger forced on for good.
- * seed is any number (a hardware random word on the device). */
-uint32_t dls_begin(dls_state_t *st, uint32_t now_ms, uint32_t ttl_s, int8_t current_mode,
-                   uint32_t seed);
+ * it would make the session hand back its own override and leave the logger forced on for good. */
+void dls_begin(dls_state_t *st, uint32_t now_ms, uint32_t ttl_s, int8_t current_mode,
+               uint32_t token);
 
 /* Does this token name the active session? False for token 0 and when none is active. */
 bool dls_token_matches(const dls_state_t *st, uint32_t token);

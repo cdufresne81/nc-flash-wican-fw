@@ -203,7 +203,7 @@ The Auto (fastest) logging rate is a **measurement, not an estimate** — this i
  "sweep_min_ms":38.2,"sweep_max_ms":52.7,"fast_ms":49.6,"fast_hz":20.15,
  "win_ok":1197,"win_timeout":0,"win_txfail":0,
  "ignition_on":true,"quiesced":false,"bus_idle_ms":4294967295,
- "reload_ok":true,"reload_pending":false,"session_list":false,
+ "reload_ok":true,"reload_pending":false,"session_list":false,"session_token":0,
  "state":"fast","gate_open":true,"fast_sweep":true,
  "gate_volt":13.2,"rpm_known":true,"rpm_seen":true,"rpm_age_ms":38,
  "rpm_configured":true,"rpm":2150,"engine_running":true,"loop_age_ms":12}
@@ -225,9 +225,10 @@ The divisor fields (issue #29) are the whole diagnostic surface for the feature 
 | `pace_sweeps` / `min_sweep_ms` | Sweeps held back by the 100 Hz cap, and the cap itself in ms. `pace_sweeps` climbing means the config is asking for more than 100 Hz and getting 100. |
 | `sweep_min_ms` / `sweep_max_ms` | Sweep-duration spread over the 3 s window — the phasing-quality readout. A wide spread means divisor groups are co-firing. |
 | `fast_ms` / `fast_hz` | Fastest channel's cadence = mean executed sweep × `sched_min_n`. **This**, not `sweep_hz`, is what the Auto CSV grid tracks. |
-| `reload_pending` | A live hot-reload is armed but not yet applied: deferred under an open trip, waiting for a rolled trip to close, or waiting out a park. |
-| `reload_ok` | Outcome of the **last** reload that ran. Only meaningful once `reload_pending` is false; before that it still describes the previous one. |
+| `reload_pending` | A live hot-reload is armed but not yet applied: deferred under an open trip, waiting for a rolled trip to close, waiting out a park, **or being parsed right now** (`s_reload_busy`). It does not dip to false mid-parse. |
+| `reload_ok` | Outcome of the **last** reload that ran, written before `reload_pending` drops. While `reload_pending` is true it still describes the previous one. |
 | `session_list` | The loaded table came from NC Flash's temporary channel list, not from `auto_pid.json` (see [datalog_session.md](datalog_session.md)). |
+| `session_token` | Token of the session whose list the loaded table was parsed from; `0` when the saved list is loaded. This, not `session_list`, is how a host knows *its* list is the one loaded. |
 
 ## Live reload of the sensor table
 
@@ -238,6 +239,12 @@ the whole request with one atomic exchange before it parses, so a request that l
 parse is still there on the next pass. The swap never happens while a CSV trip is open, so a
 file's columns never change under it. `autopid_reload_config()` re-checks that under the config
 mutex and answers `AUTOPID_RELOAD_DEFERRED` if a trip opened mid-parse.
+
+**After any pass that ran a reload the task `continue`s to the top of the loop**, back through
+`can_should_park()`, before it sends anything. The parse takes ~100 ms and the park flags are not
+looked at during it; without the `continue` a host that claimed the bus in that window got one
+sweep of `0x7E0` requests first. Everything the reload owes — the schedule, the status mirrors, the
+hold — is done before the `continue`.
 
 Two kinds of request:
 
@@ -260,6 +267,8 @@ as of this writing; the cases it is built to survive:
 - **A trip opens mid-parse** (`AUTOPID_RELOAD_DEFERRED`). The request is put back; a hold that is
   still raised closes that trip on the writer's next pass.
 - **The table is rejected.** The old one keeps running, the hold is lowered, `reload_ok` is false.
+  If the table kept is a temporary list whose session has ended (the revert failed), the reload is
+  tried again every `POLLLOG_REVERT_RETRY_MS`, at most `POLLLOG_REVERT_MAX_RETRIES` times.
 
 The recording-gate fields. `req_s` alone is ambiguous once the gate exists — ~15 req/s is healthy in WATCH and alarming in FAST — so read `state` first:
 
