@@ -1586,18 +1586,17 @@
                         <div style="color:#6b7280;margin-top:6px;font-size:12px">These SSIDs are used as backup networks if the primary station fails.</div>
                     </div>
                 </div>
-                <!-- BLE settings hidden, not removed: the streamlined UI is Wi-Fi-only for now.
-                     BLE stays in the firmware and may return if users need it (e.g. a phone whose
-                     Wi-Fi is captive to CarPlay/Android Auto). The elements must stay in the DOM:
-                     Load()/postConfig() round-trip ble_pass/ble_status/ble_power through them.
-                     See the BLE note in README.md.
+                <!-- BLE settings. Hidden while BLE and Wi-Fi were mutually exclusive (a BLE connect
+                     used to shut Wi-Fi and this page down); shown again now that both run together
+                     and a BLE ELM327 app is arbitrated by the bus rule instead of by the radio.
+                     See docs/internals/elm327_clients.md.
                      ble_pass_value MUST stay type="text": /load_config returns the redaction
                      sentinel "\x01stored\x01" for every secret, and a type="number" input runs
                      the HTML value-sanitization algorithm on assignment -- it silently drops any
                      non-numeric value to "". That made Load() blank the field and postConfig()
                      send ble_pass:"", which the firmware takes literally and wipes the passkey
                      (and forces a reboot, since ble_pass is not in LIVE_APPLY_WHITELIST). -->
-                <div id="ble_section" style="display:none">
+                <div id="ble_section">
                 <div class="divider"></div>
                 <div class="section-title">BLE</div>
                 <table class="form-table">
@@ -1622,8 +1621,8 @@
                 </div>
                 <div style="margin:8px 0;display:none" id="ble_warning_div">
                     <div style="background:linear-gradient(135deg,#fef3c7 0%,#fde68a 100%);border:1px solid #f59e0b;border-radius:8px;padding:12px;box-shadow:0 2px 4px #0000001a">
-                        <div style="align-items:center;margin-bottom:6px;display:flex"><span data-lucide="alert-triangle" style="margin-right:8px;font-size:16px"></span><strong style="color:#92400e;font-size:14px">BLE Connection Warning</strong></div>
-                        <div style="color:#78350f;font-size:13px;line-height:1.4">When BLE connects, WiFi AP is disabled. To restore WiFi AP: disconnect BLE and power cycle device.</div>
+                        <div style="align-items:center;margin-bottom:6px;display:flex"><span data-lucide="alert-triangle" style="margin-right:8px;font-size:16px"></span><strong style="color:#92400e;font-size:14px">With BLE on</strong></div>
+                        <div style="color:#78350f;font-size:13px;line-height:1.4">Wi-Fi stays up while a phone is connected over BLE. Pair with the passkey above, then point an ELM327 app at the device. The datalogger pauses while the app is talking, and NC Flash always has priority. The device restarts each time it wakes from sleep, and Wi-Fi is somewhat slower.</div>
                     </div>
                 </div>
                 <!-- Time zone (issue #91). It shapes the log file names and timestamps,

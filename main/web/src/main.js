@@ -3128,20 +3128,12 @@ function configureWifiModeSettings(elements, wifiMode) {
     // Auto-disable AP only applies to AP+Station
     elements.apAutoDisable.disabled = !isAPStation;
 
-    // BLE element state (the BLE section is hidden but still round-trips) + station info note
-    if (isAP) {
-        elements.bleStatus.disabled = false;
-        elements.blePassValue.disabled = false;
-        elements.sta_ble_info.style.display = "none";
-    } else if (isStation) {
-        elements.sta_ble_info.style.display = "block";
-    } else {   // APStation
-        elements.bleStatus.disabled = true;
-        elements.bleStatus.value = "disable";
-        elements.bleStatus.selectedIndex = 1;
-        elements.blePassValue.disabled = true;
-        elements.sta_ble_info.style.display = "none";
-    }
+    // BLE is available in every Wi-Fi mode: a BLE connection no longer takes Wi-Fi down, so the
+    // old rule that forced it off under AP+Station (where losing the AP stranded the user) has
+    // nothing left to protect. handleBleStatus() owns the passkey field's enabled state.
+    elements.bleStatus.disabled = false;
+    // Station-only info note (despite its id, it is about the AP, not BLE).
+    elements.sta_ble_info.style.display = isStation ? "block" : "none";
 }
 
 function handleBleStatus(elements) {

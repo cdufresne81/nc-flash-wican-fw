@@ -272,6 +272,78 @@ void send_to_host(char* str, uint32_t len, QueueHandle_t *q)
 }
 
 
+/* One ELM327 client transport: where its replies go, and the line it is still typing. */
+typedef struct
+{
+	QueueHandle_t *reply_q;
+	/* Line-assembly buffer for elm327_process_cmd(), which writes up to
+	 * ELM327_CLIENT_CMD_BUFFER_LEN bytes into it (stock firmware handed it 2 KB and trusted the
+	 * app to send a CR in time). 18 KB of internal RAM is not affordable, so it lives in PSRAM
+	 * and is only allocated once a client of this transport shows up. */
+	char *line;
+	uint32_t line_len;
+	int64_t last_cmd_time;
+} elm327_client_t;
+
+/* Hand an ELM327 app's bytes to the MIC3624 interpreter chip through elm327_process_cmd(),
+ * exactly as stock WiCAN PRO firmware routes them; the chip speaks ELM327 itself, the ESP32
+ * only carries bytes. Replies come back on the client's queue via send_to_host.
+ *
+ * This is the second path to the bus (architecture.md section 6) and the datalogger cannot
+ * share the ECU with it, so the three rules of ext_client_logic.h apply here:
+ *
+ *   - NC Flash wins. If a flash, a host claim, a host pause or sleep teardown holds the bus the
+ *     chunk is answered BUS BUSY and dropped. The hold is NOT touched, so a refused app cannot
+ *     keep the logger benched after NC Flash leaves.
+ *   - Never block the caller. can_tx_task also carries port 35001, so a chunk that would not
+ *     fit in the chip's command queue is answered BUFFER FULL instead of queued.
+ *   - Otherwise touch the hold FIRST, then queue: poll_log must already be on its way to the
+ *     park when the chip starts talking.
+ *
+ * uart1_event_task asks the same gate again at the moment of sending, which covers the commands
+ * that were already queued when NC Flash arrived. */
+static void elm327_client_route(elm327_client_t *c, uint8_t *msg, int len)
+{
+	if(c->reply_q == NULL || *c->reply_q == NULL || len <= 0)
+	{
+		return;   /* transport not up (BLE disabled): nowhere to answer, so nothing to do */
+	}
+	const size_t cmds = ext_client_count_commands(msg, (size_t)len);
+
+	if(c->line == NULL)
+	{
+		c->line = heap_caps_calloc(1, ELM327_CLIENT_CMD_BUFFER_LEN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		if(c->line == NULL)
+		{
+			ESP_LOGE(TAG, "no memory for the ELM327 line buffer");
+			if(cmds != 0)
+			{
+				send_to_host(ELM327_RSP_BUFFER_FULL, 0, c->reply_q, NULL);
+			}
+			return;
+		}
+	}
+	if(can_ext_client_refused())
+	{
+		c->line_len = 0;
+		c->line[0] = '\0';
+		if(cmds != 0)
+		{
+			send_to_host(ELM327_RSP_BUS_BUSY, 0, c->reply_q, NULL);
+		}
+		return;
+	}
+	if(cmds > elm327_cmd_queue_spaces())
+	{
+		c->line_len = 0;
+		c->line[0] = '\0';
+		send_to_host(ELM327_RSP_BUFFER_FULL, 0, c->reply_q, NULL);
+		return;
+	}
+	can_ext_client_touch();
+	elm327_process_cmd(msg, len, c->reply_q, c->line, &c->line_len, &c->last_cmd_time, &send_to_host);
+}
+
 static void can_tx_task(void *pvParameters)
 {
 	while(1)
@@ -311,73 +383,25 @@ static void can_tx_task(void *pvParameters)
 			}
 			continue;
 		}
-		/* ELM327 clients (Torque, Car Scanner, OBD Fusion...) on TCP 35000. Bytes go to the
-		 * MIC3624 interpreter chip through elm327_process_cmd(), exactly as stock WiCAN PRO
-		 * firmware routes them; the chip speaks ELM327 itself, the ESP32 only carries bytes.
-		 * Replies come back on xMsg_Tx_Queue via send_to_host.
-		 *
-		 * This is the second path to the bus (architecture.md section 6) and the datalogger
-		 * cannot share the ECU with it, so the three rules of ext_client_logic.h apply here:
-		 *
-		 *   - NC Flash wins. If a flash, a host claim, a host pause or sleep teardown holds the
-		 *     bus the chunk is answered BUS BUSY and dropped. The hold is NOT touched, so a
-		 *     refused app cannot keep the logger benched after NC Flash leaves.
-		 *   - Never block this task. It also carries port 35001, so a chunk that would not fit
-		 *     in the chip's command queue is answered BUFFER FULL instead of queued.
-		 *   - Otherwise touch the hold FIRST, then queue: poll_log must already be on its way to
-		 *     the park when the chip starts talking.
-		 *
-		 * uart1_event_task asks the same gate again at the moment of sending, which covers the
-		 * commands that were already queued when NC Flash arrived. */
+		/* ELM327 clients: a phone app on TCP 35000 (DEV_WIFI) or on the BLE FFF0 service
+		 * (DEV_BLE). Same route, same rules -- see elm327_client_route(). Each transport has its
+		 * own line-assembly state and its own reply queue, so two apps cannot splice their
+		 * half-typed commands together or read each other's answers. */
 		if(ucTCP_RX_Buffer.dev_channel == DEV_WIFI)
 		{
-			/* Line-assembly buffer for elm327_process_cmd(), which writes up to
-			 * ELM327_CLIENT_CMD_BUFFER_LEN bytes into it (stock firmware handed it 2 KB and
-			 * trusted the app to send a CR in time). 18 KB of internal RAM is not affordable
-			 * here, so it lives in PSRAM and is only allocated once a client shows up. */
-			static char *elm327_cmd_buffer = NULL;
-			static uint32_t elm327_cmd_buffer_len = 0;
-			static int64_t elm327_last_cmd_time = 0;
-			const size_t cmds = ext_client_count_commands(msg_ptr, (size_t)temp_len);
-
-			if(elm327_cmd_buffer == NULL)
-			{
-				elm327_cmd_buffer = heap_caps_calloc(1, ELM327_CLIENT_CMD_BUFFER_LEN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-				if(elm327_cmd_buffer == NULL)
-				{
-					ESP_LOGE(TAG, "no memory for the ELM327 line buffer");
-					if(cmds != 0)
-					{
-						send_to_host(ELM327_RSP_BUFFER_FULL, 0, &xMsg_Tx_Queue, NULL);
-					}
-					continue;
-				}
-			}
-			if(can_ext_client_refused())
-			{
-				elm327_cmd_buffer_len = 0;
-				elm327_cmd_buffer[0] = '\0';
-				if(cmds != 0)
-				{
-					send_to_host(ELM327_RSP_BUS_BUSY, 0, &xMsg_Tx_Queue, NULL);
-				}
-				continue;
-			}
-			if(cmds > elm327_cmd_queue_spaces())
-			{
-				elm327_cmd_buffer_len = 0;
-				elm327_cmd_buffer[0] = '\0';
-				send_to_host(ELM327_RSP_BUFFER_FULL, 0, &xMsg_Tx_Queue, NULL);
-				continue;
-			}
-			can_ext_client_touch();
-			elm327_process_cmd(msg_ptr, temp_len, &xMsg_Tx_Queue, elm327_cmd_buffer,
-							   &elm327_cmd_buffer_len, &elm327_last_cmd_time, &send_to_host);
+			static elm327_client_t wifi_client = { .reply_q = &xMsg_Tx_Queue };
+			elm327_client_route(&wifi_client, msg_ptr, temp_len);
+			continue;
+		}
+		if(ucTCP_RX_Buffer.dev_channel == DEV_BLE)
+		{
+			static elm327_client_t ble_client = { .reply_q = &xmsg_ble_tx_queue };
+			elm327_client_route(&ble_client, msg_ptr, temp_len);
 			continue;
 		}
 		/* Nothing else routes here. The device has one standalone mode (POLL_LOG), which drives
 		 * TWAI from its own task; the two host channels above are dispatched on dev_channel and
-		 * need no mode. A frame from any other source (BLE, the wired UART) has no consumer. */
+		 * need no mode. A frame from any other source (the wired UART) has no consumer. */
 	}
 }
 #define HEAP_CAPS   (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
