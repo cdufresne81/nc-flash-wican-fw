@@ -95,4 +95,36 @@ const char *ext_client_verdict_name(ext_client_verdict_t v);
  * know how many queue slots the chunk will take BEFORE it commits to queueing any of it. */
 size_t ext_client_count_commands(const uint8_t *buf, size_t len);
 
+/* Is this a command a client must not send to the interpreter chip? `cmd` is one complete line
+ * as the client typed it (any case, any spacing, with or without its CR); `len` bounds it, and a
+ * NUL inside it ends it early.
+ *
+ * Two families are refused, and nothing else:
+ *
+ *   - Commands that change what the chip remembers or how the firmware reaches it: programmable
+ *     parameters (AT PP -- obd.c sets 0E/0F for sleep, and they persist in EEPROM), low power,
+ *     the UART baud rate (the firmware would lose the chip), sleep configuration, factory reset.
+ *   - Bus monitors (AT MA / MR / MT / MP, ST M...). They stream until interrupted and never
+ *     print a prompt, so they would hold the chip, and the UART lock, for as long as they ran.
+ *
+ * Everything an app needs to read data, codes and freeze frames is untouched. */
+bool ext_client_cmd_forbidden(const char *cmd, size_t len);
+
+/* How many slots of the shared receive queue a client transport must leave free. That queue also
+ * carries NC Flash's port-35001 traffic, and while a flash codec runs nothing drains it; a
+ * client that filled it would make NC Flash's own receive task block. */
+#define EXT_CLIENT_RXQ_RESERVE   (16U)
+
+/* May a client transport push a chunk onto the shared receive queue? */
+bool ext_client_rx_admit(bool flash_active, size_t queue_spaces);
+
+/* Sleep: how long a client may hold off the low-voltage sleep countdown. An app left polling
+ * with the engine off -- or anything on the LAN sending a byte now and then -- must not be able
+ * to keep the device awake until the battery is flat. Half an hour covers reading codes with
+ * the key on; after that the countdown starts whatever the client is doing. */
+#define EXT_CLIENT_SLEEP_VETO_MAX_MS   (30U * 60U * 1000U)
+
+/* `veto_ms` is how long the client has been the reason sleep was held off. */
+bool ext_client_sleep_veto(bool client_active, uint32_t veto_ms);
+
 #endif /* EXT_CLIENT_LOGIC_H */

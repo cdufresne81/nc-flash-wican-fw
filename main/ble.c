@@ -47,6 +47,7 @@
 #include "types.h"
 #include "ble.h"
 #include "comm_server.h"
+#include "can.h"
 #include "config_server.h"
 #include "wifi_network.h"
 #include "dev_status.h"
@@ -916,14 +917,22 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
                     // Send prompt
                     cmdline_print_prompt_on_ble();
                 }
-            } else {
+            } else if (param->write.handle == fff0_profile_handle_table[IDX_CHAR_FFF2_VAL]) {
+                /* ONLY the FFF2 value is ELM327 data. This used to be a bare `else`, so every
+                 * other write -- notably the two bytes an app writes to a notification-enable
+                 * descriptor right after connecting -- was forwarded to the interpreter chip
+                 * and glued onto the front of the app's first command.
+                 *
+                 * Dropped, never blocked: this runs in the Bluetooth stack's own task, and the
+                 * queue is the one NC Flash's port 35001 uses (see can_ext_client_rx_admit()). */
                 ESP_LOGI(GATTS_TABLE_TAG, "Write to characteristic (handle: 0x%04x)", param->write.handle);
-                memcpy(rx_buffer.ucElement, param->write.value, param->write.len);
-                rx_buffer.dev_channel = DEV_BLE;
-                rx_buffer.usLen = param->write.len;
-                xQueueSend(*xBle_RX_Queue, ( void * ) &rx_buffer, portMAX_DELAY );
-                ESP_LOGI(GATTS_TABLE_TAG, "writing value:");
-                ESP_LOG_BUFFER_HEX(GATTS_TABLE_TAG, param->write.value, param->write.len);
+                if (param->write.len > 0 && param->write.len <= sizeof(rx_buffer.ucElement) &&
+                    can_ext_client_rx_admit(*xBle_RX_Queue)) {
+                    memcpy(rx_buffer.ucElement, param->write.value, param->write.len);
+                    rx_buffer.dev_channel = DEV_BLE;
+                    rx_buffer.usLen = param->write.len;
+                    xQueueSend(*xBle_RX_Queue, ( void * ) &rx_buffer, 0 );
+                }
             }
             break;
         case ESP_GATTS_EXEC_WRITE_EVT:
@@ -1014,6 +1023,10 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             conn_params.timeout = 400;    // timeout = 400*10ms = 4000ms
             //start sent the update connection parameters to the peer device.
             esp_ble_gap_update_conn_params(&conn_params);
+            /* Replies still queued for the previous connection must not reach this one. */
+            if (xBle_TX_Queue != NULL && *xBle_TX_Queue != NULL) {
+                xQueueReset(*xBle_TX_Queue);
+            }
             spp_conn_id = param->connect.conn_id;
             spp_gatts_if = gatts_if;
             is_connected = true;

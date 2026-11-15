@@ -79,3 +79,61 @@ size_t ext_client_count_commands(const uint8_t *buf, size_t len)
     }
     return n;
 }
+
+/* Refused command families, as the chip sees them: upper case, no spaces. Prefix match. */
+static const char *const k_forbidden[] = {
+    "ATPP",       /* programmable parameters: persist in EEPROM, obd.c owns 0E/0F */
+    "ATLP",       /* low power */
+    "ATBRD",      /* UART baud rate divisor */
+    "ATBRT",      /* UART baud rate timeout */
+    "ATMA",       /* monitor all */
+    "ATMR",       /* monitor receiver */
+    "ATMT",       /* monitor transmitter */
+    "ATMP",       /* monitor PGN */
+    "STM",        /* ST monitors */
+    "STSBR",      /* set UART baud rate */
+    "STBR",       /* switch UART baud rate */
+    "STWBR",      /* write UART baud rate to NVM */
+    "STPBR",      /* set protocol baud rate */
+    "STSL",       /* sleep: STSLEEP, STSLCS, STSLU, STSLVL, STSLX... */
+    "STRSTNVM",   /* reset NVM to factory defaults */
+    "STSAVCAL",   /* save voltage calibration */
+    "STSDI",      /* set device ID */
+    "STSATI",     /* set ATI string */
+};
+
+bool ext_client_cmd_forbidden(const char *cmd, size_t len)
+{
+    char norm[12];   /* longest entry is 8 characters; anything beyond cannot change a prefix match */
+    size_t n = 0;
+
+    if (cmd == NULL) { return false; }
+    for (size_t i = 0; i < len && cmd[i] != '\0' && n < sizeof(norm) - 1; i++)
+    {
+        char c = cmd[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { continue; }
+        if (c >= 'a' && c <= 'z') { c = (char)(c - 'a' + 'A'); }
+        norm[n++] = c;
+    }
+    norm[n] = '\0';
+
+    for (size_t k = 0; k < sizeof(k_forbidden) / sizeof(k_forbidden[0]); k++)
+    {
+        const char *f = k_forbidden[k];
+        size_t i = 0;
+        while (f[i] != '\0' && norm[i] == f[i]) { i++; }
+        if (f[i] == '\0') { return true; }
+    }
+    return false;
+}
+
+bool ext_client_rx_admit(bool flash_active, size_t queue_spaces)
+{
+    if (flash_active) { return false; }
+    return queue_spaces > EXT_CLIENT_RXQ_RESERVE;
+}
+
+bool ext_client_sleep_veto(bool client_active, uint32_t veto_ms)
+{
+    return client_active && veto_ms < EXT_CLIENT_SLEEP_VETO_MAX_MS;
+}

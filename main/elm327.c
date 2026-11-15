@@ -1337,6 +1337,11 @@ void elm327_init(void (*send_to_host)(char*, uint32_t, QueueHandle_t *q), QueueH
 #define ELM327_UPDATE_TIMEOUT_MS 		5000
 
 #define ELM327_CMD_MUTEX_TIMOUT			10000
+#define ELM327_CMD_ENQUEUE_WAIT_MS		20
+/* How often the reply loop looks up from the UART to ask whether the client must let go. */
+#define ELM327_CMD_POLL_MS				20
+/* After interrupting the chip: how long to wait for it to print its prompt. */
+#define ELM327_CMD_ABORT_SETTLE_MS		300
 
 typedef struct {
     bool in_normal_state;
@@ -1365,6 +1370,7 @@ typedef struct
     QueueHandle_t *response_queue;
     response_callback_t response_callback;
 	void *temp;
+	bool housekeeping;	/* queued by the firmware itself (obd.c), never by a client -- see elm327.h */
 } elm327_commands_t;
 
 /* Global Variables */
@@ -1499,11 +1505,33 @@ _Static_assert(ELM327_CLIENT_CMD_BUFFER_LEN >= ELM327_MAX_CMD_LEN,
                "elm327_process_cmd() writes up to ELM327_MAX_CMD_LEN bytes into the caller's buffer");
 
 /* See elm327.h. Written once at boot, before any client can connect. */
-static elm327_client_gate_t s_client_gate = NULL;
+static elm327_client_ops_t s_client_ops = {0};
 
-void elm327_set_client_gate(elm327_client_gate_t refuse)
+void elm327_set_client_ops(const elm327_client_ops_t *ops)
 {
-	s_client_gate = refuse;
+	if(ops != NULL)
+	{
+		s_client_ops = *ops;
+	}
+	else
+	{
+		memset(&s_client_ops, 0, sizeof(s_client_ops));
+	}
+}
+
+/* True from the moment uart1_event_task has dequeued a client command until it has let go of
+ * the chip. Set BEFORE that task asks the gate, so "raise the flag, then read this" on the
+ * flash side and "set this, then read the flag" here cannot both miss each other. */
+static volatile bool s_client_cmd_in_flight = false;
+
+bool elm327_client_cmd_in_flight(void)
+{
+	return s_client_cmd_in_flight;
+}
+
+static inline bool elm327_client_refused(void)
+{
+	return s_client_ops.refused != NULL && s_client_ops.refused();
 }
 
 uint32_t elm327_cmd_queue_spaces(void)
@@ -1524,9 +1552,29 @@ static bool elm327_cmd_is_atz(const char *cmd)
 }
 
 /* Function Implementations */
+static int8_t elm327_enqueue_cmd(uint8_t *cmd, uint32_t len, QueueHandle_t *q,
+                         char *cmd_buffer, uint32_t *cmd_buffer_len,
+                         int64_t *last_cmd_time, response_callback_t response_callback,
+                         bool housekeeping);
+
 int8_t elm327_process_cmd(uint8_t *cmd, uint32_t len, QueueHandle_t *q, 
                          char *cmd_buffer, uint32_t *cmd_buffer_len, 
                          int64_t *last_cmd_time, response_callback_t response_callback)
+{
+	return elm327_enqueue_cmd(cmd, len, q, cmd_buffer, cmd_buffer_len, last_cmd_time, response_callback, false);
+}
+
+int8_t elm327_process_housekeeping_cmd(uint8_t *cmd, uint32_t len, QueueHandle_t *q,
+                         char *cmd_buffer, uint32_t *cmd_buffer_len,
+                         int64_t *last_cmd_time, response_callback_t response_callback)
+{
+	return elm327_enqueue_cmd(cmd, len, q, cmd_buffer, cmd_buffer_len, last_cmd_time, response_callback, true);
+}
+
+static int8_t elm327_enqueue_cmd(uint8_t *cmd, uint32_t len, QueueHandle_t *q,
+                         char *cmd_buffer, uint32_t *cmd_buffer_len,
+                         int64_t *last_cmd_time, response_callback_t response_callback,
+                         bool housekeeping)
 {
     int64_t current_time = esp_timer_get_time();
 
@@ -1582,7 +1630,12 @@ int8_t elm327_process_cmd(uint8_t *cmd, uint32_t len, QueueHandle_t *q,
             command_data->response_queue = q;
             command_data->response_callback = response_callback;
 			command_data->temp = command_data;
-            if (xQueueSend(elm327_cmd_queue, (void*)command_data, portMAX_DELAY) != pdPASS)
+			command_data->housekeeping = housekeeping;
+			/* Bounded, not portMAX_DELAY: one caller is can_tx_task, which also carries NC
+			 * Flash's port 35001 and must never park here behind a slow chip. The queue is
+			 * ELM327_CMD_QUEUE_SIZE deep, so a full one means something is already wrong;
+			 * dropping the command (the caller gets -1) is the safe answer. */
+            if (xQueueSend(elm327_cmd_queue, (void*)command_data, pdMS_TO_TICKS(ELM327_CMD_ENQUEUE_WAIT_MS)) != pdPASS)
             {
                 ESP_LOGE(TAG, "Failed to send command to the queue");
                 free(command_data->command);
@@ -1696,16 +1749,44 @@ static void uart1_event_task(void *pvParameters)
 			sleep_state_info_t sleep_state;
 			sleep_mode_get_state(&sleep_state);
 			memset(uart_read_buf, 0, ELM327_MAX_CMD_LEN);
-			/* External-client gate (elm327.h). Asked HERE, after the dequeue and before the UART
-			 * lock, so it also catches a command that was queued before NC Flash took the bus.
-			 * Only client commands (non-NULL reply queue) are gated; the firmware's own chip
-			 * housekeeping passes NULL and must always run. Answered without touching the chip. */
-			if(elm327_command.response_queue != NULL && s_client_gate != NULL && s_client_gate())
+			/* Client commands (everything the firmware did not queue for itself, elm327.h) pass
+			 * three checks HERE -- after the dequeue, before the UART lock -- so a command that
+			 * was already waiting when NC Flash took the bus is caught too:
+			 *   refused    the bus is reserved                      -> BUS BUSY
+			 *   forbidden  it would reconfigure or lock up the chip -> ?
+			 * and a command that passes is reported as activity, so the datalogger stays
+			 * benched for as long as queued commands keep reaching the chip, not just for as
+			 * long as the app keeps typing.
+			 * in_flight goes up BEFORE the gate is asked; see s_client_cmd_in_flight. */
+			const bool is_client = !elm327_command.housekeeping;
+			const char *client_refusal = NULL;
+			if(is_client)
 			{
-				ESP_LOGW(TAG, "ELM327 client command refused: bus is reserved");
+				s_client_cmd_in_flight = true;
+				/* Store, then load: the flash side does the mirror image in can.c
+				 * (ext_client_quiesce). The fence makes the store visible before the load, the
+				 * same idiom ncflash_fastwrite.c uses for the reboot/OTA flags. */
+				__atomic_thread_fence(__ATOMIC_SEQ_CST);
+				if(elm327_client_refused())
+				{
+					client_refusal = ELM327_RSP_BUS_BUSY;
+				}
+				else if(s_client_ops.forbidden != NULL &&
+						s_client_ops.forbidden(elm327_command.command, elm327_command.command_len))
+				{
+					client_refusal = ELM327_RSP_UNKNOWN;
+				}
+				else if(s_client_ops.activity != NULL)
+				{
+					s_client_ops.activity();
+				}
+			}
+			if(client_refusal != NULL)
+			{
+				ESP_LOGW(TAG, "ELM327 client command refused");
 				if(elm327_command.response_callback != NULL)
 				{
-					elm327_command.response_callback(ELM327_RSP_BUS_BUSY, strlen(ELM327_RSP_BUS_BUSY),
+					elm327_command.response_callback((char *)client_refusal, strlen(client_refusal),
 													elm327_command.response_queue,
 													elm327_command.command);
 				}
@@ -1718,6 +1799,22 @@ static void uart1_event_task(void *pvParameters)
 				static const char atz_fake_rsp[] = "\r\rELM327 v2.3\r\r>";
 				uint8_t atz_flag = 0;
 				esp_err_t tx_wait_ret = ESP_FAIL;
+
+				/* Asked once more now that the UART lock is ours: the wait for it can be long
+				 * (another task may hold it for seconds), and NC Flash may have taken the bus
+				 * meanwhile. Nothing has been written to the chip yet, so refusing is free. */
+				const bool late_refused = is_client && elm327_client_refused();
+				if(late_refused)
+				{
+					if(elm327_command.response_callback != NULL)
+					{
+						elm327_command.response_callback((char *)ELM327_RSP_BUS_BUSY, strlen(ELM327_RSP_BUS_BUSY),
+														elm327_command.response_queue,
+														elm327_command.command);
+					}
+				}
+				else
+				{
 
                 // while (xQueueReceive(uart1_queue, &event, 0) == pdTRUE) 
                 // {
@@ -1774,70 +1871,94 @@ static void uart1_event_task(void *pvParameters)
                 bool terminator_received = false;
                 response_len = 0;
 
+				/* THE REPLY LOOP. Three ways out besides the prompt, all of them new, and all of
+				 * them because a CLIENT can now reach this code (before, only the firmware's own
+				 * well-behaved commands could):
+				 *
+				 *   deadline  ELM327_CMD_TIMEOUT_MS of wall clock for the whole reply. It used to
+				 *             be the gap allowed BETWEEN chunks, so a command whose output never
+				 *             pauses (a bus monitor) held the UART lock for ever.
+				 *   full      the reply buffer is bounded. It was not: reads were appended at
+				 *             uart_read_buf+response_len with no check, and a long stream ran off
+				 *             the end of the allocation.
+				 *   aborted   the bus was reserved while a client command was running. NC Flash
+				 *             must not find the chip still talking, so the wait is cut short.
+				 *
+				 * The poll is short so `aborted` is noticed within ELM327_CMD_POLL_MS. Every wait
+				 * is bounded, so invariant 1 at the top of this half of the file holds. */
+				bool reply_aborted = false;
+				bool reply_full = false;
+				const int64_t reply_deadline_us = esp_timer_get_time() + (int64_t)ELM327_CMD_TIMEOUT_US;
+
                 while (!terminator_received)
                 {
-                    if (xQueueReceive(uart1_queue, (void*)&event, pdMS_TO_TICKS(ELM327_CMD_TIMEOUT_MS)) == pdTRUE)
+					if(is_client && elm327_client_refused())
+					{
+						reply_aborted = true;
+						break;
+					}
+					if(esp_timer_get_time() >= reply_deadline_us)
+					{
+						ESP_LOGE(TAG, "UART read timeout");
+						break;
+					}
+                    if (xQueueReceive(uart1_queue, (void*)&event, pdMS_TO_TICKS(ELM327_CMD_POLL_MS)) == pdTRUE)
                     {
                         if (event.type == UART_DATA)
                         {
+							/* Room left, keeping one byte for the terminating NUL. */
+							const size_t room = (size_t)(ELM327_MAX_CMD_LEN - 1) - response_len;
+							if(room == 0)
+							{
+								reply_full = true;
+								break;
+							}
+							const size_t want = (event.size < room) ? event.size : room;
                             int read_bytes = elm327_uart_read_bytes(UART_NUM_1, 
                                                            uart_read_buf+response_len, 
-                                                           event.size, 
+                                                           want, 
                                                            pdMS_TO_TICKS(1));
                             if (read_bytes > 0)
                             {
-								ESP_LOGW(TAG, "-------------Received");
-                                ESP_LOG_BUFFER_HEXDUMP(TAG, uart_read_buf + response_len, 
-                                                     read_bytes, ESP_LOG_INFO);
-								ESP_LOGW(TAG, "-------------Received");
                                 response_len += read_bytes;
 								uart_read_buf[response_len] = 0;
-								// elm327_command.response_callback((char*)uart_read_buf, 
-								// 									read_bytes, 
-								// 									elm327_command.response_queue, 
-								// 									elm327_command.command);
-								for (int i = 0; i < read_bytes; i++)
-                                {
-									if(uart_read_buf[i] == 0xA5)
-									{
-										printf("A5 detected\r\n");
-									}
+								/* The prompt is "\r>" at the very end of what has arrived. */
+								if(response_len >= 2 && uart_read_buf[response_len - 2] == '\r' &&
+								   uart_read_buf[response_len - 1] == '>')
+								{
+									ESP_LOGI(TAG, "Terminator Received");
+									terminator_received = true;
 								}
-                                for (int i = 0; i < response_len+1; i++)
-                                {
-                                    // if ((i > 1 && uart_read_buf[i-1] == '\r' && uart_read_buf[i] == '>') || 
-                                    //     (i > 2 && uart_read_buf[i-2] == 'O' && uart_read_buf[i-1] == 'K' && 
-                                    //      uart_read_buf[i] == '\r'))
-									
-									if ((i >= 2 && uart_read_buf[i-2] == '\r' && uart_read_buf[i-1] == '>' && uart_read_buf[i] == '\0'))
-                                    {
-                                        // if(strstr((char*)uart_read_buf, "STSBR2000000\rOK"))
-                                        // {
-                                        //     elm327_uart_write_bytes(UART_NUM_1, "\r\r", 2);
-                                        //     elm327_uart_write_bytes(UART_NUM_1, "STWBR\r", strlen("STWBR\r"));
-                                        // }
-										ESP_LOGI(TAG, "Terminator Received");
-                                        terminator_received = true;
-                                        break;
-                                    }
-									// else if(uart_read_buf[response_len-1] == '\r')
-									// {
-									// 	elm327_command.response_callback((char*)uart_read_buf, 
-									// 										response_len, 
-									// 										elm327_command.response_queue, 
-									// 										elm327_command.command);
-									// 	response_len = 0;
-									// }
-                                }
                             }
                         }
                     }
-                    else
-                    {
-                        ESP_LOGE(TAG, "UART read timeout");
-                        break;
-                    }
                 }
+
+				/* No prompt: the chip may still be waiting on the bus or streaming. Any character
+				 * interrupts it; a SPACE is used because the chip ignores spaces in its command
+				 * line, whereas a carriage return on an idle chip means "repeat the last
+				 * command" and would put one more request on the bus. Then give it a moment to
+				 * print its prompt, and throw away whatever is left -- flush and queue reset
+				 * together, invariant 2. Only for client commands: the firmware's own never
+				 * stream, and their timeout handling is unchanged. */
+				if(!terminator_received && is_client)
+				{
+					char settle[64];
+					ESP_LOGW(TAG, "ELM327 client command cut short (%s)",
+							 reply_aborted ? "bus reserved" : (reply_full ? "reply too long" : "timeout"));
+					elm327_uart_write_bytes(UART_NUM_1, " ", 1);
+					(void)uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
+					(void)uart_read_until_pattern(UART_NUM_1, settle, sizeof(settle), "\r>", ELM327_CMD_ABORT_SETTLE_MS);
+					uart_flush_input(UART_NUM_1);
+					xQueueReset(uart1_queue);
+					if(elm327_command.response_callback != NULL)
+					{
+						const char *why = reply_aborted ? ELM327_RSP_BUS_BUSY : ELM327_RSP_STOPPED;
+						elm327_command.response_callback((char *)why, strlen(why),
+														elm327_command.response_queue,
+														elm327_command.command);
+					}
+				}
 
 				/* EEPROM guard, taken from upstream v6 (meatpiHQ/wican-fw issue #1023). The chip's
 				 * "memory" function is ON after every reset, and with it on the chip writes the
@@ -1896,9 +2017,11 @@ static void uart1_event_task(void *pvParameters)
                     }
                 }
 
+				}	/* !late_refused */
                 xSemaphoreGive(xuart1_semaphore);
             }
 
+			s_client_cmd_in_flight = false;
             free(elm327_command.command);
 			free(elm327_command.temp);
         }

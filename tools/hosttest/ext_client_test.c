@@ -10,6 +10,11 @@
  *   X6  NC Flash wins: flash, claim, pause and sleep each refuse the client; flash is named first.
  *   X7  Every verdict has a stable name.
  *   X8  Command counting: one per carriage return, and NULL/empty are zero.
+ *   X9  Commands that reconfigure or lock up the chip are refused; everything an app needs to
+ *       read data is not.
+ *   X10 A client transport leaves room on the shared receive queue for NC Flash, and pushes
+ *       nothing while a flash runs.
+ *   X11 A client's hold on the sleep countdown is capped.
  *
  * Build + run: tools/hosttest/run.sh
  */
@@ -126,6 +131,52 @@ int main(void)
     CHECK(ext_client_count_commands((const uint8_t *)"\r\n", 2) == 1, "LF does not count");
     CHECK(ext_client_count_commands(NULL, 5) == 0, "NULL");
     CHECK(ext_client_count_commands((const uint8_t *)"x", 0) == 0, "empty");
+
+    printf("# X9 forbidden commands\n");
+#define FORBID(str) ext_client_cmd_forbidden((str), strlen(str))
+    CHECK(FORBID("ATPP 0E SV 7A\r"), "programmable parameter write");
+    CHECK(FORBID("at pp 0f on\r"),   "lower case with spaces");
+    CHECK(FORBID("A T P P 0E OFF"),   "spaced out, no CR");
+    CHECK(FORBID("ATMA\r"),          "monitor all");
+    CHECK(FORBID("AT MR 7E8\r"),     "monitor receiver");
+    CHECK(FORBID("STMA\r"),          "ST monitor");
+    CHECK(FORBID("STSBR 115200\r"),  "UART baud rate");
+    CHECK(FORBID("STSLEEP 0\r"),     "sleep");
+    CHECK(FORBID("STSLVL off,off\r"),"sleep voltage level");
+    CHECK(FORBID("STRSTNVM\r"),      "NVM reset");
+    CHECK(FORBID("ATLP\r"),          "low power");
+    CHECK(FORBID("\r\nATPP FF ON\r"), "leading line ends do not hide it");
+    CHECK(!FORBID("ATZ\r"),   "reset is allowed");
+    CHECK(!FORBID("ATE0\r"),  "echo off");
+    CHECK(!FORBID("ATSP0\r"), "protocol search");
+    CHECK(!FORBID("ATM0\r"),  "memory off is not a monitor");
+    CHECK(!FORBID("ATRV\r"),  "voltage read");
+    CHECK(!FORBID("ATH1\r"),  "headers on");
+    CHECK(!FORBID("010C\r"),  "mode 01 request");
+    CHECK(!FORBID("0902\r"),  "VIN request");
+    CHECK(!FORBID("STI\r"),   "ST identify (apps probe it)");
+    CHECK(!FORBID("STDI\r"),  "ST device id read");
+    CHECK(!FORBID("\r"),      "empty line (repeat)");
+    CHECK(!FORBID(""),         "empty string");
+    CHECK(!ext_client_cmd_forbidden(NULL, 4), "NULL");
+    CHECK(!ext_client_cmd_forbidden("ATPP", 3), "len bounds the scan: ATP is not ATPP");
+    /* A NUL ends the line. Bytes after it never reach the chip as part of this command, so they
+     * must not be what the verdict is read from -- in either direction. */
+    CHECK(!ext_client_cmd_forbidden("AT\0PP 0E ON", 11), "NUL ends the line");
+#undef FORBID
+
+    printf("# X10 the shared receive queue keeps room for NC Flash\n");
+    CHECK(ext_client_rx_admit(false, 32), "empty queue: admit");
+    CHECK(ext_client_rx_admit(false, EXT_CLIENT_RXQ_RESERVE + 1), "one above the reserve: admit");
+    CHECK(!ext_client_rx_admit(false, EXT_CLIENT_RXQ_RESERVE), "at the reserve: drop");
+    CHECK(!ext_client_rx_admit(false, 0), "full: drop");
+    CHECK(!ext_client_rx_admit(true, 32), "a running flash drops everything, however empty the queue");
+
+    printf("# X11 a client cannot hold off sleep for ever\n");
+    CHECK(ext_client_sleep_veto(true, 0), "active: vetoes");
+    CHECK(ext_client_sleep_veto(true, EXT_CLIENT_SLEEP_VETO_MAX_MS - 1), "just inside the cap");
+    CHECK(!ext_client_sleep_veto(true, EXT_CLIENT_SLEEP_VETO_MAX_MS), "at the cap: no more veto");
+    CHECK(!ext_client_sleep_veto(false, 0), "no client: no veto");
 
     if (g_failures)
     {

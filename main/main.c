@@ -201,10 +201,6 @@ static esp_err_t i2c_master_init(void)
     return i2c_driver_install(i2c_master_port, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
 }
 #endif
-/* Serialises send_to_host()'s shared buffer; see the comment inside. Created in app_main before
- * any task that can call it exists. NULL-safe so an early caller still works. */
-static SemaphoreHandle_t s_send_to_host_mutex = NULL;
-
 #if HARDWARE_VER == WICAN_PRO
 void send_to_host(char* str, uint32_t len, QueueHandle_t *q, char* cmd_str)
 #else
@@ -217,12 +213,10 @@ void send_to_host(char* str, uint32_t len, QueueHandle_t *q)
         return;
     }
 
-    /* One static 1 KB buffer shared by every caller -- and since ELM327 clients came back there
-     * are two concurrent ones: can_tx_task (SLCAN replies to NC Flash on 35001, and the ELM327
-     * refusals) and uart1_event_task (the chip's answers to an ELM327 app). Unserialised, an
-     * app's reply could be memcpy'd over an NC Flash reply between its copy and its queue send.
-     * A local buffer is not the fix: uart1_event_task has a 4 KB stack. The hold is bounded --
-     * each queue send below waits at most 100 ms and a failed one returns. */
+    /* One static 1 KB buffer, and therefore ONE calling task: can_tx_task (SLCAN replies to
+     * NC Flash). The chip's answers to an ELM327 app are produced in uart1_event_task and go
+     * through elm327_client_reply() with a buffer of its own -- two tasks through this one
+     * would let an app's reply be copied over an NC Flash reply. Keep it that way. */
     static xdev_buffer xsend_buffer;
     uint32_t bytes_sent = 0;
     uint32_t bytes_to_send;
@@ -237,10 +231,6 @@ void send_to_host(char* str, uint32_t len, QueueHandle_t *q)
         len = strlen(str);  // Cache the string length
     }
 
-    if (s_send_to_host_mutex != NULL)
-    {
-        xSemaphoreTake(s_send_to_host_mutex, portMAX_DELAY);
-    }
     while (bytes_sent < len)
     {
         // Determine the number of bytes to send in this iteration
@@ -258,15 +248,11 @@ void send_to_host(char* str, uint32_t len, QueueHandle_t *q)
         if (xQueueSend(*q, (void*)&xsend_buffer, pdMS_TO_TICKS(100)) != pdPASS)
         {
             ESP_LOGE(TAG, "Failed to send data to queue");
-            break;
+            return;
         }
 
         // Update the number of bytes sent
         bytes_sent += bytes_to_send;
-    }
-    if (s_send_to_host_mutex != NULL)
-    {
-        xSemaphoreGive(s_send_to_host_mutex);
     }
 	ESP_LOGI(TAG, "bytes_sent: %lu", bytes_sent);
 }
@@ -283,30 +269,118 @@ typedef struct
 	char *line;
 	uint32_t line_len;
 	int64_t last_cmd_time;
+	/* A refusal threw away the first part of a line; the rest of that line, when it arrives in
+	 * the next chunk, must be thrown away too instead of being run as a command of its own. */
+	bool skip_to_cr;
 } elm327_client_t;
+
+/* The chip's answer to a client, called from uart1_event_task ONLY. Its own static buffer, so
+ * it never shares one with send_to_host() (can_tx_task) -- see the note there. The wait per
+ * chunk is bounded and a failed send gives up: the caller holds the UART lock, and a client
+ * that has stopped reading must not hold the chip. */
+static void elm327_client_reply(char *str, uint32_t len, QueueHandle_t *q, char *cmd_str)
+{
+	static xdev_buffer reply;
+	uint32_t sent = 0;
+	(void)cmd_str;
+
+	if(q == NULL || *q == NULL || str == NULL)
+	{
+		return;
+	}
+	if(len == 0)
+	{
+		len = strlen(str);
+	}
+	while(sent < len)
+	{
+		uint32_t n = len - sent;
+		if(n > DEV_BUFFER_LENGTH)
+		{
+			n = DEV_BUFFER_LENGTH;
+		}
+		memcpy(reply.ucElement, str + sent, n);
+		reply.usLen = n;
+		reply.dev_channel = DEV_WIFI;
+		if(xQueueSend(*q, &reply, pdMS_TO_TICKS(100)) != pdPASS)
+		{
+			ESP_LOGW(TAG, "ELM327 reply dropped: client is not reading");
+			return;
+		}
+		sent += n;
+	}
+}
+
+/* A short answer from the ROUTER itself (can_tx_task), without waiting: a client that is not
+ * reading simply does not get it. Never through send_to_host(), whose 100 ms wait would be
+ * added to NC Flash's traffic on the same task. */
+static void elm327_client_say(elm327_client_t *c, const char *text)
+{
+	static xdev_buffer say;
+	const size_t n = strlen(text);
+	if(n == 0 || n > DEV_BUFFER_LENGTH)
+	{
+		return;
+	}
+	memcpy(say.ucElement, text, n);
+	say.usLen = (int)n;
+	say.dev_channel = DEV_WIFI;
+	(void)xQueueSend(*c->reply_q, &say, 0);
+}
+
+/* Throw away the line being typed. If the chunk that caused it did not end the line, remember
+ * to discard the remainder too. */
+static void elm327_client_drop_line(elm327_client_t *c, const uint8_t *msg, int len)
+{
+	c->line_len = 0;
+	c->line[0] = '\0';
+	c->skip_to_cr = (len > 0 && msg[len - 1] != '\r');
+}
 
 /* Hand an ELM327 app's bytes to the MIC3624 interpreter chip through elm327_process_cmd(),
  * exactly as stock WiCAN PRO firmware routes them; the chip speaks ELM327 itself, the ESP32
- * only carries bytes. Replies come back on the client's queue via send_to_host.
+ * only carries bytes. Replies come back on the client's queue via elm327_client_reply().
  *
  * This is the second path to the bus (architecture.md section 6) and the datalogger cannot
- * share the ECU with it, so the three rules of ext_client_logic.h apply here:
+ * share the ECU with it, so the rules of ext_client_logic.h apply here:
  *
  *   - NC Flash wins. If a flash, a host claim, a host pause or sleep teardown holds the bus the
  *     chunk is answered BUS BUSY and dropped. The hold is NOT touched, so a refused app cannot
  *     keep the logger benched after NC Flash leaves.
- *   - Never block the caller. can_tx_task also carries port 35001, so a chunk that would not
- *     fit in the chip's command queue is answered BUFFER FULL instead of queued.
+ *   - Never block the caller. can_tx_task also carries port 35001: the answers above are sent
+ *     without waiting, a chunk that would not fit in the chip's command queue is answered
+ *     BUFFER FULL instead of queued, and the queue send itself is bounded.
  *   - Otherwise touch the hold FIRST, then queue: poll_log must already be on its way to the
  *     park when the chip starts talking.
  *
- * uart1_event_task asks the same gate again at the moment of sending, which covers the commands
- * that were already queued when NC Flash arrived. */
+ * uart1_event_task applies the gate again at the moment of sending (elm327_set_client_ops),
+ * which covers the commands that were already queued when NC Flash arrived, and is where
+ * forbidden commands are refused -- only there is the whole line in one piece. */
 static void elm327_client_route(elm327_client_t *c, uint8_t *msg, int len)
 {
 	if(c->reply_q == NULL || *c->reply_q == NULL || len <= 0)
 	{
 		return;   /* transport not up (BLE disabled): nowhere to answer, so nothing to do */
+	}
+	if(c->skip_to_cr)
+	{
+		/* The tail of a line whose head was refused. Drop up to and including its CR. */
+		int i = 0;
+		while(i < len && msg[i] != '\r')
+		{
+			i++;
+		}
+		if(i == len)
+		{
+			return;   /* still no CR: the whole chunk belongs to the dropped line */
+		}
+		c->skip_to_cr = false;
+		msg += i + 1;
+		len -= i + 1;
+		if(len <= 0)
+		{
+			return;
+		}
 	}
 	const size_t cmds = ext_client_count_commands(msg, (size_t)len);
 
@@ -318,30 +392,31 @@ static void elm327_client_route(elm327_client_t *c, uint8_t *msg, int len)
 			ESP_LOGE(TAG, "no memory for the ELM327 line buffer");
 			if(cmds != 0)
 			{
-				send_to_host(ELM327_RSP_BUFFER_FULL, 0, c->reply_q, NULL);
+				elm327_client_say(c, ELM327_RSP_BUFFER_FULL);
 			}
 			return;
 		}
 	}
 	if(can_ext_client_refused())
 	{
-		c->line_len = 0;
-		c->line[0] = '\0';
+		elm327_client_drop_line(c, msg, len);
 		if(cmds != 0)
 		{
-			send_to_host(ELM327_RSP_BUS_BUSY, 0, c->reply_q, NULL);
+			elm327_client_say(c, ELM327_RSP_BUS_BUSY);
 		}
 		return;
 	}
 	if(cmds > elm327_cmd_queue_spaces())
 	{
-		c->line_len = 0;
-		c->line[0] = '\0';
-		send_to_host(ELM327_RSP_BUFFER_FULL, 0, c->reply_q, NULL);
+		elm327_client_drop_line(c, msg, len);
+		elm327_client_say(c, ELM327_RSP_BUFFER_FULL);
 		return;
 	}
 	can_ext_client_touch();
-	elm327_process_cmd(msg, len, c->reply_q, c->line, &c->line_len, &c->last_cmd_time, &send_to_host);
+	if(elm327_process_cmd(msg, len, c->reply_q, c->line, &c->line_len, &c->last_cmd_time, &elm327_client_reply) != 0)
+	{
+		elm327_client_say(c, ELM327_RSP_BUFFER_FULL);
+	}
 }
 
 static void can_tx_task(void *pvParameters)
@@ -481,6 +556,18 @@ static void can_rx_task(void *pvParameters)
 		// 	// gpio_set_level(USB_OTG_PWR_EN, 0);
 		// 	gpio_set_level(USB_ESP_MODE_EN, 0);
 		// }
+		/* The external-client drain is its own loop: it uses the NON-blocking receive (the
+		 * plain one parks on CAN_ENABLE_BIT if the bus is disabled, and would then wake up
+		 * holding frames that belong to poll_log) and re-asks on every frame whether the hold
+		 * is still in force, so it stops the moment poll_log is free to read again. */
+		if(ext_client_drain)
+		{
+			while(can_ext_client_active() && !can_flash_active() && can_receive_nb(&rx_msg) == ESP_OK)
+			{
+			}
+			vTaskDelay(pdMS_TO_TICKS(1));
+			continue;
+		}
         while(can_receive(&rx_msg, 0) ==  ESP_OK)
         {
 //        	num_msg++;
@@ -494,10 +581,6 @@ static void can_rx_task(void *pvParameters)
 			// and host-driven reads/sessions over 35001 hang. The !can_flash_active() re-check
 			// stops forwarding the instant a codec sets FLASH_ACTIVE_BIT mid-inner-loop (it is
 			// about to suspend us), so no stale ECU frame races the codec. Only to a live client.
-			if(ext_client_drain)
-			{
-				continue;   /* drop: see ext_client_drain above */
-			}
 			if(coexist_session && !can_flash_active() && slcan_port_is_open())
 			{
 				ucTCP_TX_Buffer.usLen = slcan_parse_frame(ucTCP_TX_Buffer.ucElement, &rx_msg);
@@ -793,11 +876,6 @@ void app_main(void)
 	// 		gpio_set_level(USB_ESP_MODE_EN, 0);
 	// 	}
 	// }
-	s_send_to_host_mutex = xSemaphoreCreateMutex();
-	if(s_send_to_host_mutex == NULL)
-	{
-		ESP_LOGE(TAG, "send_to_host mutex not created; replies are unserialised");
-	}
 	#if HARDWARE_VER == WICAN_PRO
 	wc_uart_init();
 	#endif
@@ -1039,10 +1117,17 @@ void app_main(void)
 	/* ELM327 over Wi-Fi for phone apps: the port every ELM327 Wi-Fi adapter uses, served by
 	 * the stock comm_server (one client at a time). Its frames arrive tagged DEV_WIFI and
 	 * can_tx_task hands them to the interpreter chip; replies drain from xMsg_Tx_Queue. The
-	 * gate makes uart1_event_task refuse a client command while NC Flash holds the bus. Always
+	 * hooks make uart1_event_task refuse a client command while NC Flash holds the bus. Always
 	 * on and fixed, like 35001: a client only costs anything while it is actually talking, and
 	 * then the datalogger steps aside by itself (ext_client_logic.h). */
-	elm327_set_client_gate(&can_ext_client_refused);
+	{
+		static const elm327_client_ops_t client_ops = {
+			.refused   = &can_ext_client_refused,
+			.forbidden = &ext_client_cmd_forbidden,
+			.activity  = &can_ext_client_touch,
+		};
+		elm327_set_client_ops(&client_ops);
+	}
 	if(tcp_server_init(WICAN_ELM327_PORT, &xMsg_Tx_Queue, &xMsg_Rx_Queue, 0, 0) != 0)
 	{
 		ESP_LOGE(TAG, "ELM327 port init failed (phone apps cannot connect until next boot)");

@@ -36,6 +36,7 @@
 #include <lwip/netdb.h>
 #include "types.h"
 #include "comm_server.h"
+#include "can.h"
 
 #define TAG 		__func__
 
@@ -98,8 +99,15 @@ wait_skt_rx:
 				rx_buffer.dev_channel = DEV_WIFI;
 				rx_buffer.ucElement[rx_buffer.usLen] = 0; // Null-terminate whatever is received and treat it like a string
 //				ESP_LOGI(TAG, "Received %d bytes: %s", rx_buffer.usLen, rx_buffer.ucElement);
-		        //TODO: what happens if blocked for ever?
-				xQueueSend( *xRX_Queue, ( void * ) &rx_buffer, portMAX_DELAY );
+				/* This used to be a portMAX_DELAY send with a "what happens if blocked for
+				 * ever?" TODO. What happens: the queue is shared with NC Flash's port 35001 and
+				 * nothing drains it while a flash codec runs, so an ELM327 app that kept typing
+				 * filled it and NC Flash's own receive task then blocked behind it. A chunk that
+				 * is not admitted is dropped; the app sees a timeout and retries. */
+				if(can_ext_client_rx_admit(*xRX_Queue))
+				{
+					xQueueSend( *xRX_Queue, ( void * ) &rx_buffer, 0 );
+				}
 			}
 			xSemaphoreGive( xTCP_Socket_Semaphore );
         }
@@ -327,6 +335,10 @@ accept_socket:
 				inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
 			}
 			ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
+			/* Replies still queued for the PREVIOUS client (it left mid-answer; the TX task
+			 * only drains while a socket is open) must not be the first thing this one reads.
+			 * Emptied before PORT_OPEN lets the TX task run. */
+			xQueueReset(*xTX_Queue);
 			xEventGroupSetBits( xSocketEventGroup, PORT_OPEN_BIT );
 			#if HARDWARE_VER == WICAN_V300 || HARDWARE_VER == WICAN_USB_V100
 			gpio_set_level(conn_led, 0);

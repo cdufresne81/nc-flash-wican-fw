@@ -848,7 +848,18 @@ static void csv_logger_task(void *pvParameters)
         }
 
         // Fixed-rate grid: emit one LOCF snapshot row per 1/hz, even on idle passes.
-        if (csv_session_active && wc_timer_is_expired(&grid_timer))
+        //
+        // ...except while an ELM327 app has the logger benched (main/ext_client_logic.h). The
+        // poller is parked then, so every column would repeat its last value: an hour of an
+        // app's use would be an hour of rows that look like data and are not. The file stays
+        // open and the timer keeps running, so the log simply has a gap in its timestamps and
+        // picks up on the grid when the app goes quiet. (An NC Flash pause never gets here:
+        // it switches recording off outright.)
+        if (csv_session_active && wc_timer_is_expired(&grid_timer) && can_ext_client_active())
+        {
+            wc_timer_set(&grid_timer, csv_grid_period_ms());
+        }
+        else if (csv_session_active && wc_timer_is_expired(&grid_timer))
         {
             wc_timer_set(&grid_timer, csv_grid_period_ms());
             if (!csv_emit_wide_row(esp_timer_get_time() / 1000))

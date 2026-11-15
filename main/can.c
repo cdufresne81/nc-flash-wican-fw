@@ -35,6 +35,7 @@
 #include "driver/twai.h"
 #include "can.h"
 #include "ext_client_logic.h"
+#include "elm327.h"        /* elm327_client_cmd_in_flight(): the chip side of the client quiesce */
 #include "slcan_port.h"   /* slcan_port_conn_gen(): owning 35001 connection generation (dead-man's-switch) */
 #include "hw_config.h"
 
@@ -189,10 +190,46 @@ void can_unblock(void)
  * datalogger poll task short-sleeps and skips while it is set, so at most one
  * TX producer ever drives the single TWAI controller. NULL-group-safe so it is
  * callable before can_init(). */
+/* Wait for an ELM327 client's command to leave the bus.
+ *
+ * The interpreter chip is a second tester on the bus that can.c cannot see. Raising one of the
+ * reservation flags makes uart1_event_task refuse every later client command and cut short the
+ * one it is running (it polls every few ms, interrupts the chip, and drops
+ * elm327_client_cmd_in_flight()). This waits for that to have happened, so the caller -- a flash
+ * codec, or NC Flash's claim/pause -- never starts talking to the ECU while the chip is still
+ * mid-request on a phone app's behalf.
+ *
+ * MUST be called AFTER the flag is raised: "raise, then look" here and "mark in flight, then
+ * ask the gate" in the worker cannot both miss. Costs nothing when no client command is
+ * running, which is every call when no app is connected. Bounded: if the chip never lets go the
+ * caller proceeds anyway and says so -- the flag still keeps every later command off the bus,
+ * and refusing to flash because of a phone app would be the worse failure. Task context only. */
+#define EXT_CLIENT_QUIESCE_MAX_MS   (1000U)
+#define EXT_CLIENT_QUIESCE_STEP_MS  (10U)
+static void ext_client_quiesce(void)
+{
+	uint32_t waited = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);   /* the caller's flag store, before this load */
+	while(elm327_client_cmd_in_flight() && waited < EXT_CLIENT_QUIESCE_MAX_MS)
+	{
+		vTaskDelay(pdMS_TO_TICKS(EXT_CLIENT_QUIESCE_STEP_MS));
+		waited += EXT_CLIENT_QUIESCE_STEP_MS;
+	}
+	if(elm327_client_cmd_in_flight())
+	{
+		ESP_LOGE(TAG, "ELM327 client command still on the chip after %u ms", (unsigned)waited);
+	}
+	else if(waited != 0)
+	{
+		ESP_LOGW(TAG, "waited %u ms for an ELM327 client command to leave the chip", (unsigned)waited);
+	}
+}
+
 void can_flash_active_set(void)
 {
 	if(s_can_event_group)
 		xEventGroupSetBits(s_can_event_group, FLASH_ACTIVE_BIT);
+	ext_client_quiesce();
 }
 
 void can_flash_active_clear(void)
@@ -333,6 +370,15 @@ void can_ext_client_expire(void)
 	}
 }
 
+bool can_ext_client_rx_admit(QueueHandle_t rx_queue)
+{
+	if(rx_queue == NULL)
+	{
+		return false;
+	}
+	return ext_client_rx_admit(can_flash_active(), (size_t)uxQueueSpacesAvailable(rx_queue));
+}
+
 bool can_ext_client_refused(void)
 {
 	const ext_client_gate_in_t in = {
@@ -444,7 +490,12 @@ static uint32_t lease_token(lease_t *L)
 }
 
 /* --- Host bus-claim (auth-window fence): wrappers over the s_claim instance --- */
-uint32_t can_host_bus_claim_arm(uint64_t ttl_us) { return lease_arm(&s_claim, ttl_us); }
+uint32_t can_host_bus_claim_arm(uint64_t ttl_us)
+{
+	uint32_t tok = lease_arm(&s_claim, ttl_us);
+	ext_client_quiesce();   /* the claim is up: wait for a phone app's command to leave the bus */
+	return tok;
+}
 bool can_host_bus_claim_renew(uint32_t token, uint64_t ttl_us) { return lease_renew(&s_claim, token, ttl_us); }
 bool can_host_bus_claim_release(uint32_t token) { return lease_release(&s_claim, token); }
 bool can_host_bus_claim_reap(uint32_t token, uint64_t deadline_us) { return lease_reap(&s_claim, token, deadline_us); }
@@ -452,7 +503,12 @@ bool can_host_bus_claim_active(void) { return s_claim.active; }   /* lock-free v
 uint32_t can_host_bus_claim_token(void) { return lease_token(&s_claim); }
 
 /* --- Datalog-park (advisory pre-park): wrappers over the s_park instance --- */
-uint32_t can_park_lease_arm(uint64_t ttl_us) { return lease_arm(&s_park, ttl_us); }
+uint32_t can_park_lease_arm(uint64_t ttl_us)
+{
+	uint32_t tok = lease_arm(&s_park, ttl_us);
+	ext_client_quiesce();   /* same as the claim */
+	return tok;
+}
 bool can_park_lease_renew(uint32_t token, uint64_t ttl_us) { return lease_renew(&s_park, token, ttl_us); }
 bool can_park_lease_release(uint32_t token) { return lease_release(&s_park, token); }
 bool can_park_lease_reap(uint32_t token, uint64_t deadline_us) { return lease_reap(&s_park, token, deadline_us); }

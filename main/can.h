@@ -147,6 +147,11 @@ void     can_ext_client_expire(void);         /* slow-path housekeeping (reaper 
  * bus-claim, a host datalog pause or sleep teardown holds the bus. Shaped as a plain predicate so
  * elm327.c can take it as its client gate without knowing what a lease is. */
 bool     can_ext_client_refused(void);
+/* May a client transport (the 35000 socket, BLE) push a chunk onto the shared receive queue?
+ * No while a flash runs, and no once the queue is down to its NC Flash reserve
+ * (EXT_CLIENT_RXQ_RESERVE). The transport DROPS the chunk on false and must then send with a
+ * zero timeout: that queue also carries port 35001, and nothing drains it during a flash. */
+bool     can_ext_client_rx_admit(QueueHandle_t rx_queue);
 
 /* Bus-idle evidence: ms since the last TWAI TX or RX (whichever is later).
  * OBSERVABILITY ONLY since #131 -- on a running car this is ~0 forever (the PCM broadcasts
