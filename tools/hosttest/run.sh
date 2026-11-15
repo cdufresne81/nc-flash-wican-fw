@@ -5,7 +5,8 @@
 # datalogger's RTC crash-guard bring-up chain, the manual-override lifetime and the
 # logging gate, plus poll_log's recording gate (does the ENGINE actually turn), the
 # ECU-flash fence, when the default sensor list may replace auto_pid.json, and the
-# NC Flash logging session's lease and token rules.
+# NC Flash logging session's lease and token rules, and the rule that benches the logger
+# while an ELM327 app is using the car.
 # Everything under test lives in components/csv_logger/csv_bringup_logic.c and
 # components/fast_log/poll_gate_logic.c, both deliberately free of ESP-IDF includes so a
 # stock compiler can build them.
@@ -62,3 +63,11 @@ CC="${CC:-cc}"
     -o "$OUT/datalog_session_test"
 
 "$OUT/datalog_session_test"
+
+"$CC" -std=c11 -Wall -Wextra -Werror -O1 \
+    -I "$REPO/main" \
+    "$REPO/tools/hosttest/ext_client_test.c" \
+    "$REPO/main/ext_client_logic.c" \
+    -o "$OUT/ext_client_test"
+
+"$OUT/ext_client_test"

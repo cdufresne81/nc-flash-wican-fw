@@ -51,6 +51,11 @@ static void datalog_lease_task(void *arg)
     {
         vTaskDelay(pdMS_TO_TICKS(COEXIST_REAPER_TICK_MS));
 
+        /* External-client hold housekeeping (ext_client_logic.h). The hold lapses by itself;
+         * this only drops its stale flag and logs the release once. Unconditional and first,
+         * for the same reason as the session lease below. */
+        can_ext_client_expire();
+
         /* NC Flash logging session lease (docs/internals/datalog_session.md): a separate
          * dead-man from the two below, riding this tick because it needs the same 1 Hz and no
          * task of its own. First, and unconditionally -- the stuck-flash and claim branches

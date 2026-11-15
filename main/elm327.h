@@ -43,9 +43,10 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
  * effect afterwards. Defaults to ENABLED, so a caller that forgets gets today's behaviour.
  *
  * elm327_read_task exists only to forward UNSOLICITED output from the interpreter chip to a
- * connected ELM327 client. Under poll_log/fast_log no client can reach it -- main.c's router only
- * feeds elm327 when protocol is OBD_ELM327 or AUTO_PID -- so the task serves nobody, yet it still
- * takes the shared UART lock whenever the chip emits a byte. Measured in the car 2026-08-17: it
+ * connected ELM327 client -- the path stock firmware used for BLE. Nothing uses that path here:
+ * the ELM327 clients this firmware does serve (TCP 35000) go through uart1_event_task, which
+ * reads each reply itself. So the task would serve nobody, yet it still takes the shared UART
+ * lock whenever the chip emits a byte. Measured in the car 2026-08-17: it
  * held that lock across a whole sleep, so the wake spent 20 s failing to get it (LED dark, WiFi
  * down, datalogger recording the entire time) and the sleep babysitter's nudges silently did
  * nothing, producing the misleading "MIC chip would not sleep" line.
@@ -56,8 +57,54 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
  * chip's own sleep/wake voltage configuration queued by obd_init(). Never gate those. */
 void elm327_set_read_task_enabled(bool enabled);
 
+/* --- ELM327 clients (TCP 35000, BLE, the wired UART, the web page's Test-PID) -------------
+ * Every command is a CLIENT command unless the firmware queued it for its own chip
+ * housekeeping with elm327_process_housekeeping_cmd() (obd.c: power-pin setup, sleep
+ * configuration, the battery-voltage read). The distinction is made by WHO CALLED, not by what
+ * the arguments look like -- an earlier version keyed on "has a reply queue" and silently let
+ * the wired-UART client and Test-PID through during a flash.
+ *
+ * uart1_event_task consults these hooks at the last moment before the bytes go to the chip --
+ * the single choke point every queued command passes. Any hook may be NULL. */
+typedef struct
+{
+	/* The bus is reserved (flash, NC Flash session, sleep). The command is answered BUS BUSY --
+	 * what a real ELM327 says when it cannot get the bus -- and a command already running is
+	 * cut short. */
+	bool (*refused)(void);
+	/* The command would reconfigure the chip or lock it up. It is answered "?". */
+	bool (*forbidden)(const char *cmd, size_t len);
+	/* A client command is about to reach the chip. */
+	void (*activity)(void);
+} elm327_client_ops_t;
+void elm327_set_client_ops(const elm327_client_ops_t *ops);
+
+/* A client command is somewhere between "taken off the queue" and "chip released". The flash
+ * side raises its flag and then waits for this to drop, so a codec never starts while the chip
+ * is still on the bus on a client's behalf. */
+bool elm327_client_cmd_in_flight(void);
+
+/* Free slots in the command queue. The router asks BEFORE queueing a client's chunk because
+ * elm327_process_cmd() blocks forever on a full queue, and the task that would block is
+ * can_tx_task -- the same task that carries NC Flash's port-35001 traffic. A stalled or
+ * flooding ELM327 app must never be able to stall a flash. */
+uint32_t elm327_cmd_queue_spaces(void);
+
+/* Size of the line-assembly buffer a caller of elm327_process_cmd() must provide: that function
+ * appends until a CR arrives or this many bytes are held. elm327.c asserts it matches its own
+ * limit, so the two cannot drift. */
+#define ELM327_CLIENT_CMD_BUFFER_LEN   (18 * 1024)
+
+/* The two refusals the firmware itself issues to a client, in ELM327's own vocabulary. */
+#define ELM327_RSP_BUS_BUSY     "BUS BUSY\r\r>"
+#define ELM327_RSP_BUFFER_FULL  "BUFFER FULL\r\r>"
+#define ELM327_RSP_UNKNOWN      "?\r\r>"
+#define ELM327_RSP_STOPPED      "STOPPED\r\r>"
+
 #if HARDWARE_VER == WICAN_PRO
 int8_t elm327_process_cmd(uint8_t *buf, uint32_t len, QueueHandle_t *q, char *cmd_buffer, uint32_t *cmd_buffer_len, int64_t *last_cmd_time, response_callback_t response_callback);
+/* Same, for the firmware's own chip housekeeping: never gated, never counted as a client. */
+int8_t elm327_process_housekeeping_cmd(uint8_t *buf, uint32_t len, QueueHandle_t *q, char *cmd_buffer, uint32_t *cmd_buffer_len, int64_t *last_cmd_time, response_callback_t response_callback);
 elm327_chip_status_t elm327_chip_get_status(void);
 esp_err_t elm327_update_obd(bool force_update);
 #else

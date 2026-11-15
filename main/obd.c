@@ -270,11 +270,11 @@ static void obd_parse_response(char *str, uint32_t len, QueueHandle_t *q, char* 
             
             if(strcmp(config.ctrl_mode, "ELM327") == 0)
             {
-                elm327_process_cmd((uint8_t *)"ATPP 0E SV 7A\r", 0, NULL, response_buffer, 
+                elm327_process_housekeeping_cmd((uint8_t *)"ATPP 0E SV 7A\r", 0, NULL, response_buffer, 
                                 &response_len, &response_cmd_time, NULL);
-                elm327_process_cmd((uint8_t *)"ATPP 0E ON\r", 0, NULL, response_buffer, 
+                elm327_process_housekeeping_cmd((uint8_t *)"ATPP 0E ON\r", 0, NULL, response_buffer, 
                                 &response_len, &response_cmd_time, NULL);
-                elm327_process_cmd((uint8_t *)"ATZ\r", 0, NULL, response_buffer, 
+                elm327_process_housekeeping_cmd((uint8_t *)"ATZ\r", 0, NULL, response_buffer, 
                                 &response_len, &response_cmd_time, NULL);
                 vTaskDelay(pdMS_TO_TICKS(100));
                 ESP_LOGW(TAG, "Setting sleep mode to Native");
@@ -292,27 +292,27 @@ static void obd_parse_response(char *str, uint32_t len, QueueHandle_t *q, char* 
             {
                 sprintf(sleep_cmd, "STSLVLW >%.2f, 1\r", wakeup_voltage);
                 sprintf(wake_cmd, "STSLVLS <%.2f, %lu\r", sleep_voltage, sleep_time);
-                elm327_process_cmd((uint8_t *)sleep_cmd, 0, NULL, response_buffer, 
+                elm327_process_housekeeping_cmd((uint8_t *)sleep_cmd, 0, NULL, response_buffer, 
                                 &response_len, &response_cmd_time, NULL);
-                elm327_process_cmd((uint8_t *)wake_cmd, 0, NULL, response_buffer, 
+                elm327_process_housekeeping_cmd((uint8_t *)wake_cmd, 0, NULL, response_buffer, 
                                 &response_len, &response_cmd_time, NULL);
-                elm327_process_cmd((uint8_t *)"STSLVl off,off\r", 0, NULL, response_buffer, 
+                elm327_process_housekeeping_cmd((uint8_t *)"STSLVl off,off\r", 0, NULL, response_buffer, 
                                 &response_len, &response_cmd_time, NULL);
-                elm327_process_cmd((uint8_t *)"STSLU off, off\r", 0, NULL, response_buffer, 
-                                &response_len, &response_cmd_time, NULL);
-                vTaskDelay(pdMS_TO_TICKS(10));
-
-                elm327_process_cmd((uint8_t *)"ATPP 0F SV 95\r", 0, NULL, response_buffer, 
-                                &response_len, &response_cmd_time, NULL);
-                vTaskDelay(pdMS_TO_TICKS(10));
-                elm327_process_cmd((uint8_t *)"ATPP 0F ON\r", 0, NULL, response_buffer, 
-                                &response_len, &response_cmd_time, NULL);
-                vTaskDelay(pdMS_TO_TICKS(10));
-                elm327_process_cmd((uint8_t *)"STSLUIT 1200\r", 0, NULL, response_buffer, 
+                elm327_process_housekeeping_cmd((uint8_t *)"STSLU off, off\r", 0, NULL, response_buffer, 
                                 &response_len, &response_cmd_time, NULL);
                 vTaskDelay(pdMS_TO_TICKS(10));
 
-                elm327_process_cmd((uint8_t *)"ATZ\r", 0, NULL, response_buffer, 
+                elm327_process_housekeeping_cmd((uint8_t *)"ATPP 0F SV 95\r", 0, NULL, response_buffer, 
+                                &response_len, &response_cmd_time, NULL);
+                vTaskDelay(pdMS_TO_TICKS(10));
+                elm327_process_housekeeping_cmd((uint8_t *)"ATPP 0F ON\r", 0, NULL, response_buffer, 
+                                &response_len, &response_cmd_time, NULL);
+                vTaskDelay(pdMS_TO_TICKS(10));
+                elm327_process_housekeeping_cmd((uint8_t *)"STSLUIT 1200\r", 0, NULL, response_buffer, 
+                                &response_len, &response_cmd_time, NULL);
+                vTaskDelay(pdMS_TO_TICKS(10));
+
+                elm327_process_housekeeping_cmd((uint8_t *)"ATZ\r", 0, NULL, response_buffer, 
                                 &response_len, &response_cmd_time, NULL);
                 vTaskDelay(pdMS_TO_TICKS(100));
                 ESP_LOGW(TAG, "Setting sleep parameters");
@@ -324,9 +324,9 @@ static void obd_parse_response(char *str, uint32_t len, QueueHandle_t *q, char* 
         //     ESP_LOGW(TAG, "Sleep mode disabled");
         //     if(config.vl_wake.en == 1 || config.vl_sleep.en == 1)
         //     {
-        //         elm327_process_cmd((uint8_t *)"STSLVl off,off\r", 0, NULL, response_buffer, 
+        //         elm327_process_housekeeping_cmd((uint8_t *)"STSLVl off,off\r", 0, NULL, response_buffer, 
         //                         &response_len, &response_cmd_time, NULL);
-        //         elm327_process_cmd((uint8_t *)"ATZ\r", 0, NULL, response_buffer, 
+        //         elm327_process_housekeeping_cmd((uint8_t *)"ATZ\r", 0, NULL, response_buffer, 
         //                         &response_len, &response_cmd_time, NULL);
         //         vTaskDelay(pdMS_TO_TICKS(100));
         //     }
@@ -345,7 +345,7 @@ esp_err_t obd_get_voltage(float *val)
     static uint32_t response_len = 0;
     static int64_t response_cmd_time = 0;
 
-    elm327_process_cmd((uint8_t *)GET_VOLTAGE_CMD, strlen(GET_VOLTAGE_CMD), NULL,
+    elm327_process_housekeeping_cmd((uint8_t *)GET_VOLTAGE_CMD, strlen(GET_VOLTAGE_CMD), NULL,
                       response_buffer, &response_len, &response_cmd_time, obd_parse_response);
 
     if (xQueueReceive(battery_voltage_queue, val, pdMS_TO_TICKS(1500)) == pdPASS)
@@ -375,7 +375,7 @@ void obd_init(void)
     static uint32_t cmd_buffer_len = 0;
     static int64_t response_cmd_time = 0;
     ESP_LOGI(TAG, "Sending Sleep command");
-    elm327_process_cmd((uint8_t *)GET_SLEEP_CONFIG_CMD, 
+    elm327_process_housekeeping_cmd((uint8_t *)GET_SLEEP_CONFIG_CMD, 
                       strlen(GET_SLEEP_CONFIG_CMD), 
                       NULL, 
                       cmd_buffer, 

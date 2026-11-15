@@ -37,6 +37,7 @@
 #include "config_server.h"
 #include "slcan.h"
 #include "can.h"
+#include "ext_client_logic.h"
 #include "ble.h"
 #include "esp_sleep.h"
 #include "wifi_network.h"
@@ -1935,7 +1936,36 @@ void light_sleep_task(void *pvParameters)
          * loosening it. */
         const bool park_live  = sleep_coexist.datalog_parked &&
                                 (!sleep_coexist.park_expired || sleep_coexist.park_owner_alive);
-        const bool session_live = claim_live || park_live;
+        /* An ELM327 app is talking to the car (ext_client_logic.h). Same shape of problem as
+         * the claim: the hold makes can_should_park() true, so the ECU veto above goes false
+         * with the engine running, and without this term a low sleep_volt reading could put the
+         * device to sleep under a live Torque session.
+         *
+         * CAPPED, unlike the NC Flash terms. NC Flash is a deliberate session at a PC; this is
+         * any app left open on a phone, or anything on the LAN that sends port 35000 a byte now
+         * and then, and it would otherwise hold a parked car awake until the battery was flat.
+         * The clock runs for as long as a client is continuously the active one and restarts
+         * when it goes quiet (EXT_CLIENT_HOLD_MS); past EXT_CLIENT_SLEEP_VETO_MAX_MS the veto is
+         * withdrawn and the voltage decides. With the engine running the voltage is high and
+         * none of this is consulted. */
+        static int64_t ext_client_since_us = 0;
+        const int64_t ext_now_us = esp_timer_get_time();
+        if (!can_ext_client_active())
+        {
+            ext_client_since_us = 0;
+        }
+        else if (ext_client_since_us == 0)
+        {
+            ext_client_since_us = ext_now_us;
+        }
+        const bool ext_client_live = ext_client_sleep_veto(
+            ext_client_since_us != 0,
+            /* Saturating: a 32-bit millisecond count wraps after 49 days and must not hand the
+             * veto back. */
+            (ext_client_since_us == 0) ? 0 :
+            ((ext_now_us - ext_client_since_us) / 1000 >= (int64_t)UINT32_MAX) ? UINT32_MAX :
+            (uint32_t)((ext_now_us - ext_client_since_us) / 1000));
+        const bool session_live = claim_live || park_live || ext_client_live;
 
         if (!session_live)
         {
@@ -1984,8 +2014,9 @@ void light_sleep_task(void *pvParameters)
                             if (!claim_veto_logged)
                             {
                                 claim_veto_logged = true;
-                                ESP_LOGW(TAG, "Battery low (%.2fV) but NC Flash is using the device "
-                                              "-- sleep countdown not started (#92)", battery_voltage);
+                                ESP_LOGW(TAG, "Battery low (%.2fV) but %s is using the device "
+                                              "-- sleep countdown not started (#92)", battery_voltage,
+                                              (claim_live || park_live) ? "NC Flash" : "an ELM327 app");
                             }
                         }
                         else

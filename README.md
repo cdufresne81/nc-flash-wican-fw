@@ -40,11 +40,13 @@ NC Flash (desktop app)  ⇄  Wi-Fi  ⇄  WiCAN PRO (this firmware)  ⇄  OBD-II 
   actively polled PIDs, and the logging rate can be set to **Auto** — the device
   measures its real polling round-trip and logs at the fastest rate that still gives
   every row fresh values (Tactrix-style, live in `/poll_status` as `sweep_hz`).
-- **Single-purpose by default:** the device always runs the Datalogger (`poll_log`)
-  protocol; NC Flash talks to the always-on port 35001 regardless. Other protocols
-  (`fast_log`, `elm327`, `auto_pid`, `slcan`) remain available via the stored
-  configuration (`protocol` key) for bench/debug use — the selector is hidden in
-  the web UI.
+- **Single-purpose by default:** the device always runs the Datalogger (`poll_log`);
+  NC Flash talks to the always-on port 35001 regardless. There is no mode to switch.
+- **ELM327 apps over Wi-Fi.** Point Torque Pro, Car Scanner, OBD Fusion or any other
+  ELM327 Wi-Fi app at the device's IP, **port 35000**. While the app is talking the
+  datalogger pauses by itself, and it resumes about ten seconds after the app goes
+  quiet. NC Flash always has priority: during a flash or an NC Flash session the app
+  is answered `BUS BUSY`. The same works over BLE when BLE is enabled.
 - **Built-in web UI** — status, settings, automation, power saving, logger, file
   manager, and OTA — responsive down to phones (hamburger navigation).
 - **OTA firmware updates** from the web UI.
@@ -72,11 +74,11 @@ NC Flash (desktop app)  ⇄  Wi-Fi  ⇄  WiCAN PRO (this firmware)  ⇄  OBD-II 
 - The OBD-II adapter is **not** designed to be powered from the USB connector for
   normal use. USB can power the adapter to **flash custom firmware** or **hard-reset**
   the device, and is also useful for **debugging**.
-- **BLE settings are hidden in the web UI for now.** This build is Wi-Fi-only: BLE
-  degrades Wi-Fi performance, and when BLE is connected the configuration access
-  point is disabled. BLE support remains in the firmware (the `ble_*` config keys
-  still round-trip), and the UI may come back if a real need appears — e.g. phones
-  whose Wi-Fi is captive to CarPlay/Android Auto while driving.
+- **BLE is off by default and runs alongside Wi-Fi when enabled** (Settings, BLE section).
+  A BLE connection no longer shuts Wi-Fi down. ELM327 apps that support BLE adapters with
+  the `FFF0` service (Car Scanner, OBD Fusion) can use it; Torque Pro expects Bluetooth
+  Classic, which this hardware does not have, so use it over Wi-Fi on port 35000. With
+  BLE enabled the device restarts on each wake from sleep, and Wi-Fi throughput drops.
 - In **AP+Station** mode, use the **station IP** to communicate with the device; the
   **access point is for configuration only**.
 - **Expect ~0.7–0.8 MB/s on file downloads** (a 27 MB day-log ≈ 35 s). That's the

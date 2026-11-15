@@ -47,6 +47,7 @@
 #include "types.h"
 #include "ble.h"
 #include "comm_server.h"
+#include "can.h"
 #include "config_server.h"
 #include "wifi_network.h"
 #include "dev_status.h"
@@ -916,14 +917,22 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
                     // Send prompt
                     cmdline_print_prompt_on_ble();
                 }
-            } else {
+            } else if (param->write.handle == fff0_profile_handle_table[IDX_CHAR_FFF2_VAL]) {
+                /* ONLY the FFF2 value is ELM327 data. This used to be a bare `else`, so every
+                 * other write -- notably the two bytes an app writes to a notification-enable
+                 * descriptor right after connecting -- was forwarded to the interpreter chip
+                 * and glued onto the front of the app's first command.
+                 *
+                 * Dropped, never blocked: this runs in the Bluetooth stack's own task, and the
+                 * queue is the one NC Flash's port 35001 uses (see can_ext_client_rx_admit()). */
                 ESP_LOGI(GATTS_TABLE_TAG, "Write to characteristic (handle: 0x%04x)", param->write.handle);
-                memcpy(rx_buffer.ucElement, param->write.value, param->write.len);
-                rx_buffer.dev_channel = DEV_BLE;
-                rx_buffer.usLen = param->write.len;
-                xQueueSend(*xBle_RX_Queue, ( void * ) &rx_buffer, portMAX_DELAY );
-                ESP_LOGI(GATTS_TABLE_TAG, "writing value:");
-                ESP_LOG_BUFFER_HEX(GATTS_TABLE_TAG, param->write.value, param->write.len);
+                if (param->write.len > 0 && param->write.len <= sizeof(rx_buffer.ucElement) &&
+                    can_ext_client_rx_admit(*xBle_RX_Queue)) {
+                    memcpy(rx_buffer.ucElement, param->write.value, param->write.len);
+                    rx_buffer.dev_channel = DEV_BLE;
+                    rx_buffer.usLen = param->write.len;
+                    xQueueSend(*xBle_RX_Queue, ( void * ) &rx_buffer, 0 );
+                }
             }
             break;
         case ESP_GATTS_EXEC_WRITE_EVT:
@@ -998,9 +1007,13 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             break;
         case ESP_GATTS_CONNECT_EVT:
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_CONNECT_EVT");
-            config_server_stop();
-            // wifi_network_deinit();
-            wifi_mgr_disable();
+            /* Wi-Fi and the web server are NOT taken down here any more. Stock firmware stopped
+             * both on every BLE connect and restarted them on disconnect, which made BLE and the
+             * Wi-Fi workflow (NC Flash on 35001, the web console, the live stream) mutually
+             * exclusive: a phone pairing mid-session cut NC Flash off. The radios share the
+             * antenna by software coexistence (CONFIG_ESP_COEX_SW_COEXIST_ENABLE), so both stay
+             * up; the cost is throughput, not availability. Arbitration between a BLE app and
+             * everything else is the bus rule in ext_client_logic.h, not the radio. */
             esp_ble_conn_update_params_t conn_params = {0};
             memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
             /* For the iOS system, please refer to Apple official documents about the BLE connection parameters restrictions. */
@@ -1010,6 +1023,10 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             conn_params.timeout = 400;    // timeout = 400*10ms = 4000ms
             //start sent the update connection parameters to the peer device.
             esp_ble_gap_update_conn_params(&conn_params);
+            /* Replies still queued for the previous connection must not reach this one. */
+            if (xBle_TX_Queue != NULL && *xBle_TX_Queue != NULL) {
+                xQueueReset(*xBle_TX_Queue);
+            }
             spp_conn_id = param->connect.conn_id;
             spp_gatts_if = gatts_if;
             is_connected = true;
@@ -1034,8 +1051,9 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             break;
         case ESP_GATTS_DISCONNECT_EVT:
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_DISCONNECT_EVT, disconnect reason 0x%x", param->disconnect.reason);
-            wifi_mgr_enable();
-            config_server_restart();
+            /* No wifi_mgr_enable() here: Wi-Fi was never taken down for the connection (see
+             * CONNECT above). The old unconditional re-enable was also a hazard of its own -- a
+             * BLE drop during sleep teardown switched Wi-Fi back on behind the teardown. */
             is_connected = false;
             ble_secured = false;
             xEventGroupClearBits(s_ble_event_group, BLE_CONNECTED_BIT);

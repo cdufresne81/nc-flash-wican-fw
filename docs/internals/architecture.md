@@ -180,6 +180,8 @@ main/                       31,002 lines — app + most inherited subsystems
   slcan_port.c              port 35001                            [fork]
   datalog_lease_task.c      dead-man reaper for the bus lease     [fork]
   datalog_stream.c          port 35002: live trip-CSV tail        [fork]
+  comm_server.c             port 35000: ELM327 apps -> MIC3624    [inherited, re-enabled]
+  ext_client_logic.c        benches the logger for an ELM327 app  [fork]
   safemode.c                recovery AP + OTA form                [GUARDRAIL]
   multipart_upload.c        the parser OTA depends on             [GUARDRAIL]
   expression_parser.c       PID expression evaluator (Bn/Sn/Fn tokens)
@@ -405,19 +407,22 @@ Consequences:
   `obd_chip_status` ("Ready"/"Sleep") is the external chip, read from
   `OBD_READY_PIN`; `ecu_status` is the broken legacy field from §7.
 
-### `can_tx_task` now dispatches on `dev_channel` alone
+### `can_tx_task` dispatches on `dev_channel` alone
 
-It lives in `main.c:255-299` and the protocol arms that used to follow it are
-gone with the mode field (#141). Frames tagged `DEV_SLCAN_PORT` — the dedicated
-35001 listener — are handled and `continue`d; **that early exit *is* the
-no-reboot coexistence feature.** Nothing else routes here, because the one
-remaining mode drives TWAI from the poll task's own loop.
+It lives in `main.c` and the protocol arms that used to follow it are gone with
+the mode field (#141). There are two arms, and each ends in `continue`:
 
-This is not a behaviour change: on a datalogger device neither the slcan arm nor
-the elm327 arm that used to sit below could ever be true, so a frame arriving on
-the stock port was already dropped silently. That silent drop is precisely why
-port 35001 had to exist — and the stock port itself is now gone too, along with
-the `port` and `port_type` keys that configured it.
+- `DEV_SLCAN_PORT` — the dedicated 35001 listener. **That early exit *is* the
+  no-reboot coexistence feature.**
+- `DEV_WIFI` — an ELM327 app on port 35000 (`WICAN_ELM327_PORT`), handed to the
+  MIC3624 chip through `elm327_process_cmd()`. This is the second path in the
+  diagram above, used on purpose; the rules that keep it from colliding with the
+  datalogger and with NC Flash are in [elm327_clients.md](elm327_clients.md).
+
+Nothing else routes here, because the one standalone mode drives TWAI from the
+poll task's own loop. The *configurable* stock port (`port` / `port_type`) is
+still gone; 35000 is the same `comm_server.c` code on a fixed number with a
+fixed job.
 
 ### Shared state: the config lock
 

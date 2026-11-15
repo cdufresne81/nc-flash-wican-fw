@@ -79,7 +79,7 @@ void can_flash_active_set(void);
 void can_flash_active_clear(void);
 bool can_flash_active(void);
 bool can_datalog_park_active(void);   /* true while a host op=pause is in effect */
-bool can_should_park(void);           /* flash_active OR park OR claim OR sleep fence */
+bool can_should_park(void);           /* flash_active OR park OR claim OR sleep fence OR ext client */
 
 /* Sleep fence (#88): raised by the sleep teardown, lowered by the resume path. Stops
  * poll_log/AutoPID re-enabling the bus after sleep has disabled it. NOT the same as
@@ -129,6 +129,29 @@ bool     can_park_lease_renew(uint32_t token, uint64_t ttl_us);           /* tok
 bool     can_park_lease_release(uint32_t token);     /* token-matched clear (0 = unconditional) */
 bool     can_park_lease_reap(uint32_t token, uint64_t deadline_us);       /* reaper compare-and-clear */
 uint32_t can_park_token(void);                        /* 0 = disarmed */
+
+/* External-client hold: an ELM327 app (TCP 35000) -- later a J2534 tester or a BLE app -- is
+ * using the car through the MIC3624 interpreter chip, so the standalone datalogger is benched.
+ * Rule and rationale: ext_client_logic.h. Folded into can_should_park().
+ *
+ * NOT a lease: nothing arms or releases it. can_ext_client_touch() stamps "a client byte just
+ * arrived" and the hold lapses by itself EXT_CLIENT_HOLD_MS after the last one, so a client that
+ * vanishes can never leave the logger parked. It is also the WEAKEST term in can_should_park():
+ * it only ever benches the logger. It never keeps NC Flash out -- the gate below does the
+ * opposite and keeps the client out while NC Flash works. */
+void     can_ext_client_touch(void);          /* a client byte arrived */
+bool     can_ext_client_active(void);         /* within the hold window; lock-free */
+uint32_t can_ext_client_idle_ms(void);        /* ms since the last client byte; UINT32_MAX = never */
+void     can_ext_client_expire(void);         /* slow-path housekeeping (reaper tick) */
+/* May an external client's command go to the chip right now? false while a flash codec, a host
+ * bus-claim, a host datalog pause or sleep teardown holds the bus. Shaped as a plain predicate so
+ * elm327.c can take it as its client gate without knowing what a lease is. */
+bool     can_ext_client_refused(void);
+/* May a client transport (the 35000 socket, BLE) push a chunk onto the shared receive queue?
+ * No while a flash runs, and no once the queue is down to its NC Flash reserve
+ * (EXT_CLIENT_RXQ_RESERVE). The transport DROPS the chunk on false and must then send with a
+ * zero timeout: that queue also carries port 35001, and nothing drains it during a flash. */
+bool     can_ext_client_rx_admit(QueueHandle_t rx_queue);
 
 /* Bus-idle evidence: ms since the last TWAI TX or RX (whichever is later).
  * OBSERVABILITY ONLY since #131 -- on a running car this is ~0 forever (the PCM broadcasts
