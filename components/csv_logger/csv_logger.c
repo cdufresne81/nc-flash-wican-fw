@@ -1403,6 +1403,15 @@ static char *datalog_state_json(void)
     /* #131: what the reaper actually gates on. bus_idle_ms stays for compatibility, but on a
      * running car it reads ~0 forever and tells you nothing about whether a reap can fire. */
     cJSON_AddNumberToObject(root, "diag_idle_ms", can_diag_idle_ms());
+    /* An ELM327 app is using the car through the interpreter chip, so the logger is benched
+     * (main/ext_client_logic.h). Lets the web page and NC Flash say WHY nothing is being
+     * recorded. idle is null until a client has been seen. */
+    cJSON_AddBoolToObject(root, "ext_client_active", can_ext_client_active());
+    {
+        const uint32_t ext_idle = can_ext_client_idle_ms();
+        if (ext_idle != UINT32_MAX) { cJSON_AddNumberToObject(root, "ext_client_idle_ms", ext_idle); }
+        else                        { cJSON_AddNullToObject(root, "ext_client_idle_ms"); }
+    }
     cJSON_AddBoolToObject(root, "stuck_flash_alarm", can_stuck_flash_alarm());
     /* #145: the exact answer every reboot/update/config-save path uses ("clear" / "session" /
      * "flashing"), so the web page can refuse BEFORE posting instead of deriving it from the raw

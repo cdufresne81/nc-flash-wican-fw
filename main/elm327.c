@@ -1495,6 +1495,34 @@ static void elm327_powerpin_commands(void)
 	}
 }
 
+_Static_assert(ELM327_CLIENT_CMD_BUFFER_LEN >= ELM327_MAX_CMD_LEN,
+               "elm327_process_cmd() writes up to ELM327_MAX_CMD_LEN bytes into the caller's buffer");
+
+/* See elm327.h. Written once at boot, before any client can connect. */
+static elm327_client_gate_t s_client_gate = NULL;
+
+void elm327_set_client_gate(elm327_client_gate_t refuse)
+{
+	s_client_gate = refuse;
+}
+
+uint32_t elm327_cmd_queue_spaces(void)
+{
+	if(elm327_cmd_queue == NULL)
+	{
+		return 0;
+	}
+	return (uint32_t)uxQueueSpacesAvailable(elm327_cmd_queue);
+}
+
+/* Is this command a reset of the interpreter (ATZ / AT Z, any case)? One test for both the
+ * ATZ->ATWS rewrite and the memory-off guard that follows it, so they cannot drift apart. */
+static bool elm327_cmd_is_atz(const char *cmd)
+{
+	return strstr(cmd, "ATZ\r") != NULL || strstr(cmd, "atz\r") != NULL ||
+	       strstr(cmd, "AT Z\r") != NULL || strstr(cmd, "at z\r") != NULL;
+}
+
 /* Function Implementations */
 int8_t elm327_process_cmd(uint8_t *cmd, uint32_t len, QueueHandle_t *q, 
                          char *cmd_buffer, uint32_t *cmd_buffer_len, 
@@ -1668,7 +1696,21 @@ static void uart1_event_task(void *pvParameters)
 			sleep_state_info_t sleep_state;
 			sleep_mode_get_state(&sleep_state);
 			memset(uart_read_buf, 0, ELM327_MAX_CMD_LEN);
-            if ((elm327_chip_get_status() == ELM327_READY) && (sleep_state.state != STATE_SLEEPING) && xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
+			/* External-client gate (elm327.h). Asked HERE, after the dequeue and before the UART
+			 * lock, so it also catches a command that was queued before NC Flash took the bus.
+			 * Only client commands (non-NULL reply queue) are gated; the firmware's own chip
+			 * housekeeping passes NULL and must always run. Answered without touching the chip. */
+			if(elm327_command.response_queue != NULL && s_client_gate != NULL && s_client_gate())
+			{
+				ESP_LOGW(TAG, "ELM327 client command refused: bus is reserved");
+				if(elm327_command.response_callback != NULL)
+				{
+					elm327_command.response_callback(ELM327_RSP_BUS_BUSY, strlen(ELM327_RSP_BUS_BUSY),
+													elm327_command.response_queue,
+													elm327_command.command);
+				}
+			}
+            else if ((elm327_chip_get_status() == ELM327_READY) && (sleep_state.state != STATE_SLEEPING) && xSemaphoreTake(xuart1_semaphore, pdMS_TO_TICKS(ELM327_CMD_MUTEX_TIMOUT)) == pdTRUE)
             {
                 // uart_flush(UART_NUM_1);
                 uart_event_t event;
@@ -1687,10 +1729,7 @@ static void uart1_event_task(void *pvParameters)
 				uart_flush_input(UART_NUM_1);
 				xQueueReset(uart1_queue);
 
-                if(strstr(elm327_command.command, "ATZ\r") != NULL || 
-                   strstr(elm327_command.command, "atz\r") != NULL ||
-                   strstr(elm327_command.command, "AT Z\r") != NULL ||
-                   strstr(elm327_command.command, "at z\r") != NULL)
+                if(elm327_cmd_is_atz(elm327_command.command))
                 {
 					// if(strlen(elm327_command.command) < sizeof(last_command))
 					// {
@@ -1799,6 +1838,31 @@ static void uart1_event_task(void *pvParameters)
                         break;
                     }
                 }
+
+				/* EEPROM guard, taken from upstream v6 (meatpiHQ/wican-fw issue #1023). The chip's
+				 * "memory" function is ON after every reset, and with it on the chip writes the
+				 * protocol a request was answered on into its non-volatile store -- a store rated
+				 * for about 10k cycles. An app resets the chip at the start of every session and
+				 * then searches for a protocol, so each session could cost a write. Send ATM0
+				 * behind every reset we forward: one word, one "OK", RAM only, nothing stored.
+				 *
+				 * Its answer is read raw and thrown away -- the app asked for a reset, not for
+				 * this. That raw read consumes bytes without their UART events, so the flush +
+				 * queue reset below is invariant 2 from the top of this file, not tidiness.
+				 * Bounded (UART_TIMEOUT_MS) and under the lock, so invariant 1 holds too. */
+				if (terminator_received && atz_flag == 1)
+				{
+					char m0_rsp[32];
+					elm327_uart_write_bytes(UART_NUM_1, "ATM0\r", strlen("ATM0\r"));
+					(void)uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
+					int m0_len = uart_read_until_pattern(UART_NUM_1, m0_rsp, sizeof(m0_rsp), "\r>", UART_TIMEOUT_MS);
+					if (m0_len <= 0 || strstr(m0_rsp, "OK") == NULL)
+					{
+						ESP_LOGW(TAG, "ATM0 after reset not acknowledged; chip protocol memory may be on");
+					}
+					uart_flush_input(UART_NUM_1);
+					xQueueReset(uart1_queue);
+				}
 
                 if (terminator_received && response_len > 0)
                 {

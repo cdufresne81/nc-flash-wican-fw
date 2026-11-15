@@ -40,11 +40,13 @@ NC Flash (desktop app)  ⇄  Wi-Fi  ⇄  WiCAN PRO (this firmware)  ⇄  OBD-II 
   actively polled PIDs, and the logging rate can be set to **Auto** — the device
   measures its real polling round-trip and logs at the fastest rate that still gives
   every row fresh values (Tactrix-style, live in `/poll_status` as `sweep_hz`).
-- **Single-purpose by default:** the device always runs the Datalogger (`poll_log`)
-  protocol; NC Flash talks to the always-on port 35001 regardless. Other protocols
-  (`fast_log`, `elm327`, `auto_pid`, `slcan`) remain available via the stored
-  configuration (`protocol` key) for bench/debug use — the selector is hidden in
-  the web UI.
+- **Single-purpose by default:** the device always runs the Datalogger (`poll_log`);
+  NC Flash talks to the always-on port 35001 regardless. There is no mode to switch.
+- **ELM327 apps over Wi-Fi.** Point Torque Pro, Car Scanner, OBD Fusion or any other
+  ELM327 Wi-Fi app at the device's IP, **port 35000**. While the app is talking the
+  datalogger pauses by itself, and it resumes about ten seconds after the app goes
+  quiet. NC Flash always has priority: during a flash or an NC Flash session the app
+  is answered `BUS BUSY`.
 - **Built-in web UI** — status, settings, automation, power saving, logger, file
   manager, and OTA — responsive down to phones (hamburger navigation).
 - **OTA firmware updates** from the web UI.

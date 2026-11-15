@@ -1935,7 +1935,14 @@ void light_sleep_task(void *pvParameters)
          * loosening it. */
         const bool park_live  = sleep_coexist.datalog_parked &&
                                 (!sleep_coexist.park_expired || sleep_coexist.park_owner_alive);
-        const bool session_live = claim_live || park_live;
+        /* An ELM327 app is talking to the car (ext_client_logic.h). Same shape of problem as
+         * the claim: the hold makes can_should_park() true, so the ECU veto above goes false
+         * with the engine running, and without this term a low sleep_volt reading could put the
+         * device to sleep under a live Torque session. Self-bounding by construction -- it
+         * lapses EXT_CLIENT_HOLD_MS after the app's last byte whether or not its socket closes,
+         * so it cannot hold a parked car awake. */
+        const bool ext_client_live = can_ext_client_active();
+        const bool session_live = claim_live || park_live || ext_client_live;
 
         if (!session_live)
         {
@@ -1984,8 +1991,9 @@ void light_sleep_task(void *pvParameters)
                             if (!claim_veto_logged)
                             {
                                 claim_veto_logged = true;
-                                ESP_LOGW(TAG, "Battery low (%.2fV) but NC Flash is using the device "
-                                              "-- sleep countdown not started (#92)", battery_voltage);
+                                ESP_LOGW(TAG, "Battery low (%.2fV) but %s is using the device "
+                                              "-- sleep countdown not started (#92)", battery_voltage,
+                                              (claim_live || park_live) ? "NC Flash" : "an ELM327 app");
                             }
                         }
                         else

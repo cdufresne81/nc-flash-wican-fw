@@ -72,6 +72,10 @@
  * without redefining the number. It is the ONLY TCP port this firmware opens for CAN traffic:
  * the configurable stock server is gone, so nothing can collide with it any more. */
 #define WICAN_DEDICATED_SLCAN_PORT	35001
+/* ELM327 over Wi-Fi for phone apps (Torque, Car Scanner, OBD Fusion). 35000 is the port every
+ * ELM327 Wi-Fi adapter and stock WiCAN use, so apps find it without being told. Fixed for the
+ * same reason 35001 is: a port that can be configured can be configured onto another listener. */
+#define WICAN_ELM327_PORT			35000
 
 /* protocol ids 0 (slcan), 1 (realdash66) and 2 (savvycan) retired; values reserved so the
  * remaining ids never shift. id 0 went when `protocol` became a placebo: the device has one

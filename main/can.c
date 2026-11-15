@@ -34,6 +34,7 @@
 #include "lwip/sockets.h"
 #include "driver/twai.h"
 #include "can.h"
+#include "ext_client_logic.h"
 #include "slcan_port.h"   /* slcan_port_conn_gen(): owning 35001 connection generation (dead-man's-switch) */
 #include "hw_config.h"
 
@@ -258,7 +259,9 @@ bool can_sleep_fence_active(void)
 
 /* True while the single TWAI controller is reserved by ANY of: a flash codec
  * (FLASH_ACTIVE_BIT, event group), a host REST datalog-pause (s_park.active), a host
- * bus-claim over the UDS auth window (s_claim.active), or sleep teardown (s_sleep_fence).
+ * bus-claim over the UDS auth window (s_claim.active), or sleep teardown (s_sleep_fence) --
+ * or while an external ELM327 client is using the ECU through the interpreter chip
+ * (can_ext_client_active(), further down).
  * The datalogger poll task and the AutoPID poll task park on THIS so neither injects a stray
  * frame while the bus is reserved.
  * The OR chain is the brick interlock: even if a stray resume cleared the park flag,
@@ -272,7 +275,73 @@ bool can_sleep_fence_active(void)
  * and that protection disappears silently -- the veto would still compile and still look right. */
 bool can_should_park(void)
 {
-	return can_flash_active() || s_park.active || s_claim.active || s_sleep_fence;
+	return can_flash_active() || s_park.active || s_claim.active || s_sleep_fence ||
+	       can_ext_client_active();
+}
+
+/* --- External-client hold (ext_client_logic.h) -----------------------------------------
+ * The fifth term above, and deliberately the odd one out: the other four mean "the TWAI
+ * controller is spoken for", this one means "somebody else is talking to the ECU through the
+ * OTHER path to the bus" (the MIC3624 chip), which can.c cannot see. It is self-expiring, so
+ * unlike the leases it needs no token, no owner and no reaper.
+ *
+ * Writers (touch, expire) take s_park_mux so a touch can never be lost to a concurrent expire.
+ * The reader is lock-free like the lease flags: it copies the stamp, then the flag. The worst
+ * a torn read can do is report the hold one poll-loop pass late or early, and poll_log
+ * re-checks at the top of every pass. */
+static ext_client_hold_t s_ext_client;
+
+static inline uint32_t ext_now_ms(void)
+{
+	return (uint32_t)((uint64_t)esp_timer_get_time() / 1000ULL);
+}
+
+void can_ext_client_touch(void)
+{
+	uint32_t now = ext_now_ms();
+	portENTER_CRITICAL(&s_park_mux);
+	ext_client_touch(&s_ext_client, now);
+	portEXIT_CRITICAL(&s_park_mux);
+}
+
+bool can_ext_client_active(void)
+{
+	ext_client_hold_t h;
+	h.last_ms = s_ext_client.last_ms;
+	h.seen = s_ext_client.seen;
+	return ext_client_active(&h, ext_now_ms());
+}
+
+uint32_t can_ext_client_idle_ms(void)
+{
+	ext_client_hold_t h;
+	h.last_ms = s_ext_client.last_ms;
+	h.seen = s_ext_client.seen;
+	return ext_client_idle_ms(&h, ext_now_ms());
+}
+
+void can_ext_client_expire(void)
+{
+	uint32_t now = ext_now_ms();
+	bool lapsed;
+	portENTER_CRITICAL(&s_park_mux);
+	lapsed = ext_client_expire(&s_ext_client, now);
+	portEXIT_CRITICAL(&s_park_mux);
+	if(lapsed)
+	{
+		ESP_LOGI(TAG, "external client idle for %u ms: datalogger released", (unsigned)EXT_CLIENT_HOLD_MS);
+	}
+}
+
+bool can_ext_client_refused(void)
+{
+	const ext_client_gate_in_t in = {
+		.flash_active = can_flash_active(),
+		.host_claim   = s_claim.active,
+		.host_park    = s_park.active,
+		.sleep_fence  = s_sleep_fence,
+	};
+	return ext_client_gate(&in) != EXT_CLIENT_ADMIT;
 }
 
 /* --- Dead-man's-switch lease primitives (WICAN_DEADMAN_AUTORESUME.md) ----------------

@@ -52,6 +52,7 @@
 #include "config_server.h"
 #include "slcan.h"
 #include "can.h"
+#include "ext_client_logic.h"
 #include "ncflash_fastread.h"
 #include "ncflash_fastwrite.h"
 #include "ble.h"
@@ -200,6 +201,10 @@ static esp_err_t i2c_master_init(void)
     return i2c_driver_install(i2c_master_port, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
 }
 #endif
+/* Serialises send_to_host()'s shared buffer; see the comment inside. Created in app_main before
+ * any task that can call it exists. NULL-safe so an early caller still works. */
+static SemaphoreHandle_t s_send_to_host_mutex = NULL;
+
 #if HARDWARE_VER == WICAN_PRO
 void send_to_host(char* str, uint32_t len, QueueHandle_t *q, char* cmd_str)
 #else
@@ -212,7 +217,13 @@ void send_to_host(char* str, uint32_t len, QueueHandle_t *q)
         return;
     }
 
-    static xdev_buffer xsend_buffer;  // Consider non-static for multithreading
+    /* One static 1 KB buffer shared by every caller -- and since ELM327 clients came back there
+     * are two concurrent ones: can_tx_task (SLCAN replies to NC Flash on 35001, and the ELM327
+     * refusals) and uart1_event_task (the chip's answers to an ELM327 app). Unserialised, an
+     * app's reply could be memcpy'd over an NC Flash reply between its copy and its queue send.
+     * A local buffer is not the fix: uart1_event_task has a 4 KB stack. The hold is bounded --
+     * each queue send below waits at most 100 ms and a failed one returns. */
+    static xdev_buffer xsend_buffer;
     uint32_t bytes_sent = 0;
     uint32_t bytes_to_send;
 
@@ -226,6 +237,10 @@ void send_to_host(char* str, uint32_t len, QueueHandle_t *q)
         len = strlen(str);  // Cache the string length
     }
 
+    if (s_send_to_host_mutex != NULL)
+    {
+        xSemaphoreTake(s_send_to_host_mutex, portMAX_DELAY);
+    }
     while (bytes_sent < len)
     {
         // Determine the number of bytes to send in this iteration
@@ -243,11 +258,15 @@ void send_to_host(char* str, uint32_t len, QueueHandle_t *q)
         if (xQueueSend(*q, (void*)&xsend_buffer, pdMS_TO_TICKS(100)) != pdPASS)
         {
             ESP_LOGE(TAG, "Failed to send data to queue");
-            return;
+            break;
         }
 
         // Update the number of bytes sent
         bytes_sent += bytes_to_send;
+    }
+    if (s_send_to_host_mutex != NULL)
+    {
+        xSemaphoreGive(s_send_to_host_mutex);
     }
 	ESP_LOGI(TAG, "bytes_sent: %lu", bytes_sent);
 }
@@ -292,11 +311,73 @@ static void can_tx_task(void *pvParameters)
 			}
 			continue;
 		}
-		/* Nothing else routes here. The device has one mode (POLL_LOG), which drives TWAI from
-		 * its own task, so a frame arriving on the STOCK port has no consumer -- exactly as it
-		 * already behaved on every datalogger device, where neither the slcan arm nor the
-		 * elm327 arm that used to sit here could ever be true. The dedicated port above is the
-		 * only channel that does work, and it is dispatched before any of this. */
+		/* ELM327 clients (Torque, Car Scanner, OBD Fusion...) on TCP 35000. Bytes go to the
+		 * MIC3624 interpreter chip through elm327_process_cmd(), exactly as stock WiCAN PRO
+		 * firmware routes them; the chip speaks ELM327 itself, the ESP32 only carries bytes.
+		 * Replies come back on xMsg_Tx_Queue via send_to_host.
+		 *
+		 * This is the second path to the bus (architecture.md section 6) and the datalogger
+		 * cannot share the ECU with it, so the three rules of ext_client_logic.h apply here:
+		 *
+		 *   - NC Flash wins. If a flash, a host claim, a host pause or sleep teardown holds the
+		 *     bus the chunk is answered BUS BUSY and dropped. The hold is NOT touched, so a
+		 *     refused app cannot keep the logger benched after NC Flash leaves.
+		 *   - Never block this task. It also carries port 35001, so a chunk that would not fit
+		 *     in the chip's command queue is answered BUFFER FULL instead of queued.
+		 *   - Otherwise touch the hold FIRST, then queue: poll_log must already be on its way to
+		 *     the park when the chip starts talking.
+		 *
+		 * uart1_event_task asks the same gate again at the moment of sending, which covers the
+		 * commands that were already queued when NC Flash arrived. */
+		if(ucTCP_RX_Buffer.dev_channel == DEV_WIFI)
+		{
+			/* Line-assembly buffer for elm327_process_cmd(), which writes up to
+			 * ELM327_CLIENT_CMD_BUFFER_LEN bytes into it (stock firmware handed it 2 KB and
+			 * trusted the app to send a CR in time). 18 KB of internal RAM is not affordable
+			 * here, so it lives in PSRAM and is only allocated once a client shows up. */
+			static char *elm327_cmd_buffer = NULL;
+			static uint32_t elm327_cmd_buffer_len = 0;
+			static int64_t elm327_last_cmd_time = 0;
+			const size_t cmds = ext_client_count_commands(msg_ptr, (size_t)temp_len);
+
+			if(elm327_cmd_buffer == NULL)
+			{
+				elm327_cmd_buffer = heap_caps_calloc(1, ELM327_CLIENT_CMD_BUFFER_LEN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+				if(elm327_cmd_buffer == NULL)
+				{
+					ESP_LOGE(TAG, "no memory for the ELM327 line buffer");
+					if(cmds != 0)
+					{
+						send_to_host(ELM327_RSP_BUFFER_FULL, 0, &xMsg_Tx_Queue, NULL);
+					}
+					continue;
+				}
+			}
+			if(can_ext_client_refused())
+			{
+				elm327_cmd_buffer_len = 0;
+				elm327_cmd_buffer[0] = '\0';
+				if(cmds != 0)
+				{
+					send_to_host(ELM327_RSP_BUS_BUSY, 0, &xMsg_Tx_Queue, NULL);
+				}
+				continue;
+			}
+			if(cmds > elm327_cmd_queue_spaces())
+			{
+				elm327_cmd_buffer_len = 0;
+				elm327_cmd_buffer[0] = '\0';
+				send_to_host(ELM327_RSP_BUFFER_FULL, 0, &xMsg_Tx_Queue, NULL);
+				continue;
+			}
+			can_ext_client_touch();
+			elm327_process_cmd(msg_ptr, temp_len, &xMsg_Tx_Queue, elm327_cmd_buffer,
+							   &elm327_cmd_buffer_len, &elm327_last_cmd_time, &send_to_host);
+			continue;
+		}
+		/* Nothing else routes here. The device has one standalone mode (POLL_LOG), which drives
+		 * TWAI from its own task; the two host channels above are dispatched on dev_channel and
+		 * need no mode. A frame from any other source (BLE, the wired UART) has no consumer. */
 	}
 }
 #define HEAP_CAPS   (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
@@ -334,7 +415,16 @@ static void can_rx_task(void *pvParameters)
 		// vTaskSuspend()s this task), so we still park hard whenever it is set.
 		bool coexist_session =
 			(can_datalog_park_active() || can_host_bus_claim_active()) && !can_flash_active();
-		if(((protocol == FAST_LOG || protocol == POLL_LOG) && !coexist_session) || can_flash_active())
+		/* External ELM327 client (ext_client_logic.h): poll_log is benched and NOT draining
+		 * TWAI, but the controller is still on the bus and still receives everything -- the
+		 * broadcast traffic and the ECU's answers to the CHIP's requests. Somebody has to empty
+		 * the RX queue, or poll_log would resume into a queue of stale 0x7E8 frames and credit
+		 * them to its own first requests. So this task drains for that case too, and DROPS: those
+		 * frames belong to the chip's conversation, which the app reads through the chip.
+		 * can_receive() still stamps the diagnostic-idle clock on the way through, which is the
+		 * only view can.c has of the chip's traffic. */
+		const bool ext_client_drain = can_ext_client_active() && !coexist_session && !can_flash_active();
+		if(((protocol == FAST_LOG || protocol == POLL_LOG) && !coexist_session && !ext_client_drain) || can_flash_active())
 		{
 			vTaskDelay(pdMS_TO_TICKS(50));
 			continue;
@@ -380,6 +470,10 @@ static void can_rx_task(void *pvParameters)
 			// and host-driven reads/sessions over 35001 hang. The !can_flash_active() re-check
 			// stops forwarding the instant a codec sets FLASH_ACTIVE_BIT mid-inner-loop (it is
 			// about to suspend us), so no stale ECU frame races the codec. Only to a live client.
+			if(ext_client_drain)
+			{
+				continue;   /* drop: see ext_client_drain above */
+			}
 			if(coexist_session && !can_flash_active() && slcan_port_is_open())
 			{
 				ucTCP_TX_Buffer.usLen = slcan_parse_frame(ucTCP_TX_Buffer.ucElement, &rx_msg);
@@ -675,6 +769,11 @@ void app_main(void)
 	// 		gpio_set_level(USB_ESP_MODE_EN, 0);
 	// 	}
 	// }
+	s_send_to_host_mutex = xSemaphoreCreateMutex();
+	if(s_send_to_host_mutex == NULL)
+	{
+		ESP_LOGE(TAG, "send_to_host mutex not created; replies are unserialised");
+	}
 	#if HARDWARE_VER == WICAN_PRO
 	wc_uart_init();
 	#endif
@@ -815,10 +914,11 @@ void app_main(void)
 	xmsg_obd_rx_queue = xQueueCreateStatic(32, xdev_buffer_size, (uint8_t *)elm327_uart_rx_queue_storage, &elm327_uart_rx_queue_buffer);
 	// elm327_init( &send_to_host, &xmsg_obd_rx_queue, NULL); //not needed
 
-	/* elm327_read_task stays OFF. It must only run in a mode where an ELM327 client can reach
-	 * us -- see elm327_set_read_task_enabled() in elm327.h for what goes wrong otherwise: it sits
-	 * on the UART lock for nobody, which was the 20 s wake bug. With one mode left there is no
-	 * such client, so this is now constant-false, which is the safe side of that bug.
+	/* elm327_read_task stays OFF, ELM327 clients on port 35000 notwithstanding. That task only
+	 * forwards UNSOLICITED chip output (it was the BLE path); a TCP client is served by the
+	 * request/response worker, uart1_event_task, which reads each answer itself under the UART
+	 * lock. Starting the read task for nobody is the 20 s wake bug -- see
+	 * elm327_set_read_task_enabled() in elm327.h -- so it is still constant-false here.
 	 *
 	 * elm327_init() below still runs: the sleep path needs its UART, its lock and its chip
 	 * maintenance. Do NOT re-add the old claim that it "stays dormant" in the datalogger modes --
@@ -890,23 +990,20 @@ void app_main(void)
 	}
 	wifi_diag_init();
 
-	/* The configurable stock CAN-over-TCP/UDP server is gone. It existed to serve the slcan and
-	 * elm327 host protocols on a user-chosen port; both modes are retired, so nothing produced
-	 * bytes for it and nothing consumed bytes from it. Its `port` / `port_type` settings went with
-	 * it -- a knob that cannot change anything is worse than no knob, because the next reader
-	 * believes it works.
-	 *
-	 * Deleting it also removes a trap: when the stock port was set to 35001 the dedicated listener
-	 * below was skipped to avoid two binds fighting, which silently made ECU flashing impossible.
-	 * With one listener left on a fixed port, that collision cannot happen. */
+	/* The CONFIGURABLE stock CAN-over-TCP/UDP server is gone: its `port` / `port_type` settings
+	 * and the mode field that decided what it spoke went with #141. What came back is the same
+	 * comm_server code on a FIXED port with a fixed job (ELM327 on 35000, started below), so the
+	 * trap that deletion removed stays removed: a stock port set to 35001 used to skip the
+	 * dedicated listener to avoid two binds fighting, which silently made ECU flashing
+	 * impossible. Two fixed, different numbers cannot collide. */
 
 	#if HARDWARE_VER == WICAN_PRO
 	/* No-reboot coexistence (task #36): start the always-on dedicated SLCAN listener AFTER
 	 * the queues exist (above) and the network stack is up (wifi_network_init). Frames arrive
 	 * tagged DEV_SLCAN_PORT on the shared RX queue and are dispatched by can_tx_task regardless
-	 * of any config; replies drain from the private xMsg_SlcanPort_Tx_Queue. This is now the
-	 * ONLY TCP port this firmware opens for CAN traffic, on a fixed number, so nothing can
-	 * collide with it. If it fails to start, ECU flashing is unavailable until the next boot. */
+	 * of any config; replies drain from the private xMsg_SlcanPort_Tx_Queue. It is the only port
+	 * NC Flash uses, on a fixed number, so nothing can collide with it. If it fails to start,
+	 * ECU flashing is unavailable until the next boot. */
 	if(slcan_port_init(WICAN_DEDICATED_SLCAN_PORT, &xMsg_Rx_Queue, &xMsg_SlcanPort_Tx_Queue) != 0)
 	{
 		ESP_LOGE(TAG, "dedicated SLCAN port init failed (no-reboot coexistence unavailable)");
@@ -915,6 +1012,17 @@ void app_main(void)
 	 * mid-coexistence (lid close / crash / Wi-Fi drop). Reads coexistence state only; safe to
 	 * start regardless of whether the dedicated port came up. See WICAN_DEADMAN_AUTORESUME.md. */
 	datalog_lease_task_start();
+	/* ELM327 over Wi-Fi for phone apps: the port every ELM327 Wi-Fi adapter uses, served by
+	 * the stock comm_server (one client at a time). Its frames arrive tagged DEV_WIFI and
+	 * can_tx_task hands them to the interpreter chip; replies drain from xMsg_Tx_Queue. The
+	 * gate makes uart1_event_task refuse a client command while NC Flash holds the bus. Always
+	 * on and fixed, like 35001: a client only costs anything while it is actually talking, and
+	 * then the datalogger steps aside by itself (ext_client_logic.h). */
+	elm327_set_client_gate(&can_ext_client_refused);
+	if(tcp_server_init(WICAN_ELM327_PORT, &xMsg_Tx_Queue, &xMsg_Rx_Queue, 0, 0) != 0)
+	{
+		ESP_LOGE(TAG, "ELM327 port init failed (phone apps cannot connect until next boot)");
+	}
 	/* Live datalog stream (issue #3): read-only, touches no CAN state. */
 	if(datalog_stream_start(WICAN_DATALOG_STREAM_PORT) != 0)
 	{

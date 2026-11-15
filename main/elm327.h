@@ -43,9 +43,10 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
  * effect afterwards. Defaults to ENABLED, so a caller that forgets gets today's behaviour.
  *
  * elm327_read_task exists only to forward UNSOLICITED output from the interpreter chip to a
- * connected ELM327 client. Under poll_log/fast_log no client can reach it -- main.c's router only
- * feeds elm327 when protocol is OBD_ELM327 or AUTO_PID -- so the task serves nobody, yet it still
- * takes the shared UART lock whenever the chip emits a byte. Measured in the car 2026-08-17: it
+ * connected ELM327 client -- the path stock firmware used for BLE. Nothing uses that path here:
+ * the ELM327 clients this firmware does serve (TCP 35000) go through uart1_event_task, which
+ * reads each reply itself. So the task would serve nobody, yet it still takes the shared UART
+ * lock whenever the chip emits a byte. Measured in the car 2026-08-17: it
  * held that lock across a whole sleep, so the wake spent 20 s failing to get it (LED dark, WiFi
  * down, datalogger recording the entire time) and the sleep babysitter's nudges silently did
  * nothing, producing the misleading "MIC chip would not sleep" line.
@@ -55,6 +56,33 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
  * cycle, runs the chip's boot maintenance, and starts uart1_event_task -- which executes the
  * chip's own sleep/wake voltage configuration queued by obd_init(). Never gate those. */
 void elm327_set_read_task_enabled(bool enabled);
+
+/* --- External ELM327 clients (TCP 35000) -------------------------------------------------
+ * A command counts as a CLIENT command when it was queued with a non-NULL reply queue. The
+ * firmware's own chip housekeeping (obd.c, wc_uart.c) always passes NULL, so it is never gated.
+ *
+ * The gate is asked in uart1_event_task at the last moment before the bytes go to the chip --
+ * the single choke point every queued command passes -- so a command that was already waiting in
+ * the queue when NC Flash claimed the bus is refused too, not just the ones that arrive later.
+ * A refused command is answered "BUS BUSY", which is what a real ELM327 says when it cannot get
+ * the bus, so every app already knows how to show it and retry. Pass NULL to remove the gate. */
+typedef bool (*elm327_client_gate_t)(void);
+void elm327_set_client_gate(elm327_client_gate_t refuse);
+
+/* Free slots in the command queue. The router asks BEFORE queueing a client's chunk because
+ * elm327_process_cmd() blocks forever on a full queue, and the task that would block is
+ * can_tx_task -- the same task that carries NC Flash's port-35001 traffic. A stalled or
+ * flooding ELM327 app must never be able to stall a flash. */
+uint32_t elm327_cmd_queue_spaces(void);
+
+/* Size of the line-assembly buffer a caller of elm327_process_cmd() must provide: that function
+ * appends until a CR arrives or this many bytes are held. elm327.c asserts it matches its own
+ * limit, so the two cannot drift. */
+#define ELM327_CLIENT_CMD_BUFFER_LEN   (18 * 1024)
+
+/* The two refusals the firmware itself issues to a client, in ELM327's own vocabulary. */
+#define ELM327_RSP_BUS_BUSY     "BUS BUSY\r\r>"
+#define ELM327_RSP_BUFFER_FULL  "BUFFER FULL\r\r>"
 
 #if HARDWARE_VER == WICAN_PRO
 int8_t elm327_process_cmd(uint8_t *buf, uint32_t len, QueueHandle_t *q, char *cmd_buffer, uint32_t *cmd_buffer_len, int64_t *last_cmd_time, response_callback_t response_callback);
