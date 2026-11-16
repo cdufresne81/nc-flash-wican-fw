@@ -54,6 +54,7 @@
 #include "can.h"
 #include "ncflash_fastread.h"
 #include "ncflash_fastwrite.h"
+#include "ncflash_fastflash.h"
 #include "ble.h"
 #include "sleep_mode.h"
 #include "wc_uart.h"
@@ -285,6 +286,19 @@ static void can_tx_task(void *pvParameters)
 			else if(ncflash_is_fastwrite_cmd(msg_ptr, temp_len))
 			{
 				ncflash_fast_write(msg_ptr, temp_len, &xMsg_SlcanPort_Tx_Queue);
+			}
+			else if(ncflash_is_fastflash_cmd(msg_ptr, temp_len))
+			{
+				/* 'K': the dongle rewrites only the differing ECU blocks itself (docs/internals/fast_flash.md).
+				 * Inline like the two above: it owns the bus and can_tx_task until it returns. */
+				ncflash_fast_flash(msg_ptr, temp_len, &xMsg_SlcanPort_Tx_Queue);
+				/* Lines the PC sent while the op owned the bus queued up behind it; run now they would
+				 * hit an ECU that has just been reset (a PC that fell back to its own SLCAN session
+				 * mid-op). The op is the only thing that may happen in that window: drop them. */
+				static xdev_buffer stale;
+				int dropped = 0;
+				while (xQueueReceive(xMsg_Rx_Queue, &stale, 0) == pdTRUE) dropped++;
+				if (dropped) ESP_LOGW(TAG, "fast flash: dropped %d line(s) received during the op", dropped);
 			}
 			else
 			{

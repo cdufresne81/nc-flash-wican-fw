@@ -15,6 +15,8 @@ set(srcs
     "can.c"
     "ncflash_fastread.c"
     "ncflash_fastwrite.c"
+    "ncflash_fastflash.c"
+    "fast_flash_logic.c"
     "flash_fence_logic.c"
     "auto_pid_seed_logic.c"
     "ble.c"
@@ -115,3 +117,11 @@ idf_component_register(
         # TXTFILES so the blob is NUL-terminated and can be strlen'd.
         "default_auto_pid.json"
 )
+
+# Fast flash live gate (main/ncflash_fastflash.h). Off unless the build says otherwise:
+#   idf.py -B build_ff_live -DNCFF_ALLOW_LIVE=1 build
+# Use a separate build directory for a live build: the value is a CMake cache entry and stays in
+# that directory's cache. GET /host_caps reports it as "ff_live".
+if(DEFINED NCFF_ALLOW_LIVE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE NCFF_ALLOW_LIVE=${NCFF_ALLOW_LIVE})
+endif()

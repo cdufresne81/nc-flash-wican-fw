@@ -28,6 +28,7 @@
  * decide when a host is GONE; the bits decide when the bus is OWNED.
  */
 
+#include "ncflash_fastflash.h"   /* longer stuck-flash ceiling for the K fast flash */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -79,12 +80,15 @@ static void datalog_lease_task(void *arg)
         if (s.flash_active)
         {
             if (flash_since_us == 0) { flash_since_us = s.now_us; }
-            else if (!alarm_raised && (s.now_us - flash_since_us) > COEXIST_STUCK_FLASH_CEILING_US)
+            else if (!alarm_raised &&
+                     (s.now_us - flash_since_us) >
+                         (ncflash_fastflash_active() ? NCFF_STUCK_FLASH_CEILING_US : COEXIST_STUCK_FLASH_CEILING_US))
             {
                 can_set_stuck_flash_alarm(true);
                 alarm_raised = true;
                 ESP_LOGE(TAG, "NCSTUCKFLASH flash held > %llus -- power cycle required",
-                         (unsigned long long)(COEXIST_STUCK_FLASH_CEILING_US / 1000000ULL));
+                         (unsigned long long)((ncflash_fastflash_active() ? NCFF_STUCK_FLASH_CEILING_US
+                                                                          : COEXIST_STUCK_FLASH_CEILING_US) / 1000000ULL));
             }
             continue;
         }
