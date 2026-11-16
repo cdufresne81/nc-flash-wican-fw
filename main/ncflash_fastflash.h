@@ -40,10 +40,12 @@
 #define NCFLASH_FASTFLASH_REV 1
 
 /* HARD SAFETY GATE. 0 = only 'D' and 'C' (nothing can be erased); 1 = 'L' and 'R' allowed.
- * Set from the build: idf.py -DNCFF_ALLOW_LIVE=1 (main/CMakeLists.txt passes it through).
- * Keep 0 until the bench steps in docs/internals/fast_flash.md have passed. */
+ * On by default since v1.28.0-beta.1: the bench steps in docs/internals/fast_flash.md passed
+ * (2026-11-16), and NC Flash only sends 'L'/'R' when the user turned Dynamic Flash's block
+ * compare on (off by default). Build a compare-only image with idf.py -DNCFF_ALLOW_LIVE=0
+ * (main/CMakeLists.txt passes it through). */
 #ifndef NCFF_ALLOW_LIVE
-#define NCFF_ALLOW_LIVE 0
+#define NCFF_ALLOW_LIVE 1
 #endif
 
 int ncflash_is_fastflash_cmd(const uint8_t *buf, int len);
