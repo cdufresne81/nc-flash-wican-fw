@@ -118,10 +118,10 @@ idf_component_register(
         "default_auto_pid.json"
 )
 
-# Fast flash live gate (main/ncflash_fastflash.h). Off unless the build says otherwise:
-#   idf.py -B build_ff_live -DNCFF_ALLOW_LIVE=1 build
-# Use a separate build directory for a live build: the value is a CMake cache entry and stays in
-# that directory's cache. GET /host_caps reports it as "ff_live".
+# Fast flash live gate (main/ncflash_fastflash.h). On by default; a compare-only build:
+#   idf.py -B build_ff_gate0 -DNCFF_ALLOW_LIVE=0 build
+# Use a separate build directory for it: the value is a CMake cache entry and stays in that
+# directory's cache. GET /host_caps reports it as "ff_live".
 if(DEFINED NCFF_ALLOW_LIVE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE NCFF_ALLOW_LIVE=${NCFF_ALLOW_LIVE})
 endif()

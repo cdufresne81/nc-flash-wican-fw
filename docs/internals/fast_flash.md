@@ -22,9 +22,11 @@ own protocol is the header comment of the kernel source in nc-flash-re
 
 ## Safety model
 
-- **Compile gate.** `NCFF_ALLOW_LIVE` is 0 unless the build sets it (`idf.py -DNCFF_ALLOW_LIVE=1`,
-  passed through by `main/CMakeLists.txt`). With 0, only `D` and `C` run; `L` and `R` end in
-  `FFERR st=7` before any CAN traffic. `/host_caps` reports the gate as `ff_live`.
+- **Compile gate.** `NCFF_ALLOW_LIVE` is 1 by default since v1.28.0-beta.1 (bench test passed
+  2026-11-16; NC Flash sends `L`/`R` only when the user turned the block compare on, off by
+  default). A build with `idf.py -DNCFF_ALLOW_LIVE=0` (passed through by `main/CMakeLists.txt`)
+  runs only `D` and `C`; `L` and `R` then end in `FFERR st=7` before any CAN traffic.
+  `/host_caps` reports the gate as `ff_live`.
 - **Before any ECU contact** the whole package is read into PSRAM and `ff_check()` runs
   `ff_manifest_parse()` and `ff_manifest_validate()`:
   - the whole-package CRC and the CRC of every section;
