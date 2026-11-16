@@ -109,6 +109,7 @@
 #include "restart_tracker_http.h"
 #include "led_indicator.h"
 #include "ncflash_fastread.h"   /* NCFLASH_FASTREAD_REV, reported by /host_caps */
+#include "ncflash_fastflash.h"  /* NCFLASH_FASTFLASH_REV, NCFF_ALLOW_LIVE, GET /fast_flash */
 
 
 #define WIFI_CONNECTED_BIT			BIT0
@@ -1877,6 +1878,11 @@ static esp_err_t host_caps_handler(httpd_req_t *req)
 	 * logging run instead of overwriting the saved one (docs/internals/datalog_session.md).
 	 * A host contract like the two above; absent on every build before this one. */
 	cJSON_AddNumberToObject(root, "session_list", 1);
+	/* The 'K' fast flash exists (docs/internals/fast_flash.md): the wire + manifest version, and
+	 * whether this build may erase (0 = dry-run and compare-only only, NCFF_ALLOW_LIVE). NC Flash
+	 * must never send 'K' to a build without "fast_flash": an older one hands it to the SLCAN parser. */
+	cJSON_AddNumberToObject(root, "fast_flash", NCFLASH_FASTFLASH_REV);
+	cJSON_AddNumberToObject(root, "ff_live", NCFF_ALLOW_LIVE ? 1 : 0);
 
 	char *resp_str = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
@@ -3749,6 +3755,7 @@ static void register_server_uris(void)
 	httpd_register_uri_handler(server, &sd_files_post_uri);
 	event_log_register_handlers(server);   // GET /event_log* (Task #24) -- before the catch-all wildcard
 	wifi_diag_register_handlers(server);   // GET /wifi_diag* (#105) -- likewise before the wildcard
+	ncflash_fastflash_register_handlers(server);   // GET /fast_flash -- status of the 'K' fast flash
 }
 
 //static char* device_config = NULL;
@@ -4011,7 +4018,7 @@ static httpd_handle_t config_server_init(void)
 	// NOTE: the catch-all "/*" file server (get_uri_common) is registered LAST, so it
 	// must fit within this cap. The 3 CSV-logger endpoints pushed the total past 38,
 	// which silently dropped "/*" and 404'd every embedded asset (main.js, etc.).
-	// Count when /datalog_session was added: 34 of 48.
+	// Count when /datalog_session was added: 34 of 48. /fast_flash makes it 35 of 48.
 	config.max_uri_handlers = 48;
 	config.stack_size = (10*1024);
 	config.max_open_sockets = 15;
