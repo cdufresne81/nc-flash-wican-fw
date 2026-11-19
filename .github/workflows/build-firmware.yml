@@ -49,10 +49,24 @@ jobs:
       - name: Host tests
         run: node --test tools/webtest/*.test.mjs
 
+      # cJSON for the auto_pid.json parser test (tools/hosttest/autopid_config_test.c), at
+      # the exact commit ESP-IDF v5.5.3 pins as components/json/cJSON (release 1.7.19), so
+      # the host test parses with the library the firmware links. A shallow fetch of one
+      # pinned commit from GitHub: no apt index refresh, and nothing lands in the checkout.
+      - name: Fetch cJSON for the C host tests
+        run: |
+          git init -q "$RUNNER_TEMP/cJSON"
+          git -C "$RUNNER_TEMP/cJSON" fetch -q --depth 1 https://github.com/DaveGamble/cJSON.git c859b25da02955fef659d658b8f324b5cde87be3
+          git -C "$RUNNER_TEMP/cJSON" checkout -q FETCH_HEAD
+
       # C host tests: the csv_logger bring-up chain (RTC crash guard, manual-override
-      # lifetime, logging gate). Plain cc, no toolchain, seconds to run -- see
-      # tools/hosttest/run.sh for why that logic is separable at all.
+      # lifetime, logging gate), poll_log's gates, and the real auto_pid.json parser under
+      # ASan/UBSan. Plain cc, no toolchain, seconds to run -- see tools/hosttest/run.sh for
+      # why that logic is separable at all.
       - name: Host tests (C)
+        env:
+          CJSON_DIR: ${{ runner.temp }}/cJSON
+          HOSTTEST_REQUIRE_SANITIZERS: '1'
         run: bash tools/hosttest/run.sh
 
   build:

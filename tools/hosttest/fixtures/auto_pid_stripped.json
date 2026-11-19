@@ -1,0 +1,101 @@
+{
+  "format": "nc-flash-1",
+  "standard_pids": "enable",
+  "car_specific": "disable",
+  "pids": [
+    {
+      "Name": "RPM",
+      "Mode": "01",
+      "PID": "010C1",
+      "Expression": "((B3*256)+B4)/4",
+      "Unit": "rpm",
+      "MinValue": "0",
+      "MaxValue": "9000",
+      "enabled": true,
+      "description": "Engine speed"
+    },
+    {
+      "Name": "KNOCKR",
+      "Mode": "22",
+      "PID": "2210741",
+      "Expression": "B4/2",
+      "Unit": "deg",
+      "MinValue": "",
+      "MaxValue": "",
+      "SampleEvery": "4",
+      "enabled": false,
+      "comment": "hand-edited"
+    },
+    {
+      "Name": "AAT",
+      "PID": "01461",
+      "Expression": "B3-40",
+      "Unit": "C",
+      "MinValue": -40,
+      "MaxValue": 215,
+      "SampleEvery": 16,
+      "enabled": true
+    }
+  ],
+  "std_pids": [
+    {
+      "Name": "0C-EngineRPM",
+      "SampleEvery": "2",
+      "enabled": true
+    },
+    {
+      "Name": "0D-VehicleSpeed",
+      "enabled": false
+    }
+  ],
+  "can_filters": [
+    {
+      "frame_id": 513,
+      "parameters": [
+        {
+          "name": "SPEED",
+          "expression": "((B0*256)+B1)/100",
+          "unit": "km/h",
+          "min": "0",
+          "max": "300",
+          "enabled": true,
+          "description": "wheel speed"
+        },
+        {
+          "name": "BRAKE",
+          "expression": "B2&1",
+          "unit": "",
+          "min": "",
+          "max": "",
+          "enabled": false
+        }
+      ]
+    },
+    {
+      "frame_id": "0x18DAF110",
+      "parameters": [
+        {
+          "name": "XID",
+          "expression": "B0",
+          "unit": "",
+          "min": "",
+          "max": ""
+        }
+      ]
+    }
+  ],
+  "calculated": [
+    {
+      "name": "BOOST",
+      "expression": "(MAP-BARO)*0.145038",
+      "unit": "PSI",
+      "enabled": true
+    },
+    {
+      "name": "AFR",
+      "expression": "EQ_RATIO_ACT*14.71",
+      "unit": "",
+      "enabled": false
+    }
+  ]
+}
