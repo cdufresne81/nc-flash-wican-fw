@@ -61,7 +61,7 @@ Recovery paths, in order of preference: wait 60 s for the retry; `POST /csv_logg
 
 The writer task starts at boot with **no delay**, and the first file opens when the ECU actually answers — ~3–5 s, not 20+.
 
-There used to be a 20 s wait before the writer task was even created, with no status reported meanwhile, so "still starting" and "broken" were indistinguishable. Nothing replaced it: `csv_logger_start_at_boot()` runs *before* `autopid_init()`/`poll_log_init()`, no record can exist until a producer starts, and no session opens until a record arrives — the ordering is the margin. (`event_log`'s writer has always done SD `fopen`/`fwrite`/`fsync` from t=0 on the same card with no holdoff, which is the evidence a clock here bought nothing.) Removing it also means the crash guard's 15 s stability window starts at boot instead of 20 s in, halving the window a reboot can land inside.
+There used to be a 20 s wait before the writer task was even created, with no status reported meanwhile, so "still starting" and "broken" were indistinguishable. Nothing replaced it: `csv_logger_start_at_boot()` runs *before* `poll_log_init()`, no record can exist until a producer starts, and no session opens until a record arrives — the ordering is the margin. (`event_log`'s writer has always done SD `fopen`/`fwrite`/`fsync` from t=0 on the same card with no holdoff, which is the evidence a clock here bought nothing.) Removing it also means the crash guard's 15 s stability window starts at boot instead of 20 s in, halving the window a reboot can land inside.
 
 `/csv_status` reports the state so the UI never has to guess:
 

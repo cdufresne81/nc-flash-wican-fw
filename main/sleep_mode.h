@@ -22,10 +22,6 @@
 #ifndef SLEEP_MODE_h
 #define SLEEP_MODE_h
 
-#if HARDWARE_VER != WICAN_PRO
-int8_t sleep_mode_init(uint8_t enable, float sleep_volt);
-int8_t sleep_mode_get_voltage(float *val);
-#elif HARDWARE_VER == WICAN_PRO
 // #define HV_PRO_V140     1
 
 // State machine states
@@ -61,8 +57,6 @@ void sleep_mode_init(void);
 esp_err_t sleep_mode_get_voltage(float *val);
 esp_err_t sleep_mode_get_state(sleep_state_info_t *state_info);
 void sleep_mode_print_wakeup_reason(void);
-
-#endif
 
 
 #endif

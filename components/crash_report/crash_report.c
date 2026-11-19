@@ -35,7 +35,7 @@
 #include "event_log.h"
 #include "crash_report.h"
 
-// Distinct RTC_NOINIT magic (NOT csv 0xA11C0DE5 / poll_log 0x9011106D / fast_log 0xFA571A6D /
+// Distinct RTC_NOINIT magic (NOT csv 0xA11C0DE5 / poll_log 0x9011106D /
 // event_log 0xE7106A11). Marks a fully-written crash snapshot; any other value = nothing to report.
 #define CRASH_REPORT_MAGIC  0xC0FFEE10u
 #define CRASH_BT_MAX        16      // captured call-stack depth (fits several event_log lines)

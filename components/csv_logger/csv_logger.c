@@ -68,7 +68,7 @@ _Static_assert(CSV_LOGGER_SOURCE_MAX == 8, "wide column source dim must match pr
 // csv_logger_init(), fixed by publishing the queue before creating the task.
 //
 // Nothing replaced it, because the ordering already gives the margin for free:
-// csv_logger_start_at_boot() runs BEFORE autopid_init()/poll_log_init() (main.c), no record
+// csv_logger_start_at_boot() runs BEFORE poll_log_init() (main.c), no record
 // can exist until a producer starts, and no session opens until a record arrives. The first
 // file therefore opens when the ECU actually answers -- ~3-5 s -- rather than when a timer
 // says so. event_log's writer has always done SD fopen/fwrite/fsync from t=0 on the same
@@ -1717,9 +1717,9 @@ esp_err_t csv_logger_init(void)
         }
     }
 
-    // Hybrid design: the queue STORAGE lives in INTERNAL RAM, never PSRAM. auto_pid's
-    // decode hot path (autopid.c:170 -> csv_logger_record -> xQueueSend) copies each
-    // record into this storage from auto_pid's own task context. A flash-cache-disable
+    // Hybrid design: the queue STORAGE lives in INTERNAL RAM, never PSRAM. poll_log's
+    // decode hot path (csv_logger_record -> xQueueSend) copies each record into this
+    // storage from poll_log's own task context. A flash-cache-disable
     // window (NVS commit, OTA, SD/SPI op) makes any PSRAM access from that context
     // fault; internal RAM is always reachable. ~22 KB at 256 deep -- the burst buffer
     // that lets us keep full decode-rate logging without dropping samples.

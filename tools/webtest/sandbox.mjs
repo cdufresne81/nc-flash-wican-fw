@@ -81,6 +81,61 @@ function realPageIds() {
     return ids;
 }
 
+// The page's <select>s with their static <option>s, and the first id carrying each class, so
+// strictDom can answer the two things Load() and postConfig() actually rely on:
+//  - Load() sets a select by selectedIndex and postConfig() reads it back by .value. A plain stub
+//    keeps the two unrelated, so a config that loaded "ble_status: enable" would Submit "" -- and a
+//    test of the load -> Submit round trip would be checking the stub, not the page.
+//  - Load() ends with document.querySelector(".store").disabled = true. Returning null there (the
+//    permissive default) makes every config load throw on its last line.
+function realPageSelectsAndClasses() {
+    const html = readFileSync(join(REPO, 'main', 'web', 'homepage_full.html'), 'utf8');
+    const selects = new Map();
+    for (const m of html.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+        const id = /\bid=["']([^"']+)["']/.exec(m[1]);
+        if (!id) continue;
+        const options = [...m[2].matchAll(/<option\b([^>]*)>([\s\S]*?)<\/option>/g)].map(o => {
+            const v = /\bvalue=["']([^"']*)["']/.exec(o[1]);
+            return { value: v ? v[1] : o[2].trim(), text: o[2].trim(), selected: /\bselected\b/.test(o[1]) };
+        });
+        selects.set(id[1], options);
+    }
+    const classIds = new Map();
+    for (const m of html.matchAll(/<[a-zA-Z][^>]*>/g)) {
+        const id = /\bid=["']([^"']+)["']/.exec(m[0]);
+        const cls = /\bclass=["']([^"']+)["']/.exec(m[0]);
+        if (!id || !cls) continue;
+        for (const c of cls[1].split(/\s+/)) if (c && !classIds.has(c)) classIds.set(c, id[1]);
+    }
+    return { selects, classIds };
+}
+
+// A <select> whose value and selectedIndex move together, as in a browser: setting a value no
+// option carries leaves it at "" (selectedIndex -1), not at the string that was assigned. A select
+// the HTML gives no static options (the time-zone list, filled by main.js at run time) gets an
+// empty options list and a free-form value, because this stub's appendChild does not add options.
+function selectElement(options) {
+    const el = stubElement();
+    el.options = options.map(o => ({ value: o.value, text: o.text }));
+    if (!options.length) return el;
+    let idx = options.findIndex(o => o.selected);
+    if (idx < 0) idx = 0;
+    Object.defineProperty(el, 'selectedIndex', {
+        enumerable: true,
+        get: () => idx,
+        set(v) {
+            const n = Number(v);
+            idx = (Number.isInteger(n) && n >= 0 && n < el.options.length) ? n : -1;
+        },
+    });
+    Object.defineProperty(el, 'value', {
+        enumerable: true,
+        get: () => (idx >= 0 ? el.options[idx].value : ''),
+        set(v) { idx = el.options.findIndex(o => o.value === String(v)); },
+    });
+    return el;
+}
+
 /**
  * Evaluate main.js and return { exports, missing, context }.
  *  - exports: the EXPORTS above that resolved, by name
@@ -97,6 +152,7 @@ export function loadMainJs({ strictDom = false } = {}) {
     // for every id, which is fine for the pure round-trip tests but cannot catch a DOM
     // element that was deleted from the HTML while main.js still looks it up.
     const knownIds = strictDom ? realPageIds() : null;
+    const page = strictDom ? realPageSelectsAndClasses() : null;
 
     const elCache = new Map();
     const documentStub = {
@@ -105,10 +161,27 @@ export function loadMainJs({ strictDom = false } = {}) {
         // and a null there aborts the whole load.
         getElementById(id) {
             if (knownIds && !knownIds.has(id)) return null;
-            if (!elCache.has(id)) elCache.set(id, stubElement());
+            if (!elCache.has(id)) {
+                const opts = page && page.selects.get(id);
+                elCache.set(id, opts ? selectElement(opts) : stubElement());
+            }
             return elCache.get(id);
         },
-        querySelector: () => null,
+        // strictDom answers the two simple selector shapes, "#id" and ".class"; anything else is
+        // null, as in the permissive default. ".class" is an approximation: it returns the first
+        // element that has an id AND the class (the stub can only hand out elements by id), where
+        // a browser returns the first element with the class, id or not. Exact while the page's
+        // only queried class, .store, sits on a single element (#custom_pid_store).
+        querySelector(sel) {
+            if (!page) return null;
+            let m = /^#([\w-]+)$/.exec(sel);
+            if (m) return documentStub.getElementById(m[1]);
+            m = /^\.([\w-]+)$/.exec(sel);
+            if (m && page.classIds.has(m[1])) {
+                return documentStub.getElementById(page.classIds.get(m[1]));
+            }
+            return null;
+        },
         querySelectorAll: () => [],
         createElement: () => stubElement(),
         createTextNode: () => ({}),
@@ -135,10 +208,11 @@ export function loadMainJs({ strictDom = false } = {}) {
         //
         // ⚠️ An unref'd timer does NOT keep node alive, so a future strictDom test that AWAITS
         // a timer can see the process exit before the callback runs and pass for the wrong
-        // reason. Today's strictDom tests are all synchronous, so this cannot bite yet. If you
-        // write one that waits on a timeout, hold the process open yourself rather than
-        // removing the unref. Note requestAnimationFrame below closes over Node's real
-        // setTimeout, not this wrapper, so rAF timers are never unref'd (harmless at 0 ms).
+        // reason. config_contract.test.mjs awaits postConfig(), which waits on timers, so it
+        // replaces context.setTimeout with a ref'd 0 ms one; do the same in any test that
+        // waits on a timeout, rather than removing the unref. Note requestAnimationFrame below
+        // closes over Node's real setTimeout, not this wrapper, so rAF timers are never unref'd
+        // (harmless at 0 ms).
         setTimeout: strictDom
             ? (fn, ms, ...a) => { const t = setTimeout(fn, ms, ...a); t.unref?.(); return t; }
             : setTimeout,

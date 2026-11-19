@@ -24,16 +24,10 @@ both spell this out.
 
 ### Do not try to "fix" the device by editing `protocol`, `port` or `port_type`
 
-Those three keys are still written into `config.json`, at fixed values (`poll_log`, `35000`,
-`tcp`). **They do nothing on this firmware.** The parser does not read them and no code looks them
-up. They are written for exactly one reason: if this device is ever rolled back to v1.22.x or
-older, that older parser *requires* all three, and a missing required key makes it delete
-`config.json` and factory-reset the device — Wi-Fi credentials gone, device off the owner's
-network. Keeping the words there means a rollback is survivable.
-
-A downloaded backup also carries a `_deprecated` note saying the same thing. Both halves of this
-shim — the reply side in `main/config_server.c` and `PASSTHROUGH_KEYS` in `main/web/src/main.js` —
-are scheduled for deletion in v1.25.0, together.
+**Those keys do nothing on this firmware.** The parser does not read them and no code looks them
+up; an old `config.json` that still carries them loads fine. The rollback shim that used to keep
+writing them (so a v1.22.x-or-older build could still read the file) was deleted in #148, so a
+config saved on this firmware no longer carries them.
 
 Editing any of them changes nothing. If the device is not recording, the cause is below.
 
@@ -253,7 +247,7 @@ field. A forced-off writer clears itself once the ignition goes off.
 | Thing | File |
 |---|---|
 | One mode, compiled in; what bring-up starts | `main/main.c` |
-| The deprecated-key shim, the status report, the upload endpoint | `main/config_server.c` |
+| The status report, the upload endpoint | `main/config_server.c` |
 | The park and claim leases, the flags every producer parks on, the sleep fence | `main/can.c`, `main/can.h` |
 | The reaper: when a park or claim may be lifted automatically | `main/datalog_lease_task.c` |
 | The pause/resume endpoint and the remembered logging mode | `components/csv_logger/csv_logger.c` |

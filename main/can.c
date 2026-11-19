@@ -894,7 +894,6 @@ esp_err_t can_receive_nb(twai_message_t *message)
  * so a blanket reject would deadlock the flash. Single-ownership is therefore enforced at
  * each TX PRODUCER, which must park/skip while the bus is reserved:
  *   - poll_log polllog_rx_task ........ parks on can_should_park()   (poll_log.c)
- *   - AutoPID autopid_task ............ parks on can_should_park()   (autopid.c)
  *   - MQTT can/rx command handler ..... skips if can_flash_active()  (mqtt.c)
  *   - SLCAN/ELM327 ................. serialized: they run INLINE on can_tx_task, which
  *                                       is blocked inside the codec for the whole flash.

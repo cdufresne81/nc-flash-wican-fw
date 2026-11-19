@@ -1,0 +1,126 @@
+{
+  "format": "nc-flash-1",
+  "initialisation": "ATSP6;ATSH7E0;",
+  "car_model": "Mazda: MX-5 NC",
+  "ecu_protocol": "6",
+  "disable_on_sleep_voltage": "automate_threshold",
+  "pid_polling_min_voltage": "13.1",
+  "cycle": 5000,
+  "pid_validation": true,
+  "standard_pids": "enable",
+  "car_specific": "disable",
+  "pids": [
+    {
+      "Name": "RPM",
+      "Mode": "01",
+      "PID": "010C1",
+      "Expression": "((B3*256)+B4)/4",
+      "Unit": "rpm",
+      "Class": "none",
+      "MinValue": "0",
+      "MaxValue": "9000",
+      "Period": "200",
+      "sensor_type": "sensor",
+      "header": "7E8",
+      "Init": "ATSH7E0;",
+      "enabled": true,
+      "description": "Engine speed"
+    },
+    {
+      "Name": "KNOCKR",
+      "Mode": "22",
+      "PID": "2210741",
+      "Expression": "B4/2",
+      "Unit": "deg",
+      "class": "temperature",
+      "MinValue": "",
+      "MaxValue": "",
+      "Period": 1000,
+      "sensor_type": "binary",
+      "header": null,
+      "SampleEvery": "4",
+      "enabled": false,
+      "comment": "hand-edited"
+    },
+    {
+      "Name": "AAT",
+      "PID": "01461",
+      "Expression": "B3-40",
+      "Unit": "C",
+      "Class": "",
+      "MinValue": -40,
+      "MaxValue": 215,
+      "Period": "",
+      "SampleEvery": 16,
+      "enabled": true
+    }
+  ],
+  "std_pids": [
+    {
+      "Name": "0C-EngineRPM",
+      "Period": "1000",
+      "sensor_type": "sensor",
+      "ReceiveHeader": "7E8",
+      "class": "none",
+      "SampleEvery": "2",
+      "enabled": true
+    },
+    {
+      "Name": "0D-VehicleSpeed",
+      "Period": 500,
+      "sensor_type": "sensor",
+      "header": "7E8",
+      "Class": "speed",
+      "enabled": false
+    }
+  ],
+  "can_filters": [
+    {
+      "frame_id": 513,
+      "parameters": [
+        {
+          "name": "SPEED",
+          "expression": "((B0*256)+B1)/100",
+          "unit": "km/h",
+          "class": "speed",
+          "period": "5000",
+          "sensor_type": "sensor",
+          "type": "sensor",
+          "min": "0",
+          "max": "300",
+          "enabled": true,
+          "description": "wheel speed"
+        },
+        {
+          "name": "BRAKE",
+          "expression": "B2&1",
+          "unit": "",
+          "class": "",
+          "period": 100,
+          "sensor_type": "binary",
+          "min": "",
+          "max": "",
+          "enabled": false
+        }
+      ]
+    },
+    {
+      "frame_id": "0x18DAF110",
+      "parameters": [
+        {
+          "name": "XID",
+          "expression": "B0",
+          "unit": "",
+          "class": "none",
+          "period": "",
+          "min": "",
+          "max": ""
+        }
+      ]
+    }
+  ],
+  "calculated": [
+    { "name": "BOOST", "expression": "(MAP-BARO)*0.145038", "unit": "PSI", "class": "pressure", "period": "1000", "enabled": true },
+    { "name": "AFR", "expression": "EQ_RATIO_ACT*14.71", "unit": "", "sensor_type": "sensor", "enabled": false }
+  ]
+}

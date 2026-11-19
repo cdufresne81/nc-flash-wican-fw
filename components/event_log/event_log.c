@@ -56,7 +56,7 @@ static const char *TAG = "event_log";
 #define EVENT_LOG_WAKE_MS      1000         // writer wakes at least this often (also a flush tick)
 #define EVENT_LOG_GUARD_STABLE_US (15 * 1000 * 1000)
 
-// Distinct RTC_NOINIT crash-guard magic (NOT csv 0xA11C0DE5 / poll_log 0x9011106D / fast_log 0xFA571A6D).
+// Distinct RTC_NOINIT crash-guard magic (NOT csv 0xA11C0DE5 / poll_log 0x9011106D).
 #define EVENT_LOG_GUARD_MAGIC  0xE7106A11u
 RTC_NOINIT_ATTR static uint32_t s_evl_guard;
 
@@ -463,7 +463,7 @@ void event_log_init(void)
     // never boot-loop the device. The in-RAM ring still records everything; self-recovers next boot.
     if (s_evl_guard == EVENT_LOG_GUARD_MAGIC)
     {
-        /* DISARM HERE, exactly as poll_log.c and fast_log.c do. The "self-recovers next boot"
+        /* DISARM HERE, exactly as poll_log.c does. The "self-recovers next boot"
          * promise above is only true because of this line: the guard's other clear point is the
          * writer task after 15 s of stability, and on a skip boot that task never starts. Leave
          * it armed and one crash inside the 15 s window costs SD event persistence permanently --

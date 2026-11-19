@@ -27,9 +27,9 @@
  * turnaround so we can size batching (mode-01 multi-PID / UDS multi-DID) against measured data
  * instead of an estimate.
  *
- * Difference from fast_log (Phase A): fast_log is LISTEN_ONLY (passive broadcast). poll_log is
- * NORMAL / on-bus -- it TRANSMITS diagnostic read requests (the same non-intrusive reads every
- * scan tool issues). It is a sibling mode; broadcast sniffing is unchanged and still available.
+ * poll_log is NORMAL / on-bus, not LISTEN_ONLY -- it TRANSMITS diagnostic read requests (the same
+ * non-intrusive reads every scan tool issues) and decodes broadcast frames on the side. (Its
+ * passive-only predecessor, fast_log, was deleted in #148; this folder still carries its name.)
  *
  * Pure poll-only: this mode does NOT decode broadcast frames (it discards them while waiting for
  * the response). The broadcast channels (RPM/VSS/ECT...) therefore stay empty in the CSV here --
@@ -42,7 +42,7 @@
  * CAN_ENABLE_BIT / can_block() teardown fence quiesces us during an OTA-upload or sleep can_disable().
  *
  * Teardown safety: can_receive_nb() cannot block (it takes no timeout) and every can_send() uses
- * timeout 0, exactly like fast_log. A blocking receive/transmit could be parked inside the driver
+ * timeout 0. A blocking receive/transmit could be parked inside the driver
  * when an OTA/sleep can_disable() runs can_block() (clears CAN_ENABLE_BIT, ~1 ms, then
  * twai_driver_uninstall()) -> PANIC. Timeout 0 returns at once so the next can.c call parks on
  * CAN_ENABLE_BIT instead of inside the driver.
@@ -74,10 +74,8 @@
 #include "event_log.h"
 #include "config_server.h"
 #include "expression_parser.h"
-/* Battery voltage for the recording gate (fast_log already REQUIRES main). NOTE: sleep_mode.h
- * declares sleep_mode_get_voltage() TWICE behind #if HARDWARE_VER -- esp_err_t on WICAN_PRO, but
- * int8_t (1 on success) on the older targets. The `== ESP_OK` test below is right for the PRO
- * build this product ships; it would need revisiting if an older target is ever revived. */
+/* Battery voltage for the recording gate (this component already REQUIRES main).
+ * sleep_mode_get_voltage() returns esp_err_t, hence the `== ESP_OK` tests below. */
 #include "sleep_mode.h"
 #include "vehicle.h"        /* VEHICLE_IGN_HYSTERESIS_V -- shared with the CSV ignition gate */
 
@@ -279,7 +277,7 @@ _Static_assert(POLLLOG_WATCH_SWEEP_MS <= 2000,
 #define POLLLOG_BCAST_PERIOD_MS  WICAN_LOG_MIN_PERIOD_MS
 
 /* ---- Independent one-shot RTC crash-guard ------------------------------- */
-/* Distinct magic from fast_log (0xFA571A6D) and the CSV logger (0xA11C0DE5). If a prior boot
+/* Distinct magic from the CSV logger (0xA11C0DE5). If a prior boot
  * armed this and never cleared it (a crash during POLL_LOG bring-up), skip POLL_LOG for one boot
  * so a startup fault self-recovers instead of boot-looping. Recovery (safe-mode/AP/OTA) runs
  * upstream of poll_log_init() and is unaffected either way. */
@@ -804,9 +802,9 @@ static void polllog_eval_gate(int64_t now_us)
 #if POLLLOG_HYBRID
 /*
  * Hybrid: decode one drained NON-response frame against the configured broadcast filters and push
- * any matches to the wide CSV with source "CANFLT". Mirror of fast_log's fastlog_decode_frame(),
- * keyed to poll_log's own s_cfg. parameter_t.timer is repurposed as a per-channel throttle (the
- * AutoPID task isn't running in POLL_LOG, so that field is otherwise unused). Takes the same brief
+ * any matches to the wide CSV with source "CANFLT".
+ * Keyed to poll_log's own s_cfg. parameter_t.timer is repurposed as a per-channel throttle (that
+ * field is otherwise unused). Takes the same brief
  * autopid_lock as the response decode; never nested (a frame is EITHER our response OR broadcast).
  * A stale 0x7E8 response frame matches no can_filter, so it is correctly ignored here.
  */
@@ -816,8 +814,7 @@ static void polllog_decode_broadcast(const twai_message_t *msg)
         return;
     /* Try-lock (0): broadcast decode is opportunistic -- the next frame is ~20 ms away, so
      * skipping under contention is free. A blocking wait here would multiply per drained frame
-     * inside the pre-send drain loop: an HTTP Test-PID/Test-filter handler holds this lock for
-     * seconds, and at real bus rates that would stall ALL polling for the whole hold. */
+     * inside the pre-send drain loop, and at real bus rates that would stall ALL polling. */
     if (!autopid_lock(0))
         return;
 
@@ -2048,7 +2045,7 @@ void poll_log_init(char *id, uint32_t log_period)
 #endif
 
     /* ---- Bring up native TWAI in NORMAL/on-bus mode (poll_log TRANSMITS) --- */
-    /* can_set_silent(0) = NORMAL: unlike fast_log's LISTEN_ONLY, we must be on-bus to send
+    /* can_set_silent(0) = NORMAL, not LISTEN_ONLY: we must be on-bus to send
      * requests and to ACK the PCM's responses. Must precede can_enable() (no-op while ON_BUS). */
     can_set_silent(0);
     int rate = config_server_get_can_rate();
@@ -2099,7 +2096,7 @@ void poll_log_init(char *id, uint32_t log_period)
 
     /* Live per-row Test under POLL_LOG (issue #41): expose our in-band one-shot executor to the
      * /autopid/test_pid and /autopid/test_can_filter handlers via the autopid registry -- no
-     * reverse fast_log dependency, same registration pattern as the two calls above. */
+     * reverse dependency on this component, same registration pattern as the two calls above. */
     autopid_set_live_test_fn(polllog_live_test_entry);
 
     ESP_LOGI(TAG, "Phase B (measure-first) up: %lu polled PID(s), NORMAL/on-bus, single-PID round-robin",
@@ -2223,7 +2220,7 @@ uint32_t poll_log_bus_idle_ms(void)
 
 /*
  * Build the WiFi-visible poll status as a small JSON object (caller free()s). Hand-rolled with
- * snprintf so the fast_log component needs no cJSON/json dependency. ok/timeout/txfail are
+ * snprintf so this component needs no cJSON/json dependency. ok/timeout/txfail are
  * cumulative since the task started; rtt_* and req_s are the last 3 s window; win_* is that
  * window's poll counts. Returns "active":false with zeroed fields when POLL_LOG never ran, so
  * the endpoint is safe to call in any protocol mode.
@@ -2315,7 +2312,7 @@ char *poll_log_get_status_json(void)
  * store_auto_data_handler after it writes the new auto_pid.json. Sets a flag ONLY; the
  * actual re-parse + swap runs on the poll task at its top-of-loop safe point. s_active
  * doubles as the mode guard: it is only true while POLL_LOG's task is running, so
- * non-POLL_LOG modes (AUTO_PID/FAST_LOG) return false and the handler answers
+ * otherwise this returns false and the handler answers
  * "reboot-required" -- the only correct answer when this task isn't the one owning the
  * table. Returns true if the reload was queued. */
 bool poll_log_request_reload(void)

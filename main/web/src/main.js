@@ -1408,9 +1408,9 @@ function addCustomCanFilterEntry(rowData = {}) {
                     <td>Unit:</td>
                     <td><input type="text" class="unit-input" value="${safe(p.unit)}" placeholder="Unit"></td>
                 </tr>
-                <!-- Class + Period hidden here too: only the Legacy AutoPID ATMA monitor
-                     (process_can_filter_frame) honors a filter parameter's period; poll_log
-                     and fast_log decode broadcasts with their own fixed throttles. Inputs
+                <!-- Class + Period hidden here too: the firmware no longer parses either
+                     (the Legacy AutoPID ATMA monitor that honored period was deleted in #148);
+                     poll_log decodes broadcasts with its own fixed throttle. Inputs
                      stay in the DOM for the auto_pid.json round-trip. -->
                 <tr style="display:none">
                     <td>Class:</td>
@@ -3055,11 +3055,8 @@ function getElements() {
         bleStatus: document.getElementById("ble_status"),
         apAutoDisable: document.getElementById("ap_auto_disable"),
         bleWarningDiv: document.getElementById("ble_warning_div"),
-        battAlert: document.getElementById("batt_alert"),
-        battAlertDiv: document.getElementById("batt_alert_div"),
         submitButton: document.getElementById("submit_button"),
         apPassValue: document.getElementById("ap_pass_value"),
-        battAlertPort: document.getElementById("batt_alert_port"),
         blePassValue: document.getElementById("ble_pass_value"),
         sleepVolt: document.getElementById("sleep_volt"),
         sleepStatus: document.getElementById("sleep_status"),
@@ -3072,12 +3069,6 @@ function getElements() {
 function validateLength(value, min, max, fieldName) {
     const length = value.length;
     return length >= min && length <= max;
-}
-
-// Helper function to validate port number
-function validatePort(value) {
-    const port = parseInt(value);
-    return port >= 1 && port <= 65535;
 }
 
 // Helper function to disable submit button with error message
@@ -3100,12 +3091,6 @@ function submit_enable() {
     // Validate form and enable/disable submit button
     const isValid = validateForm(elements, wifiMode);
     elements.submitButton.disabled = !isValid;
-
-    // Configure sleep and battery alert settings
-    configureSleepSettings(elements);
-    
-    // Configure MQTT and battery alert visibility
-    configureMqttAndBatteryAlerts(elements);
 }
 
 function configureWifiModeSettings(elements, wifiMode) {
@@ -3142,15 +3127,6 @@ function handleBleStatus(elements) {
     elements.bleWarningDiv.style.display = isBleEnabled ? "block" : "none";
     // Enable BLE passkey input only when BLE is enabled
     elements.blePassValue.disabled = !isBleEnabled;
-    
-    if (isBleEnabled && !window.bleAlertShown) {
-        elements.battAlert.value = "disable";
-        elements.battAlertDiv.style.display = "none";
-        elements.battAlert.disabled = true;
-        window.bleAlertShown = true;
-    } else if (!isBleEnabled) {
-        elements.battAlert.disabled = true;
-    }
 }
 
 function validateForm(elements, wifiMode) {
@@ -3181,11 +3157,6 @@ function validateForm(elements, wifiMode) {
     }
 
     
-    // Port validation
-    if (!validatePort(elements.battAlertPort.value)) {
-        return disableSubmitWithError("Battery Alert Port value, min=1 max=65535", 5000);
-    }
-    
     // BLE passkey validation - only validate if BLE is enabled
     const isBleEnabled = elements.bleStatus.value === "enable";
     if (isBleEnabled) {
@@ -3211,25 +3182,6 @@ function validateForm(elements, wifiMode) {
     }
     
     return true;
-}
-
-function configureSleepSettings(elements) {
-    const sleepEnabled = elements.sleepStatus.value === "enable";
-    const bleEnabled = elements.bleStatus.value === "enable";
-    
-    if (sleepEnabled) {
-        if (!bleEnabled) {
-            elements.battAlert.disabled = true;
-        }
-    } else {
-        elements.battAlert.disabled = true;
-        elements.battAlert.selectedIndex = 0;
-    }
-}
-
-function configureMqttAndBatteryAlerts(elements) {
-    // Battery alert div is always hidden in current logic
-    elements.battAlertDiv.style.display = "none";
 }
 
 document.getElementById("defaultOpen").click();
@@ -3279,11 +3231,6 @@ function checkStatus() {
             document.getElementById("apconfig_warning_div").style.display = "none";
         }
         document.getElementById("batt_voltage").innerHTML = obj.batt_voltage;
-        if(document.getElementById("batt_alert").value == "enable") {
-            document.getElementById("batt_alert_div").style.display = "none";
-        } else if(document.getElementById("batt_alert").value == "disable") {
-            document.getElementById("batt_alert_div").style.display = "none";
-        }
         document.getElementById("obd_chip_status").innerHTML = obj.obd_chip_status || "N/A";
         document.getElementById("uptime").innerHTML = obj.uptime || "N/A";
         const restartLastResetEl = document.getElementById("restart_last_reset_reason");
@@ -3421,30 +3368,11 @@ async function postConfig() {
     obj["sleep_status"] = document.getElementById("sleep_status").value;
     obj["can_wake"] = document.getElementById("can_wake").value;
     obj["sleep_disable_agree"] = document.getElementById("sleep_disable_agree").value;
-    obj["periodic_wakeup"] = document.getElementById("periodic_wakeup").value;
     obj["sleep_volt"] = document.getElementById("sleep_volt").value;
     obj["engine_volt"] = document.getElementById("engine_volt").value;
     obj["sleep_time"] = document.getElementById("sleep_time").value;
-    obj["wakeup_interval"] = document.getElementById("wakeup_interval").value;
-    obj["batt_alert"] = document.getElementById("batt_alert").value;
-    obj["batt_alert_ssid"] = document.getElementById("batt_alert_ssid").value;
-    obj["batt_alert_pass"] = document.getElementById("batt_alert_pass").value;
-    obj["batt_alert_volt"] = document.getElementById("batt_alert_volt").value;
-    obj["batt_alert_protocol"] = document.getElementById("batt_alert_protocol").value;
-    let mqtt_txt = "mqtt://";
-    let mqtt_url_val = mqtt_txt.concat(document.getElementById("batt_alert_url").value);
-    obj["batt_alert_url"] = mqtt_url_val;
-    obj["batt_alert_port"] = document.getElementById("batt_alert_port").value;
-    obj["batt_alert_topic"] = document.getElementById("batt_alert_topic").value;
-    obj["batt_alert_time"] = document.getElementById("batt_alert_time").value;
-    obj["batt_mqtt_user"] = document.getElementById("batt_mqtt_user").value;
-    obj["batt_mqtt_pass"] = document.getElementById("batt_mqtt_pass").value;
     applyLoggerXor();   // compose the real csv_log key from the master widget
     obj["csv_log"] = document.getElementById("csv_log").value;
-    // Single-option selects removed from the UI (SD card / FATFS are the only
-    // supported values) -- send the constants the firmware expects.
-    obj["log_filesystem"] = "fatfs";
-    obj["log_storage"] = "sdcard";
     // csv_grid_mode retired with the Event grid mode (issue #53) -- deliberately NOT sent,
     // so the key disappears from config.json on the first Submit after the update.
     // "auto" (issue #23): the grid tracks the measured polling sweep instead of a fixed Hz.
@@ -3920,34 +3848,22 @@ async function uploadCfg() {
 
 // Config keys with no UI after the streamline: captured from /load_config in Load(),
 // re-sent verbatim by postConfig() so config-file edits survive a Submit. Every entry
-// below is pre-seeded, so the form sends it even when /load_config omits it -- which is
-// not hypothetical: a device running a build older than the v1.25.0 shim replies without
-// the three deprecated keys, and capture-only would silently drop them from the file.
+// below is pre-seeded, so the form sends it even when /load_config omits it.
 // Of these, only can_datarate and can_mode are mandatory to THIS firmware's parser
 // (config_server.c, both `goto config_error` when absent); log_period and imu_threshold
-// fall back to defaults, and the three deprecated keys are ignored entirely -- see the
-// comment on them below for why they are sent anyway.
+// fall back to defaults.
 // The home_*/drive_* SmartConnect keys are optional and captured only when present.
 var loadedPassthrough = {
     can_datarate: "500K",   // NC platform is always 500K
     can_mode: "normal",
     imu_threshold: "8",     // IMU only feeds the removed SmartConnect logic
     log_period: "10",       // datalog period (no UI element after the trim)
-    // DEPRECATED, delete together with the /load_config shim in v1.25.0 (config_server.c,
-    // load_config_handler). This firmware ignores all three. They are re-sent so config.json
-    // keeps them, because a firmware older than v1.23.0 hard-requires them and FACTORY-RESETS
-    // the device (owner's Wi-Fi gone) when one is missing. The shim only puts them in the
-    // /load_config reply; these entries are what puts them back in the file on Submit.
-    protocol: "poll_log",   // must match the shim's values exactly
-    port: "35000",
-    port_type: "tcp",
 };
 // "debug" (#98): has no UI element, so without it here every Submit rewrote config.json without
 // the key and silently turned debug logging back off. That was invisible while the flag only
 // controlled serial output nobody can read on this device; it now also gates the event log's
 // detail-only lines, so a Submit mid-debugging-session would quietly end the session.
 var PASSTHROUGH_KEYS = ["can_datarate", "can_mode", "imu_threshold", "log_period", "debug",
-    "protocol", "port", "port_type",   // DEPRECATED rollback shim, see loadedPassthrough above
     "home_ssid", "home_password", "home_security", "home_protocol",
     "drive_ssid", "drive_password", "drive_security", "drive_protocol",
     "drive_connection_type", "drive_mode_timeout"];
@@ -4135,27 +4051,6 @@ xhttp.onload = async function() {
             document.getElementById("sleep_disable_agree").selectedIndex = "0";
         }
         toggleSleepWarning();
-        // Pinned, not mirrored: periodic wakeup is retired and the firmware force-disables
-        // the key in the config parser. A legacy config.json may still say "enable" (
-        // /load_config streams the raw file), so ignore it and post "disable" back.
-        document.getElementById("periodic_wakeup").value = "disable";
-
-        document.getElementById("batt_mqtt_user").value = obj.batt_mqtt_user;
-        document.getElementById("batt_mqtt_pass").value = obj.batt_mqtt_pass;
-        if(obj.batt_alert_time == "1") {
-            document.getElementById("batt_alert_time").selectedIndex = "0";
-        } else if(obj.batt_alert_time == "6") {
-            document.getElementById("batt_alert_time").selectedIndex = "1";
-        } else if(obj.batt_alert_time == "12") {
-            document.getElementById("batt_alert_time").selectedIndex = "2";
-        } else if(obj.batt_alert_time == "24") {
-            document.getElementById("batt_alert_time").selectedIndex = "3";
-        }
-        if(document.getElementById("batt_alert").value == "enable") {
-            document.getElementById("batt_alert_div").style.display = "none";
-        } else if(document.getElementById("batt_alert").value == "disable") {
-            document.getElementById("batt_alert_div").style.display = "none";
-        }
 
         // --- Restored settings population (regression fix: commit d372fc9 over-cut this block,
         //     causing every Submit to persist stock HTML defaults). MQTT-gateway lines intentionally
@@ -4193,16 +4088,6 @@ xhttp.onload = async function() {
         }
         document.getElementById("sleep_time").value = obj.sleep_time;
         document.getElementById('sleep_time_value').textContent = obj.sleep_time;
-        document.getElementById("wakeup_interval").value = obj.wakeup_interval;
-        document.getElementById('wakeup_interval_value').textContent = obj.wakeup_interval;
-        document.getElementById("batt_alert").value = "disable";
-        document.getElementById("batt_alert_ssid").value = obj.batt_alert_ssid;
-        document.getElementById("batt_alert_pass").value = obj.batt_alert_pass;
-        document.getElementById("batt_alert_volt").value = obj.batt_alert_volt;
-        document.getElementById("batt_alert_protocol").value = obj.batt_alert_protocol;
-        document.getElementById("batt_alert_url").value = obj.batt_alert_url.slice(7);
-        document.getElementById("batt_alert_port").value = obj.batt_alert_port;
-        document.getElementById("batt_alert_topic").value = obj.batt_alert_topic;
         loadautoPID();
 
         // Load fallback networks if present

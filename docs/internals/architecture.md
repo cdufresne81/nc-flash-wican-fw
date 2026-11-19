@@ -49,23 +49,22 @@ surprisingly hard to reconstruct from the source:
 | **Console** | The Field Console — live gauges for the polled channels; the Trip Recorder (Start Trip, Mark Event); Recent Trips; a tail of the Event Log |
 | **Files** | SD browser — new folder, download/delete selected, size/modified/type |
 | **Logger** | The **sensor set**: Polled PIDs, Broadcast PIDs, Calculated PIDs, plus Export/Import Sensors and the engine-gating and low-voltage-protection options |
-| **Settings** | Wi-Fi (AP mode, Station mode, Backup Networks, Scan), Sleep Mode, Battery Alert/MQTT, Time Zone |
+| **Settings** | Wi-Fi (AP mode, Station mode, Backup Networks, Scan), Sleep Mode, BLE, Time Zone |
 | **Status** | Live device status |
 | **System** | Firmware update (OTA) |
 | **About** | Version and links |
 
 > The **Logger** tab is the product. Everything else is either operating the
-> recorder (Console, Files), configuring the device (Settings, System), or
-> inherited (the Battery Alert/MQTT block).
+> recorder (Console, Files) or configuring the device (Settings, System).
 
-**Hidden UI is a much smaller story than issue #28 implies.** Of the 11 elements
-carrying `style="display:none"` in `homepage_full.html`, nine are ordinary
-conditional UI that `main.js` shows and hides at runtime (`ota_progress_row`,
+**Hidden UI is a much smaller story than issue #28 implies.** The elements
+carrying `style="display:none"` in `homepage_full.html` are ordinary conditional
+UI that `main.js` shows and hides at runtime (`ota_progress_row`,
 `csv_grid_hz_row`, `console_mark_btn`, `sleep_warning_div`, `wifi_networks_row`,
-`csv_require_engine_row`, `pid_polling_min_voltage_row`, and two file inputs).
-Only **two are permanently hidden** — `ble_section` (`:1522`) and
-`wakeup_every_row` (`:1334`) — with zero references anywhere in `main.js`. Those
-two are the real "hide, don't delete" residue.
+`csv_require_engine_row`, `pid_polling_min_voltage_row`, file inputs, …). The
+two that used to be permanently hidden are gone: `ble_section` was un-hidden
+when BLE came back (#159), and `wakeup_every_row` was deleted with periodic
+wake-up (#148). No "hide, don't delete" residue remains here.
 
 **Scope constraints that explain a lot of the design:**
 
@@ -197,8 +196,7 @@ components/                 15,318 lines
   sd_filemgr/               SD file browser endpoints             [fork]
   event_log/                operational event ring + SD writer    [fork]
   crash_report/             panic backtrace via RTC_NOINIT        [fork]
-  autopid/                  config parse + expression eval + CSV columns
-                            ... AND a legacy scheduler that never runs (§7)
+  autopid/                  config parse + expression eval + CSV columns (§7)
   restart_tracker/ cmdline/ wican_common/
 tools/
   build_web.py              homepage_full.html -> src/homepage.html
@@ -209,7 +207,7 @@ docs/internals/             you are here
 
 Largest files, because size predicts where the work is:
 `main.js` 4,359 · `config_server.c` 3,718 · `obd2_standard_pids.h` 3,654 ·
-`elm327.c` 3,353 · `autopid.c` 3,204 · `homepage_full.html` 1,846.
+`elm327.c` 3,353 · `homepage_full.html` 1,846.
 
 ---
 
@@ -341,13 +339,12 @@ yield-free prio-5 loop starves both IDLE and the CSV writer, which is why
 Two traps when adding a task:
 
 - **Priority 5 is crowded** — `can_rx`, `can_tx`, `obd_rx`, `smartconnect`,
-  `wifi_reconnect`, `uart_tx_task`, `uart_rx_task`, `autopid_task`,
+  `wifi_reconnect`, `uart_tx_task`, `uart_rx_task`,
   `config_mode_task` all sit there. Most are inert under `poll_log`, so the
   effective ladder is clean, but **the number 5 by itself tells you nothing
-  about importance.** (`adc_task` is *not* on this list: its only creation,
-  `sleep_mode.c:581`, is inside `#if HARDWARE_VER != WICAN_PRO` — compiled out,
-  not merely inert. The same dead half holds the MQTT client handle, which is
-  why the battery-alert feature cannot work on this board.)
+  about importance.** (`adc_task` is *not* on this list: it only ever existed in
+  the non-PRO half of `sleep_mode.c`, deleted in #148 together with the
+  battery-alert MQTT client it carried.)
 - **Stack depth is in *bytes*, and the in-code comments that say otherwise are
   wrong.** ESP-IDF documents `usStackDepth` / `ulStackDepth` as "the NUMBER OF
   BYTES. Note that this differs from vanilla FreeRTOS"
@@ -374,7 +371,7 @@ unless you evaluate the preprocessor.
 ```mermaid
 flowchart LR
     subgraph ESP["ESP32-S3"]
-        PL["poll_log · fast_log"]
+        PL["poll_log"]
         NCF["ncflash codecs · slcan_port"]
         TWAI["can.c → TWAI controller"]
         ELM["elm327.c (WICAN_PRO half)"]
@@ -429,21 +426,20 @@ fixed job.
 The live sensor table (`autopid_config` — the parsed `pids[]`, `can_filters[]`,
 calculated channels) is read by the poll task on every sweep and replaced
 wholesale by a live hot-reload. It is guarded by `s_autopid_mutex`, reached
-through `autopid_lock(timeout_ms)` / `autopid_unlock()` (`autopid.c:247`).
+through `autopid_lock(timeout_ms)` / `autopid_unlock()` (`autopid.c:59`).
 
 **The timeout is the contract, and callers pick it deliberately:**
 
 | Caller | Timeout | Why |
 |---|---|---|
-| `poll_log` broadcast decode | **0 (try-lock)** | a multi-second HTTP Test-PID lock hold must skip broadcast decode, never stall the sweep |
+| `poll_log` broadcast decode | **0 (try-lock)** | opportunistic: the next frame is ~20 ms away, so skipping under contention is free; a wait would stall the sweep |
 | calculated channels | 20 ms | once per sweep, on the hot path |
 | `/poll_status`-style readers | 100 ms | brief and bounded |
-| HTTP Test PID / Test CAN filter | 6000 ms | a human-initiated one-shot may legitimately wait |
 
 > **Do not "simplify" `autopid_lock(portMAX_DELAY)`.** It runs its argument
 > through `pdMS_TO_TICKS`, which *overflows* `portMAX_DELAY` into a finite
 > timeout. The swap-critical sites therefore take `s_autopid_mutex` directly
-> with `portMAX_DELAY` and say so (`autopid.c:344-348`).
+> with `portMAX_DELAY` and say so (`autopid.c:164-168`).
 
 The hot-reload path also re-checks `csv_logger_session_active()` **under** the
 mutex (issue #43): the safe-point check can pass, then the reload spends ~100 ms
@@ -524,44 +520,39 @@ flash. Either flag alone keeps every producer parked.
 overlap, and it is a common source of wrong assumptions. Its locking contract —
 which matters if you are planning the #28 split — is in §6.
 
-**It is two things in one directory:**
+**What it holds now** (the legacy ELM327-based scheduler, its ATMA broadcast
+monitor, the cached config JSON nothing served and the HTTP Test endpoints'
+ELM327 path were deleted in #148):
 
-| Still essential | Never runs |
-|---|---|
-| config parsing (`autopid_config.c`) — reads `auto_pid.json` into `pid_data_t` / `parameter_t` | `autopid_task` — the legacy ELM327-based scheduler |
-| the **calculated-channel** evaluator (`calc_evaluate`, `autopid.c:674`) | `process_can_filter_frame` — its ATMA broadcast monitor |
-| the CSV **column provider** (`autopid_collect_log_columns`) | `autopid_get_config()` JSON — built, cached, never served |
-| the HTTP Test-PID / Test-CAN-filter endpoints | |
+| Still essential |
+|---|
+| config parsing (`autopid_config.c`) — reads `auto_pid.json` into `pid_data_t` / `parameter_t` |
+| the **calculated-channel** evaluator (`calc_evaluate`, `autopid.c:487`) |
+| the CSV **column provider** (`autopid_collect_log_columns`) |
+| the HTTP Test-PID / Test-CAN-filter endpoints (they hand the test to `poll_log`) |
 
-The legacy half only executes when `protocol == auto_pid`. The device ships
-`poll_log`. So:
+So:
 
 > **Do not delete the `autopid` component.** `poll_log` and `csv_logger` depend
 > on its parser, its calculated-channel evaluator and its column provider. The
 > removal in issue #28 is a *split*, not a delete.
 
-The split already has a name in the code: **`autopid_load_config_only()`**
-(`autopid.c:2967`) loads the channel config, creates the mutex, registers the
-column provider and caches the JSON — and starts **no task and no ELM polling**.
-It is called from exactly two places, `poll_log.c:1249` and `fast_log.c:217`.
-That function *is* the boundary #28 should cut along: everything it touches is
-the keep side, `autopid_init()`'s extra work is the discard side. Verified: the
-task itself is created only at `autopid.c:3163`, reached solely via
-`autopid_init()`. **`main.c` no longer calls it at all**: the `protocol` config
-field was retired and the mode dispatch collapsed to the one datalogger arm, so
-the legacy AutoPID scheduler is now unreachable from boot. What remains of
+The entry point is **`autopid_load_config_only()`**: it loads the channel
+config, creates the mutex and registers the column provider, and starts **no
+task and no ELM polling**. It has exactly one caller, `poll_log.c` (the passive
+fast_log logger that also called it was deleted in #148). What remains of
 `components/autopid` is the table/expression side that `poll_log` uses.
 
 ### There are two expression evaluators, deliberately
 
-Worth knowing before you try to "unify" them — the comment at `autopid.c:507`
+Worth knowing before you try to "unify" them — the comment at `autopid.c:320`
 explains why that would be wrong:
 
 | | `evaluate_expression()` | `calc_evaluate()` |
 |---|---|---|
-| Lives in | `main/expression_parser.c` | `components/autopid/autopid.c:674` |
+| Lives in | `main/expression_parser.c` | `components/autopid/autopid.c:487` |
 | Operates on | **raw response bytes** — `B0`..`B7`, `S<n>`, `[Bx:By]`, `F<n>`, `V` | **decoded channel names** — `"MAP - BARO"`, `"EQ_RATIO * 14.64"` |
-| Used by | `poll_log.c:417`, `fast_log.c:133`, `autopid.c:1449`, both HTTP test endpoints | calculated channels only, once per sweep |
+| Used by | `poll_log.c:417` (which also runs both HTTP test endpoints' one-shots) | calculated channels only, once per sweep |
 | Shape | single-char sigils | recursive descent, `CALC_MAX_DEPTH` 32, allocation-free |
 
 They are not redundant: the byte evaluator *cannot lex multi-letter channel
@@ -571,7 +562,7 @@ decoded value, failing the whole expression when an input is missing so the
 column simply stays empty rather than logging a wrong number.
 
 > **Undocumented limitation:** a calculated channel **cannot reference another
-> calculated channel.** `calc_resolve_name()` (`autopid.c:533`) scans
+> calculated channel.** `calc_resolve_name()` (`autopid.c:346`) scans
 > `cfg->pids[]` and `cfg->can_filters[]` and then returns false — there is no
 > `cfg->calculated[]` loop. The reference silently fails, `calc_evaluate()`
 > returns false, and the column simply stays empty (LOCF) forever with no log
@@ -579,15 +570,15 @@ column simply stays empty rather than logging a wrong number.
 
 > **Footgun:** `evaluate_expression()` does **not** bounds-check `B0`..`B7`.
 > Every caller must hand it a full, zero-padded 8-byte buffer — `poll_log.c:417`
-> and `fast_log.c:112` both carry this warning at the call site. `Fn` (the
+> carries this warning at the call site. `Fn` (the
 > float32 token) is the one token that does bounds-check, because it consumes
 > four bytes.
 
 A concrete symptom of the split, and a good illustration of what dead code
 costs: `/check_status` reports `"ecu_status"`, derived from
 `autopid_get_ecu_status()` (`config_server.c:1506`), which reads
-`ECU_CONNECTED_BIT`. The only three writers of that bit
-(`autopid.c:2688`, `:2891`, `:2896`) all live inside `autopid_task`. Under
+`ECU_CONNECTED_BIT`. Every writer of that bit lived inside the legacy AutoPID
+scheduler (deleted in #148), and its event group is never created. Under
 `poll_log` nothing ever sets it, so **the field reports `"offline"` forever** —
 observed on the bench reading `offline` while `/poll_status` showed 468,488
 successful polls and zero timeouts. Nothing in the web UI reads the field, so
@@ -653,7 +644,7 @@ Two stores, two very different behaviours. Confusing them causes real damage.
 flowchart TB
     POST["POST /store_config"] --> SH["shadow = live device_config (memcpy)<br/><i>looks redundant — is not: padding</i>"]
     SH --> PARSE["parse JSON into shadow"]
-    PARSE --> PR["probe = live device_config,<br/>then copy in the 20 whitelisted fields<br/>from shadow"]
+    PARSE --> PR["probe = live device_config,<br/>then copy in the 11 whitelisted fields<br/>from shadow"]
     PR --> EQ{"memcmp(probe, shadow)"}
     EQ -->|"equal — only whitelisted keys changed"| LIVE["apply per-field, no reboot<br/>reply {reboot:false, applied:live}"]
     EQ -->|"differs"| RB["write config.json<br/>2 s restart timer<br/>reply {reboot:true}"]
@@ -661,14 +652,14 @@ flowchart TB
 
 **The reboot decision (issue #39), stated accurately.** `store_config_handler`
 does *not* always reboot. It seeds a `probe` copy from the live struct, memcpy's
-the 20 `LIVE_APPLY_WHITELIST` fields (`config_server.c:707-714`) in from the
+the 11 `LIVE_APPLY_WHITELIST` fields in from the
 parsed shadow, and `memcmp`s the two. If they match, only whitelisted fields
 changed, so it applies them in place and replies `{"reboot":false,
 "applied":"live"}`.
 
-But note **which** 20 fields: `led_blink`, then `home_*` / `drive_*` (10 keys —
-SmartConnect, not reachable from the UI) and `batt_alert_*` / `batt_mqtt_*`
-(9 keys — battery-alert MQTT, compiled out on this board). So in practice
+But note **which** 11 fields: `led_blink`, then `home_*` / `drive_*` (10 keys —
+SmartConnect, not reachable from the UI). The 9 battery-alert keys that used to
+be listed went with the feature in #148. So in practice
 **every config change a user can make through the shipped UI still reboots,
 except toggling the LED.** The live path is real, it is just aimed almost
 entirely at features this fork hides.
@@ -1026,10 +1017,6 @@ tracked rather than hidden:
 > SmartConnect (§15 Tier 1). A ledger whose citations no longer resolve stops
 > being trusted, which is how the debt it tracks becomes invisible. Fixing the
 > ledger is part of the cleanup, not a prerequisite to it.
-
-The same drift affects in-code comments: `autopid.c:396-397` asks the reader to
-keep the column provider in sync with call sites it cites as "~4007/4065" in a
-3,204-line file.
 
 Four plan documents at the repo root — `REFACTOR_PLAN.md`,
 `NC_DATALOGGER_PLAN.md`, `STREAM2_LOGGER_PLAN.md`, `LED_INDICATORS_GOAL.md` —

@@ -57,7 +57,7 @@ void elm327_init(response_callback_t rsp_callback, QueueHandle_t *rx_queue, void
  * chip's own sleep/wake voltage configuration queued by obd_init(). Never gate those. */
 void elm327_set_read_task_enabled(bool enabled);
 
-/* --- ELM327 clients (TCP 35000, BLE, the wired UART, the web page's Test-PID) -------------
+/* --- ELM327 clients (TCP 35000, BLE, the wired UART) ---------------------------------------
  * Every command is a CLIENT command unless the firmware queued it for its own chip
  * housekeeping with elm327_process_housekeeping_cmd() (obd.c: power-pin setup, sleep
  * configuration, the battery-voltage read). The distinction is made by WHO CALLED, not by what
@@ -111,11 +111,9 @@ esp_err_t elm327_update_obd(bool force_update);
 int8_t elm327_process_cmd(uint8_t *buf, uint8_t len, twai_message_t *frame, QueueHandle_t *q);
 #endif
 
-void elm327_run_command(char* command, uint32_t command_len, uint32_t timeout, QueueHandle_t *response_q, response_callback_t response_callback, bool stop_after_first_frame, uint32_t expected_frame_id);
 esp_err_t elm327_sleep(void);
 void elm327_lock(void);
 void elm327_send_cmd(uint8_t* cmd, uint32_t cmd_len);
-esp_err_t elm327_get_protocol_number(uint8_t *protocol_number);
 void elm327_hardreset_chip(void);
 
 /* Same hard reset, but the wait for the shared UART lock is bounded by the caller instead of the

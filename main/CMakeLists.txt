@@ -65,7 +65,6 @@ set(requires
     bt
     spiffs
     freertos
-    mqtt
     json
     wear_levelling
     esp_http_client

@@ -97,7 +97,7 @@ Details that matter:
 
 - **Throttle**: each broadcast channel records at most every `POLLLOG_BCAST_PERIOD_MS` (20 ms ≈ 50 Hz/ch). The otherwise-unused `parameter_t.timer` field is repurposed as the per-channel throttle timestamp.
 - **Gating mirrors the CSV column provider**: filters with `is_vehicle_specific` are skipped when `pid_specific_en` is off — otherwise records would arrive for channels the wide CSV has no column for.
-- **Locking**: the decode takes `autopid_lock(0)` as a *try-lock*. A multi-second HTTP Test-PID lock hold must skip broadcast decode, not stall polling.
+- **Locking**: the decode takes `autopid_lock(0)` as a *try-lock*. It is opportunistic: the next frame is ~20 ms away, so skipping under contention costs nothing, and a wait would stall the sweep.
 - **Why hybrid wins** (issue #23 discussion): a polled channel costs ~2.5 ms of sweep per sample plus ECU diag-task work; a broadcast channel is free — the PCM transmits it anyway. Migrating a channel from the poll list to a CAN filter shortens the sweep (speeding up all remaining polled channels), reduces ECU load, and the channel arrives at broadcast rate (≥ grid rate). Only channels with no broadcast source (Mode 22s, MAF, trims…) need polling.
 
 ## Per-PID sweep divisors (`SampleEvery`, issue #29)
@@ -119,7 +119,7 @@ Three bypasses skip the gate completely, and while bypassed the counters do **no
 
 ### The bus-withheld park
 
-`can_receive()` opens with an infinite wait on `CAN_ENABLE_BIT`. For elm327/fast_log/can_rx_task that is their OTA/sleep park and is correct; for poll_log it was a trap. The poll task carries the sleep veto (`poll_log_ecu_answering()`) and the recording gate, and a frozen task keeps publishing its **last** values — so a device with the bus disabled went on reporting a live ECU and an open gate forever, and the sleep veto stuck true means a parked car never sleeps: a flat battery in days. One stray SLCAN `C` on the always-on port 35001 is enough, from any TCP client, with no event-log trace.
+`can_receive()` opens with an infinite wait on `CAN_ENABLE_BIT`. For elm327/can_rx_task that is their OTA/sleep park and is correct; for poll_log it was a trap. The poll task carries the sleep veto (`poll_log_ecu_answering()`) and the recording gate, and a frozen task keeps publishing its **last** values — so a device with the bus disabled went on reporting a live ECU and an open gate forever, and the sleep veto stuck true means a parked car never sleeps: a flat battery in days. One stray SLCAN `C` on the always-on port 35001 is enough, from any TCP client, with no event-log trace.
 
 Two changes close it:
 

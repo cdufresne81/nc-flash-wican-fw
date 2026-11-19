@@ -61,7 +61,6 @@
 #include "elm327.h"
 #include "autopid.h"
 #include "csv_logger.h"
-#include "fast_log.h"
 #include "poll_log.h"
 #include "event_log.h"
 #include "wifi_diag.h"
@@ -131,7 +130,7 @@ static uint8_t protocol = OBD_ELM327;
  * this predicate was extracted during. The two must agree by construction, not by comment. */
 static inline bool protocol_feeds_elm327(uint8_t p)
 {
-	return (p == OBD_ELM327) || (p == AUTO_PID);
+	return (p == OBD_ELM327);
 }
 
 static uint8_t derived_mac_addr[6] = {0};
@@ -493,11 +492,11 @@ static void can_rx_task(void *pvParameters)
 
 		dev_status_wait_for_bits(DEV_AWAKE_BIT, portMAX_DELAY);
 
-		// FAST_LOG / POLL_LOG (Task #18) own the native TWAI controller exclusively: their
+		// POLL_LOG (Task #18) owns the native TWAI controller exclusively: its
 		// task is the SOLE twai_receive()/twai_transmit() consumer. If this task also drained
 		// the RX queue, TWAI would split/steal frames between the two (each frame goes to exactly
 		// one waiter) -- in POLL_LOG that would steal the PCM's diagnostic responses.
-		// Gate this task off entirely in those modes. MUST stay above the can_receive() loop.
+		// Gate this task off entirely in that mode. MUST stay above the can_receive() loop.
 		//
 		// No-reboot coexistence (task #36): a flash/read codec is also the SOLE TWAI consumer
 		// for its duration (it does its own can_receive). In coexist modes that DON'T gate this
@@ -506,7 +505,7 @@ static void can_rx_task(void *pvParameters)
 		// can_flash_active() so the codec stays sole TWAI owner while a flash holds the bus.
 		// No-reboot coexistence RX-forward (task #36): when a host coexist session has
 		// reserved the bus (a REST datalog pause OR a host bus-claim, and NO flash) the
-		// FAST_LOG/POLL_LOG task is NOT draining TWAI, so this task must take over as the
+		// POLL_LOG task is NOT draining TWAI, so this task must take over as the
 		// sole consumer and forward the ECU's reply frames to the dedicated port (35001)
 		// below. Keying on EITHER park or claim means a claim-without-pause (e.g. a future
 		// op=flash_begin) still hands TWAI here for forwarding. A flash/read codec
@@ -523,7 +522,7 @@ static void can_rx_task(void *pvParameters)
 		 * can_receive() still stamps the diagnostic-idle clock on the way through, which is the
 		 * only view can.c has of the chip's traffic. */
 		const bool ext_client_drain = can_ext_client_active() && !coexist_session && !can_flash_active();
-		if(((protocol == FAST_LOG || protocol == POLL_LOG) && !coexist_session && !ext_client_drain) || can_flash_active())
+		if((protocol == POLL_LOG && !coexist_session && !ext_client_drain) || can_flash_active())
 		{
 			vTaskDelay(pdMS_TO_TICKS(50));
 			continue;
