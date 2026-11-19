@@ -605,7 +605,6 @@ int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
  * path is now the only thing that can still hand these subsystems the reboot they are waiting
  * for. */
 #include "poll_log.h"
-#include "fast_log.h"
 #include "csv_logger.h"
 #include "datalog_session.h"   /* end an NC Flash logging session at sleep entry */
 
@@ -1264,7 +1263,6 @@ static bool sleep_mode_teardown(sleep_state_info_t *state_info, float battery_vo
 static bool sleep_mode_recovery_needed(void)
 {
     return poll_log_bringup_skipped()
-        || fast_log_bringup_skipped()
         || csv_logger_bringup_skipped()
         || event_log_bringup_skipped();
 }
@@ -1300,9 +1298,9 @@ static bool sleep_mode_resume(sleep_state_info_t *state_info, float battery_volt
     if(sleep_mode_recovery_needed())
     {
         ESP_LOGW(TAG, "resume: a subsystem is waiting on a boot to retry -- rebooting to repair it");
-        event_log_emit(EVL_INFO, "resume refused: bring-up guard set (poll_log %d fast_log %d "
+        event_log_emit(EVL_INFO, "resume refused: bring-up guard set (poll_log %d "
                                  "csv %d event_log %d) -- rebooting to repair",
-                       (int)poll_log_bringup_skipped(), (int)fast_log_bringup_skipped(),
+                       (int)poll_log_bringup_skipped(),
                        (int)csv_logger_bringup_skipped(), (int)event_log_bringup_skipped());
         return false;
     }

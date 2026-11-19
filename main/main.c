@@ -61,7 +61,6 @@
 #include "elm327.h"
 #include "autopid.h"
 #include "csv_logger.h"
-#include "fast_log.h"
 #include "poll_log.h"
 #include "event_log.h"
 #include "wifi_diag.h"

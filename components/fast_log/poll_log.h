@@ -26,7 +26,7 @@
  * 100 ms inter-poll delay. Single-PID round-robin -- the simplest correct poller -- so we
  * can measure the REAL per-request turnaround on the PCM before adding batching.
  *
- * Sibling to fast_log (passive broadcast). Selected via the "poll_log" protocol string.
+ * Selected via the "poll_log" protocol string.
  */
 void poll_log_init(char *id, uint32_t log_period);
 

@@ -92,7 +92,7 @@ calculated:
 
 | Omitted | Why it is dead under poll_log |
 |---|---|
-| `Period` (polled **and** broadcast) | only the legacy AutoPID scheduler gates on it — `process_can_filter_frame()` is called solely from `autopid_task`, and `fastlog_decode_frame()` is explicitly its equivalent *without* the period gate |
+| `Period` (polled **and** broadcast) | only the legacy AutoPID scheduler gates on it — `process_can_filter_frame()` is called solely from `autopid_task` |
 | `Class` | read only to build an MQTT/HA payload this fork never publishes (`autopid.c:1293`) |
 | `initialisation`, `ecu_protocol` | legacy ELM setup; poll_log hardcodes physical addressing (`POLLLOG_TX_ID` `0x7E0`) |
 | `standard_pids`, `std_pids` | the standard-PID path is unused and has no UI |

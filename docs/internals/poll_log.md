@@ -119,7 +119,7 @@ Three bypasses skip the gate completely, and while bypassed the counters do **no
 
 ### The bus-withheld park
 
-`can_receive()` opens with an infinite wait on `CAN_ENABLE_BIT`. For elm327/fast_log/can_rx_task that is their OTA/sleep park and is correct; for poll_log it was a trap. The poll task carries the sleep veto (`poll_log_ecu_answering()`) and the recording gate, and a frozen task keeps publishing its **last** values — so a device with the bus disabled went on reporting a live ECU and an open gate forever, and the sleep veto stuck true means a parked car never sleeps: a flat battery in days. One stray SLCAN `C` on the always-on port 35001 is enough, from any TCP client, with no event-log trace.
+`can_receive()` opens with an infinite wait on `CAN_ENABLE_BIT`. For elm327/can_rx_task that is their OTA/sleep park and is correct; for poll_log it was a trap. The poll task carries the sleep veto (`poll_log_ecu_answering()`) and the recording gate, and a frozen task keeps publishing its **last** values — so a device with the bus disabled went on reporting a live ECU and an open gate forever, and the sleep veto stuck true means a parked car never sleeps: a flat battery in days. One stray SLCAN `C` on the always-on port 35001 is enough, from any TCP client, with no event-log trace.
 
 Two changes close it:
 

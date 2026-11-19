@@ -374,7 +374,7 @@ unless you evaluate the preprocessor.
 ```mermaid
 flowchart LR
     subgraph ESP["ESP32-S3"]
-        PL["poll_log · fast_log"]
+        PL["poll_log"]
         NCF["ncflash codecs · slcan_port"]
         TWAI["can.c → TWAI controller"]
         ELM["elm327.c (WICAN_PRO half)"]
@@ -543,7 +543,7 @@ The legacy half only executes when `protocol == auto_pid`. The device ships
 The split already has a name in the code: **`autopid_load_config_only()`**
 (`autopid.c:2967`) loads the channel config, creates the mutex, registers the
 column provider and caches the JSON — and starts **no task and no ELM polling**.
-It is called from exactly two places, `poll_log.c:1249` and `fast_log.c:217`.
+It has exactly one caller, `poll_log.c` (the passive fast_log logger that also called it was deleted in #148).
 That function *is* the boundary #28 should cut along: everything it touches is
 the keep side, `autopid_init()`'s extra work is the discard side. Verified: the
 task itself is created only at `autopid.c:3163`, reached solely via
@@ -561,7 +561,7 @@ explains why that would be wrong:
 |---|---|---|
 | Lives in | `main/expression_parser.c` | `components/autopid/autopid.c:674` |
 | Operates on | **raw response bytes** — `B0`..`B7`, `S<n>`, `[Bx:By]`, `F<n>`, `V` | **decoded channel names** — `"MAP - BARO"`, `"EQ_RATIO * 14.64"` |
-| Used by | `poll_log.c:417`, `fast_log.c:133`, `autopid.c:1449`, both HTTP test endpoints | calculated channels only, once per sweep |
+| Used by | `poll_log.c:417`, `autopid.c:1449`, both HTTP test endpoints | calculated channels only, once per sweep |
 | Shape | single-char sigils | recursive descent, `CALC_MAX_DEPTH` 32, allocation-free |
 
 They are not redundant: the byte evaluator *cannot lex multi-letter channel
@@ -579,7 +579,7 @@ column simply stays empty rather than logging a wrong number.
 
 > **Footgun:** `evaluate_expression()` does **not** bounds-check `B0`..`B7`.
 > Every caller must hand it a full, zero-padded 8-byte buffer — `poll_log.c:417`
-> and `fast_log.c:112` both carry this warning at the call site. `Fn` (the
+> carries this warning at the call site. `Fn` (the
 > float32 token) is the one token that does bounds-check, because it consumes
 > four bytes.
 
