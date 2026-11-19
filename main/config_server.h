@@ -77,13 +77,13 @@
  * same reason 35001 is: a port that can be configured can be configured onto another listener. */
 #define WICAN_ELM327_PORT			35000
 
-/* protocol ids 0 (slcan), 1 (realdash66) and 2 (savvycan) retired; values reserved so the
- * remaining ids never shift. id 0 went when `protocol` became a placebo: the device has one
- * mode and the stored value is discarded at the parse site, so no id here is selectable any
- * more. The rest stay defined because dead-but-compiled router arms in main.c still name them. */
+/* protocol ids 0 (slcan), 1 (realdash66), 2 (savvycan), 4 (auto_pid) and 5 (fast_log) retired;
+ * values reserved so the remaining ids never shift. The device has one mode and the stored
+ * `protocol` value is discarded at the parse site, so no id here is selectable any more.
+ * OBD_ELM327 stays because config_server_get_drive_protocol() (SmartConnect) and main.c's
+ * protocol_feeds_elm327() still use it;
+ * POLL_LOG is what config_server_protocol() always returns. */
 #define OBD_ELM327			3
-#define AUTO_PID			4
-#define FAST_LOG			5	/* Native-TWAI fast datalogger (Task #18) */
 #define POLL_LOG			6	/* Native-TWAI request/response poller (Task #18, Phase B) */
 
 typedef enum
@@ -93,20 +93,6 @@ typedef enum
 	WIFI_WPA3_PSK,
 	WIFI_MAX
 }wifi_security_t;
-
-typedef enum
-{
-	LOG_SDCARD,
-	LOG_INTERNAL,
-	MAX_LOG_STORAGE
-}log_storage_t;
-
-typedef enum
-{
-	LOG_FS_LITTLEFS,
-	LOG_FS_FATFS,
-	MAX_LOG_FS
-}log_filesystem_t;
 
 typedef enum
 {
@@ -160,24 +146,7 @@ typedef struct _device_config
 	char engine_volt[10];   // Task #6: dedicated engine-running gate for the CSV logger (separate from sleep_volt)
 	char wakeup_volt[10];
 	char sleep_time[32];
-	char wakeup_time[32];
-	char periodic_wakeup[32];
-	char wakeup_interval[32];
-	char batt_alert[32];
-	char batt_alert_ssid[65];
-	char batt_alert_pass[65];
-	char batt_alert_volt[32];
-	char batt_alert_protocol[65];
-	char batt_alert_url[256];
-	char batt_alert_port[32];
-	char batt_alert_topic[256];
-	char batt_alert_time[16];
-	char batt_mqtt_user[64];
-	char batt_mqtt_pass[64];
-	// MQTT TLS verification behavior: "enable" to skip CN check, "disable" (default) to verify
 	char csv_log[16];
-	char log_storage[16];
-	char log_filesystem[16];
 	char log_period[16];
 	char csv_grid_hz[16];     // wide fixed-rate grid frequency, 1..100 Hz or "auto" (issue #23)
 	char csv_require_engine[16]; // gate CSV logging on engine running (ECU answering): "enable" | "disable"
@@ -197,7 +166,6 @@ char *config_server_get_sta_pass(void);
 char *config_server_get_home_ssid(void);
 char *config_server_get_home_password(void);
 char *config_server_get_home_security(void);
-int8_t config_server_get_home_protocol(void);
 char *config_server_get_drive_ssid(void);
 char *config_server_get_drive_password(void);
 char *config_server_get_drive_security(void);
@@ -216,8 +184,6 @@ char *config_server_get_ap_pass(void);
 int8_t config_server_get_ap_ssid_en(void);
 char *config_server_get_ap_ssid(void);
 int8_t config_server_protocol(void);
-/* Name of a resolved protocol enum value, for logging. Never NULL. */
-const char *config_server_protocol_name(int8_t protocol);
 int config_server_ble_pass(void);
 int8_t config_server_get_sleep_config(void);
 int8_t config_server_get_can_wake(void);
@@ -250,20 +216,8 @@ int8_t config_server_get_ble_config(void);
 void config_server_restart(void);
 int8_t config_server_get_sleep_volt(float *sleep_volt);
 int8_t config_server_get_engine_volt(float *engine_volt);   // Task #6: engine-running gate (13.0-15.0 V)
-int8_t config_server_get_battery_alert_config(void);
-int32_t config_server_get_alert_port(void);
-char *config_server_get_alert_ssid(void);
-char *config_server_get_alert_pass(void);
-char *config_server_get_alert_protocol(void);
-char *config_server_get_alert_url(void);
-char *config_server_get_alert_topic(void);
-int8_t config_server_get_alert_volt(float *alert_volt);
-int config_server_get_alert_time(void);
-char *config_server_get_alert_mqtt_user(void);
-char *config_server_get_alert_mqtt_pass(void);
 int8_t config_server_get_wakeup_volt(float *wakeup_volt);
 int8_t config_server_get_sleep_time(uint32_t *sleep_time);
-int8_t config_server_get_wakeup_time(uint32_t *wakeup_time);
 wifi_security_t config_server_get_sta_security(void);
 int8_t config_server_get_csv_log(void);
 // Activity-LED blink toggle: 1 = blink while active (default), 0 = solid color.
@@ -275,11 +229,7 @@ int8_t config_server_get_log_period(uint32_t *log_period);
 int8_t config_server_get_csv_grid_hz(uint32_t *hz);
 // Engine-running CSV gate (default ON): 1=enable, 0=disable.
 int8_t config_server_get_csv_require_engine(void);
-log_storage_t config_server_get_log_storage(void);
-log_filesystem_t config_server_get_log_filesystem(void);
 int8_t config_server_get_ap_auto_disable(void);
-int8_t config_server_get_periodic_wakeup(void);
-int8_t config_server_get_wakeup_interval(uint32_t *wakeup_interval);
 int8_t config_server_get_imu_threshold(uint8_t *imu_threshold);
 bool config_server_is_debug_enabled(void);
 // Fallback STA networks accessors

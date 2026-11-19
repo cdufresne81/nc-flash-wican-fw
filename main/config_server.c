@@ -213,12 +213,9 @@ const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\",\"st
 										\"home_ssid\":\"MeatPi\",\"home_password\":\"TomatoSauce\",\"home_security\":\"wpa3\",\"home_protocol\":\"elm327\",\
 										\"drive_ssid\":\"MeatPi\",\"drive_password\":\"TomatoSauce\",\"drive_security\":\"wpa3\",\"drive_protocol\":\"elm327\",\"drive_connection_type\":\"wifi\",\"drive_mode_timeout\":\"60\",\
 										\"can_datarate\":\"500K\",\
-										\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"poll_log\",\"ble_pass\":\"123456\",\
-								\"ble_status\":\"disable\",\"ble_power\":\"9\",\"sleep_status\":\"enable\",\"can_wake\":\"enable\",\"periodic_wakeup\":\"disable\",\"sleep_volt\":\"13.0\",\"engine_volt\":\"13.0\",\"wakeup_volt\":\"13.5\",\"sleep_time\":\"5\",\"wakeup_interval\":\"90\",\"batt_alert\":\"disable\",\
-										\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\
-										\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\
-								\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\
-										\"csv_log\":\"disable\",\"log_filesystem\":\"littlefs\",\"log_storage\":\"sdcard\",\"log_period\":\"10\",\"csv_grid_hz\":\"auto\",\"csv_require_engine\":\"enable\",\"led_blink\":\"enable\",\"timezone\":\"" SYNC_SYS_TIME_DEFAULT_TZ "\"}";
+										\"can_mode\":\"normal\",\"ap_pass\":\"@meatpi#\",\"ble_pass\":\"123456\",\
+								\"ble_status\":\"disable\",\"ble_power\":\"9\",\"sleep_status\":\"enable\",\"can_wake\":\"enable\",\"sleep_volt\":\"13.0\",\"engine_volt\":\"13.0\",\"wakeup_volt\":\"13.5\",\"sleep_time\":\"5\",\
+										\"csv_log\":\"disable\",\"log_period\":\"10\",\"csv_grid_hz\":\"auto\",\"csv_require_engine\":\"enable\",\"led_blink\":\"enable\",\"timezone\":\"" SYNC_SYS_TIME_DEFAULT_TZ "\"}";
 
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
 // const char device_config_default[] = "{\"wifi_mode\":\"AP\",\"ap_ch\":\"6\", \"ap_auto_disable\": \"disable\",\"sta_ssid\":\"MeatPi\",\"sta_pass\":\"TomatoSauce\",\"sta_security\":\"wpa3\",\"can_datarate\":\"500K\",\"can_mode\":\"normal\",\"port_type\":\"tcp\",\"port\":\"35000\",\"ap_pass\":\"@meatpi#\",\"protocol\":\"elm327\",\"ble_pass\":\"123456\",\"ble_status\":\"disable\",\"sleep_status\":\"disable\",\"sleep_volt\":\"13.1\",\"wakeup_volt\":\"13.5\",\"periodic_wakeup\":\"disable\",\"wakeup_interval\":\"5\",\"batt_alert\":\"disable\",\"batt_alert_ssid\":\"MeatPi\",\"batt_alert_pass\":\"TomatoSauce\",\"batt_alert_volt\":\"11.0\",\"batt_alert_protocol\":\"mqtt\",\"batt_alert_url\":\"mqtt://mqtt.eclipseprojects.io\",\"batt_alert_port\":\"1883\",\"batt_alert_topic\":\"CAR1/voltage\",\"batt_mqtt_user\":\"meatpi\",\"batt_mqtt_pass\":\"meatpi\",\"batt_alert_time\":\"1\",\"mqtt_user\":\"meatpi\",\"mqtt_pass\":\"meatpi\",\"mqtt_tx_topic\":\"wican/%s/can/tx\",\"mqtt_rx_topic\":\"wican/%s/can/rx\",\"mqtt_status_topic\":\"wican/%s/can/status\"}";
@@ -457,20 +454,6 @@ char *config_server_get_home_security(void)
 	return device_config.home_security;
 }
 
-int8_t config_server_get_home_protocol(void)
-{
-	// No slcan arm: protocol id 0 is retired (config_server.h) and the device has one mode.
-	if(strcmp(device_config.home_protocol, "elm327") == 0)
-	{
-		return OBD_ELM327;
-	}
-	// No auto_pid arm: the legacy AutoPID scheduler is retired on this fork (issue #28), so a
-	// stored "auto_pid" falls through to the ELM327 default below. This is the single place that
-	// decision lives -- main.c forces protocol = AUTO_PID from this getter under SmartConnect, so
-	// resurrecting the arm here would restart the legacy poller.
-	return OBD_ELM327;
-}
-
 char *config_server_get_drive_ssid(void)
 {
 	return device_config.drive_ssid;
@@ -488,12 +471,13 @@ char *config_server_get_drive_security(void)
 
 int8_t config_server_get_drive_protocol(void)
 {
-	// See config_server_get_home_protocol(): no slcan arm, id 0 is retired.
+	// No slcan arm: protocol id 0 is retired (config_server.h) and the device has one mode.
 	if(strcmp(device_config.drive_protocol, "elm327") == 0)
 	{
 		return OBD_ELM327;
 	}
-	// See config_server_get_home_protocol(): no auto_pid arm, by design.
+	// No auto_pid arm: the legacy AutoPID scheduler is retired on this fork (issue #28), so a
+	// stored "auto_pid" falls through to the ELM327 default.
 	return OBD_ELM327;
 }
 
@@ -539,18 +523,6 @@ wifi_security_t config_server_get_drive_security_type(void)
 		return WIFI_WPA3_PSK;
 	}
 	return WIFI_WPA3_PSK; // Default to WPA3
-}
-
-const char *config_server_protocol_name(int8_t protocol)
-{
-	switch(protocol)
-	{
-		case OBD_ELM327:  return "elm327";
-		case AUTO_PID:    return "auto_pid";
-		case FAST_LOG:    return "fast_log";
-		case POLL_LOG:    return "poll_log";
-		default:          return "unknown";
-	}
 }
 
 int8_t config_server_protocol(void)
@@ -745,21 +717,14 @@ static esp_err_t index_handler(httpd_req_t *req)
 
 // LIVE whitelist (issue #39): the config.json keys that apply at runtime without a
 // reboot because every consumer re-reads them live (LED task each loop, smartconnect
-// per transition, batt-alert creds/protocol when an alert fires). Any change to a
-// field NOT listed here still forces a reboot via the memcmp(probe,shadow) backstop.
-// batt_alert (master) and periodic_wakeup are inert: the parser force-disables both, so
-// neither can ever diff.
-// Deliberately EXCLUDED (stay reboot-required): batt_alert_volt, batt_alert_time
-// (cached once into adc_task statics). Keep this list in lockstep with
-// docs/goal-live-reconfigure.md (exactly 20 keys).
+// per transition). Any change to a field NOT listed here still forces a reboot via
+// the memcmp(probe,shadow) backstop. The battery-alert keys that used to be listed
+// here are gone with the feature (#148).
 #define LIVE_APPLY_WHITELIST(X) \
 	X(led_blink) \
 	X(home_ssid) X(home_password) X(home_security) X(home_protocol) \
 	X(drive_ssid) X(drive_password) X(drive_security) X(drive_protocol) \
-	X(drive_connection_type) X(drive_mode_timeout) \
-	X(batt_alert) X(batt_alert_protocol) X(batt_alert_ssid) X(batt_alert_pass) \
-	X(batt_alert_url) X(batt_alert_port) X(batt_alert_topic) \
-	X(batt_mqtt_user) X(batt_mqtt_pass)
+	X(drive_connection_type) X(drive_mode_timeout)
 
 // ---- Stored secrets ---------------------------------------------------------
 // Every credential the device stores, in one place: the JSON key on the wire and
@@ -772,9 +737,7 @@ static esp_err_t index_handler(httpd_req_t *req)
 	X("ap_pass",         ap_pass) \
 	X("ble_pass",        ble_pass) \
 	X("home_password",   home_password) \
-	X("drive_password",  drive_password) \
-	X("batt_alert_pass", batt_alert_pass) \
-	X("batt_mqtt_pass",  batt_mqtt_pass)
+	X("drive_password",  drive_password)
 
 // Sent in place of a stored secret, so the UI can show that one is set and hand
 // it back untouched on the next Submit without ever holding the real value.
@@ -1226,57 +1189,11 @@ static esp_err_t load_config_handler(httpd_req_t *req)
 	CONFIG_SECRET_FIELDS(REDACT_SECRET)
 	#undef REDACT_SECRET
 
-	/* ---- DEPRECATED COMPATIBILITY SHIM -- REMOVE IN v1.25.0 ---------------------------------
-	 *
-	 * `protocol`, `port` and `port_type` are GONE from this firmware: the parser ignores them,
-	 * device_config_t has no fields for them, no code reads them, and the web UI has no controls
-	 * for them. They are re-inserted here, at fixed values, for ONE reason and one only.
-	 *
-	 * THE REASON: an older firmware's parser hard-requires all three, and a missing required key
-	 * does not merely fail -- config_server_load_cfg() unlinks config.json and writes the factory
-	 * default. So without these three words, the first Submit on this firmware would produce a
-	 * config file that FACTORY-RESETS the device if it were ever rolled back to an older build:
-	 * Wi-Fi credentials gone, device off the owner's network, recoverable only by holding the
-	 * hardware button for 5 s. A firmware rollback is the normal response to a bad build, so it
-	 * must not be the thing that wipes the device.
-	 *
-	 * The values are deliberately the historical defaults, not a report of any live state. There
-	 * is no live state left to report.
-	 *
-	 * REMOVAL: delete this whole block in v1.25.0. By then no supported build requires the keys.
-	 * When it goes, a backup taken afterwards can no longer be restored on any firmware older than
-	 * this one -- which is exactly the trade being deferred, not avoided. Announce it in the
-	 * release notes for the version that drops it, not only here.
-	 *
-	 * Everything else about this endpoint is unchanged: it is BOTH the seed for the settings form
-	 * AND the file the user downloads as a backup. The file on the SD card is NOT rewritten --
-	 * firmware never rewrites config.json outside the store path, because an interrupted write
-	 * loses the owner's Wi-Fi credentials.
-	 *
-	 * THIS BLOCK IS ONLY HALF THE SHIM. It puts the keys in the REPLY; it does not make them come
-	 * back on the next Submit. postConfig() builds its POST from a fixed whitelist, not an echo of
-	 * what it was served, so the other half is PASSTHROUGH_KEYS + loadedPassthrough in
-	 * main/web/src/main.js. Without that half, every Submit writes a config.json missing all three
-	 * keys and the rollback hazard above is wide open. Delete BOTH halves together in v1.25.0. */
-	{
-		static const struct { const char *key, *val; } deprecated_keys[] = {
-			{ "protocol",  "poll_log" },   /* the only mode this firmware has */
-			{ "port",      "35000"    },   /* historical stock-server default */
-			{ "port_type", "tcp"      },
-		};
-		for (size_t i = 0; i < sizeof deprecated_keys / sizeof deprecated_keys[0]; i++)
-		{
-			cJSON_DeleteItemFromObject(root, deprecated_keys[i].key);
-			cJSON_AddStringToObject(root, deprecated_keys[i].key, deprecated_keys[i].val);
-		}
-		/* The indicator. A downloaded backup carries its own expiry date, so the deprecation is
-		 * visible to whoever opens the file rather than living only in a source comment nobody
-		 * reads. Both the old and the new parser ignore keys they do not look up, so carrying it
-		 * is free. Delete it with the block above. */
-		cJSON_DeleteItemFromObject(root, "_deprecated");
-		cJSON_AddStringToObject(root, "_deprecated",
-			"protocol/port/port_type do nothing on this firmware and are dropped in v1.25.0");
-	}
+	/* Retired battery-alert credentials (#148): this firmware no longer reads them, so they are
+	 * no longer in CONFIG_SECRET_FIELDS, but a config.json written by an older build still
+	 * carries them. Drop them from the reply rather than serve them in clear. */
+	cJSON_DeleteItemFromObject(root, "batt_alert_pass");
+	cJSON_DeleteItemFromObject(root, "batt_mqtt_pass");
 
 	char *resp_str = cJSON_PrintUnformatted(root);
 	cJSON_Delete(root);
@@ -1730,26 +1647,10 @@ char *config_server_get_status_json(bool remove_sensitive_info)
 	cJSON_AddStringToObject(root, "engine_volt", device_config.engine_volt);
 	cJSON_AddStringToObject(root, "sleep_time", device_config.sleep_time);
 	cJSON_AddStringToObject(root, "wakeup_volt", device_config.wakeup_volt);
-	cJSON_AddStringToObject(root, "periodic_wakeup", device_config.periodic_wakeup);
-	cJSON_AddStringToObject(root, "wakeup_interval", device_config.wakeup_interval);
-
-	cJSON_AddStringToObject(root, "batt_alert", device_config.batt_alert);
-	cJSON_AddStringToObject(root, "batt_alert_ssid", device_config.batt_alert_ssid);
-	config_add_secret(root, "batt_alert_pass", device_config.batt_alert_pass, remove_sensitive_info);
-	cJSON_AddStringToObject(root, "batt_alert_url", device_config.batt_alert_url);
-	cJSON_AddStringToObject(root, "batt_alert_port", device_config.batt_alert_port);
-	cJSON_AddStringToObject(root, "batt_mqtt_user", device_config.batt_mqtt_user);
-	config_add_secret(root, "batt_mqtt_pass", device_config.batt_mqtt_pass, remove_sensitive_info);
-	cJSON_AddStringToObject(root, "batt_alert_protocol", device_config.batt_alert_protocol);
-	cJSON_AddStringToObject(root, "batt_alert_volt", device_config.batt_alert_volt);
-	cJSON_AddStringToObject(root, "batt_alert_topic", device_config.batt_alert_topic);
-	cJSON_AddStringToObject(root, "batt_alert_time", device_config.batt_alert_time);
 	cJSON_AddStringToObject(root, "csv_log", device_config.csv_log);
-	cJSON_AddStringToObject(root, "log_filesystem", device_config.log_filesystem);
 	cJSON_AddStringToObject(root, "log_period", device_config.log_period);
 	cJSON_AddStringToObject(root, "csv_grid_hz", device_config.csv_grid_hz);
 	cJSON_AddStringToObject(root, "csv_require_engine", device_config.csv_require_engine);
-	cJSON_AddStringToObject(root, "log_storage", device_config.log_storage);
 	// "mounted" | "unreadable" | "absent". The card is never auto-formatted, so
 	// an unreadable one keeps the user's logs intact -- this is what tells them
 	// it happened, on a device with no console.
@@ -2979,131 +2880,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	}
 	ESP_LOGI(TAG, "dst->engine_volt: %s", dst->engine_volt);
 
-	//*****
-	// key = cJSON_GetObjectItem(root,"batt_alert");
-	// if(key == 0 || (strlen(key->valuestring) > sizeof(dst->batt_alert)))
-	// {
-	// 	goto config_error;
-	// }
 
-	strlcpy(dst->batt_alert, "disable", sizeof(dst->batt_alert));
-	ESP_LOGI(TAG, "dst->batt_alert: %s", dst->batt_alert);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_ssid");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_ssid)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_alert_ssid, key->valuestring, sizeof(dst->batt_alert_ssid));
-	ESP_LOGI(TAG, "dst->batt_alert_ssid: %s", dst->batt_alert_ssid);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_pass");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_pass)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_alert_pass, key->valuestring, sizeof(dst->batt_alert_pass));
-	CONFIG_LOG_SECRET("dst->batt_alert_pass", dst->batt_alert_pass);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_volt");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_volt)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_alert_volt, key->valuestring, sizeof(dst->batt_alert_volt));
-	ESP_LOGI(TAG, "dst->batt_alert_volt: %s", dst->batt_alert_volt);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_protocol");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_protocol)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_alert_protocol, key->valuestring, sizeof(dst->batt_alert_protocol));
-	ESP_LOGI(TAG, "dst->batt_alert_protocol: %s", dst->batt_alert_protocol);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_url");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_url)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_alert_url, key->valuestring, sizeof(dst->batt_alert_url));
-	ESP_LOGI(TAG, "dst->batt_alert_url: %s", dst->batt_alert_url);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_port");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_port)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_alert_port, key->valuestring, sizeof(dst->batt_alert_port));
-	ESP_LOGI(TAG, "dst->batt_alert_port: %s", dst->batt_alert_port);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_topic");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_topic)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_alert_topic, key->valuestring, sizeof(dst->batt_alert_topic));
-	ESP_LOGI(TAG, "dst->batt_alert_topic: %s", dst->batt_alert_topic);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_mqtt_user");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_mqtt_user)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_mqtt_user, key->valuestring, sizeof(dst->batt_mqtt_user));
-	ESP_LOGI(TAG, "dst->batt_mqtt_user: %s", dst->batt_mqtt_user);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_mqtt_pass");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_mqtt_pass)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_mqtt_pass, key->valuestring, sizeof(dst->batt_mqtt_pass));
-	CONFIG_LOG_SECRET("dst->batt_mqtt_pass", dst->batt_mqtt_pass);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"batt_alert_time");
-	if(key == 0 || key->valuestring == NULL || (strlen(key->valuestring) > sizeof(dst->batt_alert_time)))
-	{
-		goto config_error;
-	}
-
-	strlcpy(dst->batt_alert_time, key->valuestring, sizeof(dst->batt_alert_time));
-	ESP_LOGI(TAG, "dst->batt_alert_time: %s", dst->batt_alert_time);
-	//*****
-
-
-
-	// mqtt_security
-	//*****
 
 	//*****
 	//***** Optional keys (issue #68): an absent key falls back to its default, and so
@@ -3244,10 +3021,9 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	{
 		strlcpy(dst->home_protocol, key->valuestring, sizeof(dst->home_protocol));
 	}
-	// A stored "auto_pid" needs no coercion here: config_server_get_home_protocol() has no
-	// auto_pid arm, so it already resolves to ELM327 and the SmartConnect override in main.c
-	// can never see AUTO_PID. The fallback above is "elm327" only so an absent key and a
-	// legacy stored value end up saying the same thing.
+	// A stored "auto_pid" needs no coercion here: nothing reads home_protocol as a mode any
+	// more. The fallback above is "elm327" only so an absent key and a legacy stored value end
+	// up saying the same thing.
 	ESP_LOGI(TAG, "dst->home_protocol: %s", dst->home_protocol);
 
 	key = cJSON_GetObjectItem(root,"drive_ssid");
@@ -3314,7 +3090,7 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	{
 		strlcpy(dst->drive_protocol, key->valuestring, sizeof(dst->drive_protocol));
 	}
-	// See the home_protocol note above: the getter, not the parser, retires auto_pid here.
+	// See config_server_get_drive_protocol(): the getter, not the parser, retires auto_pid here.
 	ESP_LOGI(TAG, "dst->drive_protocol: %s", dst->drive_protocol);
 
 	//**** End SmartConnect fields ****
@@ -3339,34 +3115,6 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	{
 		strlcpy(dst->csv_log, "disable", sizeof(dst->csv_log));
 	}
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"log_filesystem");
-	if(key == 0 || key->valuestring == NULL)
-	{
-		strlcpy(dst->log_filesystem, "littlefs", sizeof(dst->log_filesystem));
-	}
-	else
-	{
-		strlcpy(dst->log_filesystem, key->valuestring, sizeof(dst->log_filesystem));
-	}
-	ESP_LOGI(TAG, "dst->log_filesystem: %s", dst->log_filesystem);
-	//*****
-
-	//*****
-	key = cJSON_GetObjectItem(root,"log_storage");
-
-	if(key == 0 || key->valuestring == NULL)
-	{
-		strlcpy(dst->log_storage, "sdcard", sizeof(dst->log_storage));
-	}
-	else
-	{
-		strlcpy(dst->log_storage, key->valuestring, sizeof(dst->log_storage));
-	}
-
-	ESP_LOGI(TAG, "dst->log_storage: %s", dst->log_storage);
 	//*****
 
 	//*****
@@ -3477,41 +3225,6 @@ static bool config_server_parse_cfg_into(device_config_t *dst, const char *cfg)
 	}
 
 	ESP_LOGI(TAG, "dst->ap_auto_disable: %s", dst->ap_auto_disable);
-
-	//*****
-	// Periodic wakeup is retired: the wake was only an esp_restart() that nothing
-	// distinguishes from a cold boot (nobody reads POWER_WAKE), and this build has no
-	// outbound client to report with -- so it just burned parked battery. Pinned here
-	// rather than in the UI alone so already-deployed devices with periodic_wakeup=enable
-	// stop waking at their next boot, and so a direct POST /store_config cannot re-arm it.
-	// Same treatment as batt_alert above. To revive for issue #24, restore the parse.
-	// key = cJSON_GetObjectItem(root,"periodic_wakeup");
-	// if(key == 0)
-	// {
-	// 	strlcpy(dst->periodic_wakeup, "disable", sizeof(dst->periodic_wakeup));
-	// }
-	// else
-	// {
-	// 	strlcpy(dst->periodic_wakeup, key->valuestring, sizeof(dst->periodic_wakeup));
-	// }
-
-	strlcpy(dst->periodic_wakeup, "disable", sizeof(dst->periodic_wakeup));
-	ESP_LOGI(TAG, "dst->periodic_wakeup: %s", dst->periodic_wakeup);
-	//*****
-
-	//*****	
-	key = cJSON_GetObjectItem(root,"wakeup_interval");
-	if(key == 0 || key->valuestring == NULL)
-	{
-		strlcpy(dst->wakeup_interval, "60", sizeof(dst->wakeup_interval));
-	}
-	else
-	{
-		strlcpy(dst->wakeup_interval, key->valuestring, sizeof(dst->wakeup_interval));
-	}
-
-	ESP_LOGI(TAG, "dst->wakeup_interval: %s", dst->wakeup_interval);
-	//*****	
 
 
 	//*****
@@ -4191,151 +3904,6 @@ int8_t config_server_get_sleep_time(uint32_t *sleep_time)
     return 1;
 }
 
-int8_t config_server_get_periodic_wakeup(void)
-{
-	if(strcmp(device_config.periodic_wakeup, "enable") == 0)
-	{
-		return 1;
-	}
-	return 0;
-}
-
-int8_t config_server_get_wakeup_interval(uint32_t *wakeup_interval)
-{
-    char *endptr;
-    long wk_int = strtol(device_config.wakeup_interval, &endptr, 10);
-    
-    // Check for conversion errors
-    if (*endptr != '\0' || endptr == device_config.wakeup_interval)
-	{
-        return -1;
-    }
-    
-    // Validate range
-    if (wk_int < 5 || wk_int > 240)
-	{
-        return -1;
-    }
-    
-    *wakeup_interval = (uint32_t)wk_int;
-    return 1;
-}
-
-int8_t config_server_get_battery_alert_config(void)
-{
-	if(strcmp(device_config.batt_alert, "enable") == 0)
-	{
-		return 1;
-	}
-	else if(strcmp(device_config.batt_alert, "disable") == 0)
-	{
-		return 0;
-	}
-	return -1;
-}
-
-int32_t config_server_get_alert_port(void)
-{
-	int port_val = atoi(device_config.batt_alert_port);
-
-	if(port_val > 0 && port_val <= 65535)
-	{
-		return port_val;
-	}
-	return -1;
-}
-
-char *config_server_get_alert_ssid(void)
-{
-	return device_config.batt_alert_ssid;
-}
-
-char *config_server_get_alert_pass(void)
-{
-	return device_config.batt_alert_pass;
-}
-
-char *config_server_get_alert_protocol(void)
-{
-	return device_config.batt_alert_protocol;
-}
-
-char *config_server_get_alert_url(void)
-{
-	return device_config.batt_alert_url;
-}
-
-char *config_server_get_alert_topic(void)
-{
-	return device_config.batt_alert_topic;
-}
-
-char *config_server_get_alert_mqtt_user(void)
-{
-	return device_config.batt_mqtt_user;
-}
-
-char *config_server_get_alert_mqtt_pass(void)
-{
-	return device_config.batt_mqtt_pass;
-}
-
-int config_server_get_alert_time(void)
-{
-	if(strcmp(device_config.batt_alert_time, "1") == 0)
-	{
-		return 1;
-	}
-	else if(strcmp(device_config.batt_alert_time, "6") == 0)
-	{
-		return 6;
-	}
-	else if(strcmp(device_config.batt_alert_time, "12") == 0)
-	{
-		return 12;
-	}
-	else if(strcmp(device_config.batt_alert_time, "24") == 0)
-	{
-		return 24;
-	}
-	else
-	{
-		return -1;
-	}
-
-}
-
-int8_t config_server_get_alert_volt(float *alert_volt)
-{
-	*alert_volt = atof(device_config.batt_alert_volt);
-
-	if(device_config.batt_alert_volt[2] != '.')
-	{
-		return -1;
-	}
-
-	if(*alert_volt > 8.0f && *alert_volt <= 15.0f)
-	{
-		return 1;
-	}
-	return -1;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 wifi_security_t config_server_get_sta_security(void)
 {
 	if (strcmp(device_config.sta_security, "wpa2") == 0)
@@ -4381,32 +3949,6 @@ int8_t config_server_get_ap_auto_disable(void)
 		return 0;
 	}
 	return 0;
-}
-
-log_filesystem_t config_server_get_log_filesystem(void)
-{
-	if(strcmp(device_config.log_filesystem, "littlefs") == 0)
-	{
-		return LOG_FS_LITTLEFS;
-	}
-	else if(strcmp(device_config.log_filesystem, "fatfs") == 0)
-	{
-		return LOG_FS_FATFS;
-	}
-	return MAX_LOG_FS;
-}
-
-log_storage_t config_server_get_log_storage(void)
-{
-	if(strcmp(device_config.log_storage, "sdcard") == 0)
-	{
-		return LOG_SDCARD;
-	}
-	else if(strcmp(device_config.log_storage, "internal") == 0)
-	{
-		return LOG_INTERNAL;
-	}
-	return MAX_LOG_STORAGE;
 }
 
 int8_t config_server_get_log_period(uint32_t *log_period)

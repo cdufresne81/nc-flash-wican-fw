@@ -74,10 +74,8 @@
 #include "event_log.h"
 #include "config_server.h"
 #include "expression_parser.h"
-/* Battery voltage for the recording gate (this component already REQUIRES main). NOTE: sleep_mode.h
- * declares sleep_mode_get_voltage() TWICE behind #if HARDWARE_VER -- esp_err_t on WICAN_PRO, but
- * int8_t (1 on success) on the older targets. The `== ESP_OK` test below is right for the PRO
- * build this product ships; it would need revisiting if an older target is ever revived. */
+/* Battery voltage for the recording gate (this component already REQUIRES main).
+ * sleep_mode_get_voltage() returns esp_err_t, hence the `== ESP_OK` tests below. */
 #include "sleep_mode.h"
 #include "vehicle.h"        /* VEHICLE_IGN_HYSTERESIS_V -- shared with the CSV ignition gate */
 
@@ -2314,7 +2312,7 @@ char *poll_log_get_status_json(void)
  * store_auto_data_handler after it writes the new auto_pid.json. Sets a flag ONLY; the
  * actual re-parse + swap runs on the poll task at its top-of-loop safe point. s_active
  * doubles as the mode guard: it is only true while POLL_LOG's task is running, so
- * non-POLL_LOG modes (AUTO_PID/FAST_LOG) return false and the handler answers
+ * otherwise this returns false and the handler answers
  * "reboot-required" -- the only correct answer when this task isn't the one owning the
  * table. Returns true if the reload was queued. */
 bool poll_log_request_reload(void)

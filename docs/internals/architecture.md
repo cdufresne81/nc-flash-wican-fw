@@ -49,23 +49,22 @@ surprisingly hard to reconstruct from the source:
 | **Console** | The Field Console — live gauges for the polled channels; the Trip Recorder (Start Trip, Mark Event); Recent Trips; a tail of the Event Log |
 | **Files** | SD browser — new folder, download/delete selected, size/modified/type |
 | **Logger** | The **sensor set**: Polled PIDs, Broadcast PIDs, Calculated PIDs, plus Export/Import Sensors and the engine-gating and low-voltage-protection options |
-| **Settings** | Wi-Fi (AP mode, Station mode, Backup Networks, Scan), Sleep Mode, Battery Alert/MQTT, Time Zone |
+| **Settings** | Wi-Fi (AP mode, Station mode, Backup Networks, Scan), Sleep Mode, BLE, Time Zone |
 | **Status** | Live device status |
 | **System** | Firmware update (OTA) |
 | **About** | Version and links |
 
 > The **Logger** tab is the product. Everything else is either operating the
-> recorder (Console, Files), configuring the device (Settings, System), or
-> inherited (the Battery Alert/MQTT block).
+> recorder (Console, Files) or configuring the device (Settings, System).
 
-**Hidden UI is a much smaller story than issue #28 implies.** Of the 11 elements
-carrying `style="display:none"` in `homepage_full.html`, nine are ordinary
-conditional UI that `main.js` shows and hides at runtime (`ota_progress_row`,
+**Hidden UI is a much smaller story than issue #28 implies.** The elements
+carrying `style="display:none"` in `homepage_full.html` are ordinary conditional
+UI that `main.js` shows and hides at runtime (`ota_progress_row`,
 `csv_grid_hz_row`, `console_mark_btn`, `sleep_warning_div`, `wifi_networks_row`,
-`csv_require_engine_row`, `pid_polling_min_voltage_row`, and two file inputs).
-Only **two are permanently hidden** — `ble_section` (`:1522`) and
-`wakeup_every_row` (`:1334`) — with zero references anywhere in `main.js`. Those
-two are the real "hide, don't delete" residue.
+`csv_require_engine_row`, `pid_polling_min_voltage_row`, file inputs, …). The
+two that used to be permanently hidden are gone: `ble_section` was un-hidden
+when BLE came back (#159), and `wakeup_every_row` was deleted with periodic
+wake-up (#148). No "hide, don't delete" residue remains here.
 
 **Scope constraints that explain a lot of the design:**
 
@@ -343,10 +342,9 @@ Two traps when adding a task:
   `wifi_reconnect`, `uart_tx_task`, `uart_rx_task`,
   `config_mode_task` all sit there. Most are inert under `poll_log`, so the
   effective ladder is clean, but **the number 5 by itself tells you nothing
-  about importance.** (`adc_task` is *not* on this list: its only creation,
-  `sleep_mode.c:581`, is inside `#if HARDWARE_VER != WICAN_PRO` — compiled out,
-  not merely inert. The same dead half holds the MQTT client handle, which is
-  why the battery-alert feature cannot work on this board.)
+  about importance.** (`adc_task` is *not* on this list: it only ever existed in
+  the non-PRO half of `sleep_mode.c`, deleted in #148 together with the
+  battery-alert MQTT client it carried.)
 - **Stack depth is in *bytes*, and the in-code comments that say otherwise are
   wrong.** ESP-IDF documents `usStackDepth` / `ulStackDepth` as "the NUMBER OF
   BYTES. Note that this differs from vanilla FreeRTOS"
@@ -646,7 +644,7 @@ Two stores, two very different behaviours. Confusing them causes real damage.
 flowchart TB
     POST["POST /store_config"] --> SH["shadow = live device_config (memcpy)<br/><i>looks redundant — is not: padding</i>"]
     SH --> PARSE["parse JSON into shadow"]
-    PARSE --> PR["probe = live device_config,<br/>then copy in the 20 whitelisted fields<br/>from shadow"]
+    PARSE --> PR["probe = live device_config,<br/>then copy in the 11 whitelisted fields<br/>from shadow"]
     PR --> EQ{"memcmp(probe, shadow)"}
     EQ -->|"equal — only whitelisted keys changed"| LIVE["apply per-field, no reboot<br/>reply {reboot:false, applied:live}"]
     EQ -->|"differs"| RB["write config.json<br/>2 s restart timer<br/>reply {reboot:true}"]
@@ -654,14 +652,14 @@ flowchart TB
 
 **The reboot decision (issue #39), stated accurately.** `store_config_handler`
 does *not* always reboot. It seeds a `probe` copy from the live struct, memcpy's
-the 20 `LIVE_APPLY_WHITELIST` fields (`config_server.c:707-714`) in from the
+the 11 `LIVE_APPLY_WHITELIST` fields in from the
 parsed shadow, and `memcmp`s the two. If they match, only whitelisted fields
 changed, so it applies them in place and replies `{"reboot":false,
 "applied":"live"}`.
 
-But note **which** 20 fields: `led_blink`, then `home_*` / `drive_*` (10 keys —
-SmartConnect, not reachable from the UI) and `batt_alert_*` / `batt_mqtt_*`
-(9 keys — battery-alert MQTT, compiled out on this board). So in practice
+But note **which** 11 fields: `led_blink`, then `home_*` / `drive_*` (10 keys —
+SmartConnect, not reachable from the UI). The 9 battery-alert keys that used to
+be listed went with the feature in #148. So in practice
 **every config change a user can make through the shipped UI still reboots,
 except toggling the LED.** The live path is real, it is just aimed almost
 entirely at features this fork hides.

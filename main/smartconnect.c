@@ -414,13 +414,6 @@ static void enable_home_mode(void)
     dev_status_set_home_mode_enabled();
     dev_status_clear_drive_mode_enabled();
     
-    // Check home protocol and manage autopid bit
-    int8_t home_protocol = config_server_get_home_protocol();
-    if (home_protocol == AUTO_PID) {
-        ESP_LOGI(TAG, "Home mode: AutoPID protocol - enabling AutoPID");
-        dev_status_set_autopid_enabled();
-    }
-    
     // In Home mode, only WiFi is allowed - disable BLE
     ESP_LOGI(TAG, "Disabling BLE for home mode...");
     ble_disable();

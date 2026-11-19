@@ -370,9 +370,6 @@ The order matters and every step earns its place.
 
 ## Side paths
 
-**Periodic wake-up**, if switched on. While asleep and above 11.9 V, a configurable timer
-expires and the device takes a full **reboot** rather than a resume, coming up normally.
-
 **Resume fails.** Any failure in block C logs the reason, waits 1.5 seconds so the line actually
 reaches the SD card, then reboots. Resume is the optimisation; reboot is the repair, and it must
 always stay reachable on a device with no serial console and no network.

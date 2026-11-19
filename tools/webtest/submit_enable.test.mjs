@@ -23,7 +23,6 @@ function fillValid(doc) {
     set('ap_pass_value', 'not-the-default');   // 8..63 chars and not "@meatpi#"
     set('ssid_value', 'HomeNet');
     set('pass_value', 'stationpass');
-    set('batt_alert_port', '1883');
     set('ble_status', 'disable');
     set('sleep_volt', '13.0');
     set('sleep_status', 'enable');

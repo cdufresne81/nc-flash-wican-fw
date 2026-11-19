@@ -45,7 +45,6 @@
 #include "esp_ota_ops.h"
 #include "nvs.h"
 #include "sleep_mode.h"
-#include "mqtt_client.h"
 #include "ver.h"
 #include "driver/rtc_io.h"
 #include "led.h"
@@ -60,531 +59,6 @@
 // #define TAG 		__func__
 #define TAG         "SLEEP_MODE"
 
-#if HARDWARE_VER != WICAN_PRO
-
-#define TIMES              256
-#define GET_UNIT(x)        ((x>>3) & 0x1)
-#if CONFIG_IDF_TARGET_ESP32
-#define ADC_RESULT_BYTE     2
-#define ADC_CONV_LIMIT_EN   1                       //For ESP32, this should always be set to 1
-#define ADC_CONV_MODE       ADC_CONV_SINGLE_UNIT_1  //ESP32 only supports ADC1 DMA mode
-#define ADC_OUTPUT_TYPE     ADC_DIGI_OUTPUT_FORMAT_TYPE1
-#elif CONFIG_IDF_TARGET_ESP32S2
-#define ADC_RESULT_BYTE     2
-#define ADC_CONV_LIMIT_EN   0
-#define ADC_CONV_MODE       ADC_CONV_BOTH_UNIT
-#define ADC_OUTPUT_TYPE     ADC_DIGI_OUTPUT_FORMAT_TYPE2
-#elif CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32H2 || CONFIG_IDF_TARGET_ESP32C2
-#define ADC_RESULT_BYTE     4
-#define ADC_CONV_LIMIT_EN   0
-#define ADC_CONV_MODE       ADC_CONV_ALTER_UNIT     //ESP32C3 only supports alter mode
-#define ADC_OUTPUT_TYPE     ADC_DIGI_OUTPUT_FORMAT_TYPE2
-#elif CONFIG_IDF_TARGET_ESP32S3
-#define ADC_RESULT_BYTE     4
-#define ADC_CONV_LIMIT_EN   0
-#define ADC_CONV_MODE       ADC_CONV_SINGLE_UNIT_1
-#define ADC_OUTPUT_TYPE     ADC_DIGI_OUTPUT_FORMAT_TYPE2
-#endif
-
-#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32H2 || CONFIG_IDF_TARGET_ESP32C2
-#if CONFIG_IDF_TARGET_ESP32C3
-static uint16_t adc1_chan_mask = BIT(4);
-static adc_channel_t channel[1] = {ADC1_CHANNEL_4};
-#else
-static uint16_t adc1_chan_mask = BIT(6);
-//static uint16_t adc2_chan_mask = BIT(0);
-static adc_channel_t channel[1] = {ADC1_CHANNEL_6};
-#endif
-#endif
-#if CONFIG_IDF_TARGET_ESP32S2
-static uint16_t adc1_chan_mask = BIT(2) | BIT(3);
-static uint16_t adc2_chan_mask = BIT(0);
-static adc_channel_t channel[3] = {ADC1_CHANNEL_2, ADC1_CHANNEL_3, (ADC2_CHANNEL_0 | 1 << 3)};
-#endif
-#if CONFIG_IDF_TARGET_ESP32
-static uint16_t adc1_chan_mask = BIT(7);
-static uint16_t adc2_chan_mask = 0;
-static adc_channel_t channel[1] = {ADC1_CHANNEL_7};
-#endif
-//#define THRESHOLD_VOLTAGE		13.0f
-#define SLEEP_TIME_DELAY		(180*1000*1000)
-#define WAKEUP_TIME_DELAY		(200*1000)
-
-static EventGroupHandle_t s_mqtt_event_group = NULL;
-#define MQTT_CONNECTED_BIT 			BIT0
-#define PUB_SUCCESS_BIT     		BIT1
-
-static float sleep_voltage = 13.1f;
-static uint8_t enable_sleep = 0;
-static QueueHandle_t voltage_queue = NULL;
-static esp_adc_cal_characteristics_t adc1_chars;
-// Static queue storage for voltage_queue (queue length = 1, item size = sizeof(float))
-static StaticQueue_t voltage_queue_struct;
-static uint8_t voltage_queue_storage[sizeof(float)];
-
-
-static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
-{
-    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%ld", base, event_id);
-    esp_mqtt_event_handle_t event = event_data;
-//    esp_mqtt_client_handle_t client = event->client;
-
-    switch ((esp_mqtt_event_id_t)event_id) {
-    case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-        xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
-        break;
-    case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
-        xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
-//        esp_mqtt_client_stop(client);
-        break;
-
-    case MQTT_EVENT_SUBSCRIBED:
-        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
-        break;
-    case MQTT_EVENT_UNSUBSCRIBED:
-        ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
-        break;
-    case MQTT_EVENT_PUBLISHED:
-        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
-        xEventGroupSetBits(s_mqtt_event_group, PUB_SUCCESS_BIT);
-        break;
-    case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-        printf("DATA=%.*s\r\n", event->data_len, event->data);
-        break;
-    case MQTT_EVENT_ERROR:
-        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
-//        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-//            log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
-//            log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
-//            log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
-//            ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
-//
-//        }
-        break;
-    default:
-        ESP_LOGI(TAG, "Other event id:%d", event->event_id);
-        break;
-    }
-}
-static esp_mqtt_client_handle_t client = NULL;
-static void mqtt_init(void)
-{
-    esp_mqtt_client_config_t mqtt_cfg = {
-		.broker.address.uri = config_server_get_alert_url(),
-		.broker.address.port = config_server_get_alert_port(),
-		.credentials.username = config_server_get_alert_mqtt_user(),
-		.credentials.authentication.password = config_server_get_alert_mqtt_pass(),
-		.network.disable_auto_reconnect = true,
-		.network.reconnect_timeout_ms = 4000,
-//         .uri = config_server_get_alert_url(),
-// 		.port = config_server_get_alert_port(),
-// 		.username = config_server_get_alert_mqtt_user(),
-// 		.password = config_server_get_alert_mqtt_pass(),
-// //		.disable_auto_reconnect = 1,
-// 		.reconnect_timeout_ms = 4000
-    };
-    ESP_LOGI(TAG, "mqtt_cfg.uri: %s", mqtt_cfg.broker.address.uri);
-    if(client == NULL)
-    {
-    	client = esp_mqtt_client_init(&mqtt_cfg);
-        /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
-        esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-        esp_mqtt_client_start(client);
-    }
-    else
-    {
-    	esp_mqtt_client_reconnect(client);
-    }
-
-    EventBits_t bits = xEventGroupWaitBits(s_mqtt_event_group,
-						MQTT_CONNECTED_BIT,
-						pdFALSE,
-						pdFALSE,
-						pdMS_TO_TICKS(10000));
-    if (bits & MQTT_CONNECTED_BIT)
-    {
-    	static char pub_data[128];
-    	float batt_voltage = 0;
-    	sleep_mode_get_voltage(&batt_voltage);
-    	sprintf(pub_data, "{\"alert\": \"low_battery\", \"battery_voltage\": %f}", batt_voltage);
-        int msg_id = esp_mqtt_client_publish(client, config_server_get_alert_topic(), pub_data, 0, 1, 0);
-        ESP_LOGI(TAG, "publish, msg_id=%d", msg_id);
-
-    }
-    else
-    {
-    	ESP_LOGE(TAG, "unable to connect to broker...");
-    }
-}
-
-
-static void continuous_adc_init(uint16_t adc1_chan_mask, uint16_t adc2_chan_mask, adc_channel_t *channel, uint8_t channel_num)
-{
-    adc_digi_init_config_t adc_dma_config = {
-        .max_store_buf_size = 1024,
-        .conv_num_each_intr = TIMES,
-        .adc1_chan_mask = adc1_chan_mask,
-//        .adc2_chan_mask = adc2_chan_mask,
-    };
-    ESP_ERROR_CHECK(adc_digi_initialize(&adc_dma_config));
-
-    adc_digi_configuration_t dig_cfg = {
-        .conv_limit_en = ADC_CONV_LIMIT_EN,
-        .conv_limit_num = 250,
-        .sample_freq_hz = 10 * 1000,
-        .conv_mode = ADC_CONV_MODE,
-        .format = ADC_OUTPUT_TYPE,
-    };
-
-    adc_digi_pattern_config_t adc_pattern[SOC_ADC_PATT_LEN_MAX] = {0};
-    dig_cfg.pattern_num = channel_num;
-    for (int i = 0; i < channel_num; i++) {
-        uint8_t unit = GET_UNIT(channel[i]);
-        uint8_t ch = channel[i] & 0x7;
-        adc_pattern[i].atten = ADC_ATTEN_DB_11;
-        adc_pattern[i].channel = ch;
-        adc_pattern[i].unit = unit;
-        adc_pattern[i].bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
-
-        ESP_LOGI(TAG, "adc_pattern[%d].atten is :%x", i, adc_pattern[i].atten);
-        ESP_LOGI(TAG, "adc_pattern[%d].channel is :%x", i, adc_pattern[i].channel);
-        ESP_LOGI(TAG, "adc_pattern[%d].unit is :%x", i, adc_pattern[i].unit);
-    }
-    dig_cfg.adc_pattern = adc_pattern;
-    ESP_ERROR_CHECK(adc_digi_controller_configure(&dig_cfg));
-    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_DEFAULT, 0, &adc1_chars);
-
-
-}
-
-//ADC Attenuation
-#define ADC_ATTEN           ADC_ATTEN_DB_11
-
-//ADC Calibration
-#if CONFIG_IDF_TARGET_ESP32
-#define ADC_CALI_SCHEME     ESP_ADC_CAL_VAL_EFUSE_VREF
-#elif CONFIG_IDF_TARGET_ESP32S2
-#define ADC_CALI_SCHEME     ESP_ADC_CAL_VAL_EFUSE_TP
-#elif CONFIG_IDF_TARGET_ESP32C3
-#define ADC_CALI_SCHEME     ESP_ADC_CAL_VAL_EFUSE_TP
-#elif CONFIG_IDF_TARGET_ESP32S3
-#define ADC_CALI_SCHEME     ESP_ADC_CAL_VAL_EFUSE_TP_FIT
-#endif
-static esp_adc_cal_characteristics_t adc1_chars;
-static bool adc_calibration_init(void)
-{
-    esp_err_t ret;
-    bool cali_enable = false;
-
-    ret = esp_adc_cal_check_efuse(ADC_CALI_SCHEME);
-    if (ret == ESP_ERR_NOT_SUPPORTED) {
-        ESP_LOGW(TAG, "Calibration scheme not supported, skip software calibration");
-    } else if (ret == ESP_ERR_INVALID_VERSION) {
-        ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
-    } else if (ret == ESP_OK) {
-        cali_enable = true;
-        esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN, ADC_WIDTH_BIT_DEFAULT, 0, &adc1_chars);
-    } else {
-        ESP_LOGE(TAG, "Invalid arg");
-    }
-
-    return cali_enable;
-}
-
-#if !CONFIG_IDF_TARGET_ESP32
-static bool check_valid_data(const adc_digi_output_data_t *data)
-{
-    const unsigned int unit = data->type2.unit;
-    if (unit > 2) return false;
-    if (data->type2.channel >= SOC_ADC_CHANNEL_NUM(unit)) return false;
-
-    return true;
-}
-#endif
-
-#define RUN_STATE			0
-#define	SLEEP_DETECTED		1
-#define SLEEP_STATE			2
-#define WAKEUP_STATE		3
-
-static void adc_task(void *pvParameters)
-{
-    esp_err_t ret;
-    uint32_t ret_num = 0;
-    uint8_t result[TIMES] = {0};
-    static uint8_t sleep_state = 0;
-    static int64_t sleep_detect_time = 0;
-    static int64_t wakeup_detect_time = 0;
-    static int64_t pub_time = 0;
-    static float alert_voltage = 0;
-    static uint64_t alert_time;
-
-    alert_time = config_server_get_alert_time();
-    alert_time *= (3600000000);
-//    alert_time = 10000000;
-    ESP_LOGW(TAG, "%" PRIu64 "\n", alert_time);
-
-    if(config_server_get_alert_volt(&alert_voltage) != -1)
-    {
-    	alert_voltage = 16.0f;
-    }
-
-    memset(result, 0xcc, TIMES);
-    adc_calibration_init();
-    continuous_adc_init(adc1_chan_mask, adc1_chan_mask, channel, sizeof(channel) / sizeof(adc_channel_t));
-    adc_digi_start();
-
-    while(1)
-    {
-    	uint32_t count = 0;
-    	uint64_t avg = 0;
-    	uint32_t adc_val = 0;
-    	for(int j = 0; j < 10; j++)
-    	{
-			ret = adc_digi_read_bytes(result, TIMES, &ret_num, ADC_MAX_DELAY);
-			if (ret == ESP_OK || ret == ESP_ERR_INVALID_STATE)
-			{
-				if (ret == ESP_ERR_INVALID_STATE)
-				{
-					/**
-					 * @note 1
-					 * Issue:
-					 * As an example, we simply print the result out, which is super slow. Therefore the conversion is too
-					 * fast for the task to handle. In this condition, some conversion results lost.
-					 *
-					 * Reason:
-					 * When this error occurs, you will usually see the task watchdog timeout issue also.
-					 * Because the conversion is too fast, whereas the task calling `adc_digi_read_bytes` is slow.
-					 * So `adc_digi_read_bytes` will hardly block. Therefore Idle Task hardly has chance to run. In this
-					 * example, we add a `vTaskDelay(1)` below, to prevent the task watchdog timeout.
-					 *
-					 * Solution:
-					 * Either decrease the conversion speed, or increase the frequency you call `adc_digi_read_bytes`
-					 */
-				}
-
-	//            ESP_LOGI("TASK:", "ret is %x, ret_num is %d", ret, ret_num);
-				count = 0;
-				avg = 0;
-				for (int i = 0; i < ret_num; i += ADC_RESULT_BYTE)
-				{
-					adc_digi_output_data_t *p = (void*)&result[i];
-
-					if (ADC_CONV_MODE == ADC_CONV_SINGLE_UNIT_1 || ADC_CONV_MODE == ADC_CONV_ALTER_UNIT)
-					{
-						if (check_valid_data(p))
-						{
-							count++;
-							avg += (esp_adc_cal_raw_to_voltage(p->type2.data, &adc1_chars));
-	//                        ESP_LOGI(TAG, "Unit: %d,_Channel: %d, Value: %d", p->type2.unit+1, p->type2.channel, p->type2.data);
-						}
-						else
-						{
-							// abort();
-							ESP_LOGI(TAG, "Invalid data [%d_%d_%x]", p->type2.unit+1, p->type2.channel, p->type2.data);
-						}
-					}
-				}
-				//See `note 1`
-//				ESP_LOGI(TAG, "value: %u",(uint32_t)(avg/count));
-				vTaskDelay(10);
-			}
-			else if (ret == ESP_ERR_TIMEOUT)
-			{
-				/**
-				 * ``ESP_ERR_TIMEOUT``: If ADC conversion is not finished until Timeout, you'll get this return error.
-				 * Here we set Timeout ``portMAX_DELAY``, so you'll never reach this branch.
-				 */
-				ESP_LOGW(TAG, "No data, increase timeout or reduce conv_num_each_intr");
-				vTaskDelay(2000);
-			}
-    	}
-    	adc_val = (uint32_t)(avg/count);
-    	float battery_voltage;
-
-    	if(HARDWARE_VER == WICAN_V300)
-    	{
-    		battery_voltage = (adc_val*116)/(16*1000.0f);
-    	}
-    	else if(HARDWARE_VER == WICAN_USB_V100)
-    	{
-    		battery_voltage = (adc_val*106.49f)/(6.49f*1000.0f);
-    	}
-    	battery_voltage += 0.2;
-    	// if(project_hardware_rev == WICAN_V210)
-    	// {
-    	// 	battery_voltage = -1;
-    	// }
-
-    	xQueueOverwrite( voltage_queue, &battery_voltage );
-        if (battery_voltage < sleep_voltage)
-        {
-        	dev_status_clear_bits(DEV_WAKE_VOLTAGE_OK_BIT);
-        }
-        else
-        {
-        	dev_status_set_bits(DEV_WAKE_VOLTAGE_OK_BIT);
-        }
-    	if(enable_sleep == 1)
-    	{
-			switch(sleep_state)
-			{
-				case RUN_STATE:
-				{
-					if(battery_voltage < sleep_voltage)
-					{
-						ESP_LOGI(TAG, "low voltage, value: %lu, voltage: %f",adc_val, battery_voltage);
-						sleep_detect_time = esp_timer_get_time();
-						sleep_state++;
-					}
-					break;
-				}
-				case SLEEP_DETECTED:
-				{
-					if(battery_voltage > sleep_voltage)
-					{
-						ESP_LOGI(TAG, "low voltage, value: %lu, voltage: %f",adc_val, battery_voltage);
-						sleep_state = RUN_STATE;
-					}
-
-					if((esp_timer_get_time() - sleep_detect_time) > SLEEP_TIME_DELAY)
-					{
-						sleep_state = SLEEP_STATE;
-	//    	    		wifi_network_deinit();
-	//    	    		ble_disable();
-					}
-
-					break;
-				}
-				case SLEEP_STATE:
-				{
-					ESP_LOGI(TAG, "Go to sleep");
-					if(battery_voltage > sleep_voltage)
-					{
-						wakeup_detect_time = esp_timer_get_time();
-						ESP_LOGI(TAG, "low voltage, value: %lu, voltage: %f",adc_val, battery_voltage);
-						sleep_state = WAKEUP_STATE;
-					}
-
-					if(config_server_get_battery_alert_config())
-					{
-						if(battery_voltage < alert_voltage)
-						{
-							ESP_LOGW(TAG, "battery alert!");
-							if(((esp_timer_get_time() - pub_time) > alert_time) || (pub_time == 0))
-							{
-								pub_time = esp_timer_get_time();
-								wifi_network_init(config_server_get_alert_ssid(), config_server_get_alert_pass());
-								vTaskDelay(1000 / portTICK_PERIOD_MS);
-								uint8_t count = 0;
-								while(!wifi_network_is_connected())
-								{
-									vTaskDelay(1000 / portTICK_PERIOD_MS);
-									if(count++ > 10)
-									{
-										break;
-									}
-								}
-								if(wifi_network_is_connected())
-								{
-									ESP_LOGI(TAG, " wifi connectred try to publish");
-									mqtt_init();
-									EventBits_t bits = xEventGroupWaitBits(s_mqtt_event_group,
-																			PUB_SUCCESS_BIT,
-																			pdFALSE,
-																			pdFALSE,
-																			pdMS_TO_TICKS(10000));
-									if (bits & PUB_SUCCESS_BIT)
-									{
-										ESP_LOGI(TAG, "publish ok");
-										xEventGroupClearBits(s_mqtt_event_group, PUB_SUCCESS_BIT);
-									}
-									else
-									{
-										ESP_LOGE(TAG, "publish error");
-									}
-									esp_mqtt_client_disconnect(client);
-									vTaskDelay(1000 / portTICK_PERIOD_MS);
-									wifi_network_deinit();
-								}
-							}
-						}
-					}
-					break;
-				}
-				case WAKEUP_STATE:
-				{
-					if(battery_voltage > sleep_voltage)
-					{
-						if((esp_timer_get_time() - wakeup_detect_time) > WAKEUP_TIME_DELAY)
-						{
-							ESP_LOGI(TAG, "Wake up now...");
-                            restart_tracker_restart(RESTART_TRACKER_PLANNED_REASON_POWER_WAKE,
-                                                    RESTART_TRACKER_SOURCE_SLEEP_MODE,
-                                                    RESTART_TRACKER_FLAG_NONE);
-
-						}
-					}
-					else if(battery_voltage < sleep_voltage)
-					{
-						sleep_state = SLEEP_STATE;
-					}
-					break;
-				}
-			}
-
-	//    	ESP_LOGI(TAG, "value: %u",adc_val);
-			if(sleep_state == SLEEP_STATE)
-			{
-				ESP_LOGW(TAG, "sleeping");
-				can_disable();
-				wifi_network_deinit();
-				ble_disable();
-				esp_sleep_enable_timer_wakeup(2*1000000);
-				esp_light_sleep_start();;
-			}
-			else vTaskDelay(pdMS_TO_TICKS(1000));
-    	}
-    	else
-    	{
-    		vTaskDelay(pdMS_TO_TICKS(1000));
-    	}
-    }
-
-    adc_digi_stop();
-    ret = adc_digi_deinitialize();
-    assert(ret == ESP_OK);
-}
-
-int8_t sleep_mode_get_voltage(float *val)
-{
-	if(voltage_queue != NULL)
-	{
-		if(xQueuePeek( voltage_queue, val, 0 ))
-		{
-			return 1;
-		}
-		else return -1;
-	}
-	return -1;
-}
-
-int8_t sleep_mode_init(uint8_t enable, float sleep_volt)
-{
-	enable_sleep = enable;
-	sleep_voltage = sleep_volt;
-	ESP_LOGW(TAG, "sleep_volt: %2.2f", sleep_volt);
-	s_mqtt_event_group = xEventGroupCreate();
-    voltage_queue = xQueueCreateStatic(1, sizeof(float), voltage_queue_storage, &voltage_queue_struct);
-	xTaskCreate(adc_task, "adc_task", 4096, (void*)AF_INET, 5, NULL);
-
-	return 1;
-}
-#elif HARDWARE_VER == WICAN_PRO
 #include <string.h>
 #include <stdio.h>
 #include "esp_log.h"
@@ -973,8 +447,8 @@ esp_err_t read_ss_adc_voltage(float *voltage_out)
 /* The ONE sleep-entry teardown. Previously this existed as two copies -- the low-voltage timeout
  * path and the boot-loop guard -- which had to be kept in step by hand and had already drifted
  * (the LED suspend sat on different sides of the state_info publish). One body means they cannot
- * diverge again. Each caller keeps only its own tail: the low-voltage path adds the 1 s settle
- * and the periodic-wakeup timer, the boot-loop guard adds its printf and the red breathing LED.
+ * diverge again. Each caller keeps only its own tail: the low-voltage path adds the 1 s settle,
+ * the boot-loop guard adds its printf and the red breathing LED.
  *
  * Returns false when sleep must be POSTPONED -- see the flash interlock below. The caller must
  * then NOT move to STATE_SLEEPING.
@@ -1558,7 +1032,7 @@ static bool sleep_mode_can_wake_check(float battery_voltage)
         return false;  /* quiet, stuck, or cooling down -- can_wake_handle() logged if it mattered */
     }
 
-    /* Same hard floor the periodic path uses: never reboot into a brown-out. Cranking dips to
+    /* Hard floor: never reboot into a brown-out. Cranking dips to
      * 9-11 V and clears within one 2 s cycle, so a deferral costs one cycle and the next pass
      * re-checks against a fresh ADC read. */
     if(battery_voltage <= CRITICAL_VOLTAGE)
@@ -1638,9 +1112,6 @@ void light_sleep_task(void *pvParameters)
     static wc_timer_t sleep_timer;
     static wc_timer_t wakeup_timer;
 	static uint32_t sleep_time;
-	static int8_t periodic_wakeup;
-	static uint32_t wakeup_interval;
-	static wc_timer_t periodic_wakeup_timer;
 	/* #4: latch for the ECU-veto lines (serial at both sites, plus the "sleep countdown cancelled"
 	 * event line at the STATE_LOW_VOLTAGE site -- see sleep_log_ecu_veto). Cleared every pass the
 	 * ECU is NOT answering, so it is scoped to a veto episode and not to a boot -- this device
@@ -1707,23 +1178,6 @@ void light_sleep_task(void *pvParameters)
 		sleep_time *= 60000; //change min to ms
 	}
 
-	periodic_wakeup = config_server_get_periodic_wakeup();
-
-    if(periodic_wakeup == -1)
-    {
-        periodic_wakeup = 0;
-    }
-
-    if(config_server_get_wakeup_interval(&wakeup_interval) == -1)
-    {
-        wakeup_interval = 30*60000; //5 min
-        ESP_LOGW(TAG, "Failed to get wakeup interval, using default 5 min");
-    }
-    else
-    {
-        wakeup_interval *= 60000; //change min to ms
-    }
-
     // Create queues (static allocation)
     voltage_queue = xQueueCreateStatic(1, sizeof(float), voltage_queue_storage, &voltage_queue_struct);
     sleep_state_queue = xQueueCreateStatic(1, sizeof(sleep_state_info_t), sleep_state_queue_storage, &sleep_state_queue_struct);
@@ -1735,8 +1189,8 @@ void light_sleep_task(void *pvParameters)
     // ESP_ERROR_CHECK(adc_continuous_start(handle));
 
     // Log initial configuration
-    ESP_LOGI(TAG, "Sleep task started. Sleep enabled: %d, Sleep voltage: %.2f, Wakeup voltage: %.2f, Sleep time: %lu, Periodic wakeup: %d, Wakeup interval: %lu", 
-             sleep_en, sleep_voltage, wakeup_voltage, sleep_time, periodic_wakeup, wakeup_interval);
+    ESP_LOGI(TAG, "Sleep task started. Sleep enabled: %d, Sleep voltage: %.2f, Wakeup voltage: %.2f, Sleep time: %lu", 
+             sleep_en, sleep_voltage, wakeup_voltage, sleep_time);
 
     /* Shadow of DEV_WAKE_VOLTAGE_OK_BIT: -1 = not resolved yet, 0 = cleared, 1 = set.
      *
@@ -2110,10 +1564,6 @@ void light_sleep_task(void *pvParameters)
                             current_state = STATE_SLEEPING;
                             cd.armed_us = 0;   /* it ran out; nothing left to cancel */
                             vTaskDelay(pdMS_TO_TICKS(1000));
-                            if(periodic_wakeup)
-                            {
-                                wc_timer_set(&periodic_wakeup_timer, wakeup_interval);
-                            }
                         }
                         else
                         {
@@ -2130,14 +1580,6 @@ void light_sleep_task(void *pvParameters)
                         ESP_LOGI(TAG, "Voltage above wakeup threshold, starting wakeup timer");
                         current_state = STATE_WAKE_PENDING;
                         wc_timer_set(&wakeup_timer, 1000); // 2 second timer for stable voltage
-                    }
-                    else if(battery_voltage > CRITICAL_VOLTAGE && periodic_wakeup && wc_timer_is_expired(&periodic_wakeup_timer))
-                    {
-                        ESP_LOGI(TAG, "Periodic wakeup timer expired, returning to normal mode");
-                        // current_state = STATE_NORMAL;
-                        restart_tracker_restart(RESTART_TRACKER_PLANNED_REASON_POWER_WAKE,
-                                                RESTART_TRACKER_SOURCE_SLEEP_MODE,
-                                                RESTART_TRACKER_FLAG_NONE);
                     }
                     break;
 
@@ -2635,5 +2077,3 @@ void sleep_mode_init(void)
         }
 	}
 }
-
-#endif

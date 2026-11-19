@@ -1374,8 +1374,7 @@
                             <td>Sleep After:</td>
                             <td class="slider-container"><input oninput="document.getElementById('sleep_time_value').textContent = this.value;submit_enable();" id="sleep_time" max="30" min="1" name="sleep_time" step="1" type="range" value="5"> <span id="sleep_time_value">5</span>min</td>
                         </tr>
-                        <!-- Wake on CAN (issue #4). Unlike periodic_wakeup above, this one is
-                             real and on by default. The transceiver keeps watching the bus while
+                        <!-- Wake on CAN (issue #4). On by default. The transceiver keeps watching the bus while
                              the dongle sleeps and costs essentially nothing to do so, so the
                              dongle wakes when the car starts talking instead of waiting for the
                              battery voltage to rise. Leaving it enabled is the recommendation;
@@ -1388,99 +1387,8 @@
                                     <option value="disable">Disable</option>
                                 </select></td>
                         </tr>
-                        <!-- Periodic wake up is inoperative in this fork: the firmware pins
-                             periodic_wakeup to "disable" in the config parser
-                             (config_server.c), same as batt_alert below. A wake was only an
-                             esp_restart() that nothing distinguishes from a cold boot, and
-                             this build has no outbound client to report anything with. Rows
-                             hidden; both controls stay in the DOM deliberately -- the keys
-                             keep round-tripping, and the battery-guard reimplementation
-                             (GitHub issue #24) can resurrect this as-is. -->
-                        <tr style="display:none">
-                            <td>Periodic wake up:</td>
-                            <td><select id="periodic_wakeup" name="periodic_wakeup" onchange="submit_enable();">
-                                    <option value="enable">Enable</option>
-                                    <option value="disable">Disable</option>
-                                </select></td>
-                        </tr>
-                        <tr id="wakeup_every_row" style="display:none">
-                            <td>Wakeup Every:</td>
-                            <td class="slider-container"><input oninput="document.getElementById('wakeup_interval_value').textContent = this.value;submit_enable();" id="wakeup_interval" max="240" min="5" name="wakeup_interval" step="1" type="range" value="60"> <span id="wakeup_interval_value">60</span>min</td>
-                        </tr>
-                        <!-- Battery Alert is inoperative in this fork: the firmware pins
-                             batt_alert to "disable" in /store_config (config_server.c). Row
-                             hidden; the select AND the full batt_alert_div form below stay
-                             in the DOM deliberately -- the batt_* keys keep round-tripping
-                             through them, and the battery-guard reimplementation (GitHub
-                             issue #24: periodic wake -> voltage check -> alert via nearby
-                             network) can resurrect this form as-is. -->
-                        <tr style="display:none">
-                            <td>Battery Alert:</td>
-                            <td><select id="batt_alert" name="batt_alert" onchange="submit_enable();">
-                                    <option value="disable">Disable</option>
-                                </select></td>
-                        </tr>
                     </tbody>
                 </table>
-                <div id="batt_alert_div">
-                    <div class="divider"></div>
-                    <div class="section-title">Battery Alert</div>
-                    <table class="form-table">
-                        <tbody>
-                            <tr>
-                                <td><label for="batt_alert_ssid"><b>SSID:</b></label></td>
-                                <td><input id="batt_alert_ssid" name="batt_alert_ssid" value="MeatPi"></td>
-                            </tr>
-                            <tr>
-                                <td><label for="batt_alert_pass"><b>Password:</b></label></td>
-                                <td><input autocomplete="off" id="batt_alert_pass" name="batt_alert_pass" type="password" value=""></td>
-                            </tr>
-                            <tr>
-                                <td><label for="batt_alert_volt"><b>Alert Voltage:</b></label></td>
-                                <td><input id="batt_alert_volt" max="15.0" min="9.0" name="batt_alert_volt" step="0.1" type="number" value="11.0"></td>
-                            </tr>
-                            <tr>
-                                <td><label for="batt_alert_protocol"><b>Alert Protocol:</b></label></td>
-                                <td><select id="batt_alert_protocol" name="batt_alert_protocol" style="width:93px">
-                                        <option value="mqtt">MQTT</option>
-                                    </select></td>
-                            </tr>
-                            <tr>
-                                <td><label for="batt_alert_url"><b>Alert URL:</b></label></td>
-                                <td><input id="batt_alert_url" name="batt_alert_url" value="127.0.0.1"></td>
-                            </tr>
-                            <tr>
-                                <td><label for="batt_alert_port"><b>Alert Port:</b></label></td>
-                                <td><input id="batt_alert_port" max="65535" min="1" name="batt_alert_port" type="number" value="1883"></td>
-                            </tr>
-                            <tr>
-                                <td><label for="batt_mqtt_user"><b>Alert MQTT User:</b></label></td>
-                                <td><input id="batt_mqtt_user" name="batt_mqtt_user" value="meatpi"></td>
-                            </tr>
-                            <tr>
-                                <td><label for="batt_mqtt_pass"><b>Alert MQTT Pass:</b></label></td>
-                                <td><input autocomplete="off" id="batt_mqtt_pass" name="batt_mqtt_pass" type="password" value=""></td>
-                            </tr>
-                            <tr>
-                                <td><label for="batt_alert_topic"><b>Alert Topic:</b></label></td>
-                                <td><input id="batt_alert_topic" name="batt_alert_topic" value="CAR1/voltage"></td>
-                            </tr>
-                            <tr>
-                                <td><b>Alert every:</b></td>
-                                <td><select id="batt_alert_time" name="batt_alert_time" style="width:93px">
-                                        <option value="1">1hr</option>
-                                        <option value="6">6hr</option>
-                                        <option value="12">12hr</option>
-                                        <option value="24">1day</option>
-                                    </select></td>
-                            </tr>
-                            <tr>
-                                <td>&nbsp;</td>
-                                <td>&nbsp;</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
                 <div class="section-title">AP Config</div>
                 <div style="margin:8px 0;display:none" id="apstation_warning_div">
                     <div style="background:linear-gradient(135deg,#fef3c7 0%,#fde68a 100%);border:1px solid #f59e0b;border-radius:8px;padding:12px;box-shadow:0 2px 4px #0000001a">
