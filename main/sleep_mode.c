@@ -971,54 +971,6 @@ esp_err_t read_ss_adc_voltage(float *voltage_out)
     return ESP_ERR_INVALID_STATE;  // No valid samples
 }
 
-void configure_wakeup_sources(void)
-{
-    esp_sleep_enable_ext0_wakeup(OBD_READY_PIN, 0);
-    rtc_gpio_pullup_dis(OBD_READY_PIN);
-}
-
-void enter_deep_sleep(void)
-{
-	static char response_buffer[32];
-	static uint32_t response_len = 0;
-	static int64_t response_cmd_time = 0;
-	esp_err_t sleep_ret = ESP_OK;
-    ESP_LOGI(TAG, "Entering deep sleep");
-    configure_wakeup_sources();
-    
-    // adc_continuous_stop(adc_handle);
-    
-	if(gpio_get_level(OBD_READY_PIN) == 1)
-	{
-		printf("MIC is already sleeping!!!!!!!\r\n");
-	}
-    gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
-	// sleep_ret = elm327_sleep();
-    
-	vTaskDelay(pdMS_TO_TICKS(5000));
-
-	if(sleep_ret == ESP_OK && gpio_get_level(OBD_READY_PIN) == 1)
-	{
-		printf("MIC chip is sleeping...\r\n");
-	}
-	else
-	{
-		printf("MIC sleep failed...\r\n");
-	}
-    gpio_set_level(CAN_STDBY_GPIO_NUM, 1);
-	ESP_LOGI(TAG, "Going to sleep now");
-	// Returns after any in-progress indicator repaint; nothing relights the
-	// LED between here and esp_deep_sleep_start().
-	led_indicator_suspend();
-	led_set_level(0,0,0);
-    esp_wifi_stop();
-    ble_disable();
-    sd_card_deinit();
-	vTaskDelay(pdMS_TO_TICKS(1000));
-	// Enter deep sleep
-	esp_deep_sleep_start();
-}
-
 /* The ONE sleep-entry teardown. Previously this existed as two copies -- the low-voltage timeout
  * path and the boot-loop guard -- which had to be kept in step by hand and had already drifted
  * (the LED suspend sat on different sides of the state_info publish). One body means they cannot

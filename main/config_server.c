@@ -4533,31 +4533,3 @@ int8_t config_server_get_ble_power(int8_t *power_dbm)
 	}
 }
 
-void config_server_set_ble_config(uint8_t b)
-{
-	cJSON * root;
-	root = cJSON_Parse(device_config_file);
-	if(b == 1)
-	{
-		cJSON_SetValuestring(cJSON_GetObjectItem(root,"ble_status"), "enable");
-	}
-	else if(b==0)
-	{
-		cJSON_SetValuestring(cJSON_GetObjectItem(root,"ble_status"), "disable");
-	}
-	const char *resp_str = cJSON_PrintUnformatted(root);
-	ESP_LOGI(TAG, "resp_str:%s", resp_str);
-	FILE* f = fopen(FS_MOUNT_POINT"/config.json", "w");
-	if (f != NULL)
-	{
-		fprintf(f, resp_str);
-		fclose(f);
-	}
-	// xTimerStart( xrestartTimer, 0 );
-	config_server_schedule_reboot(RESTART_TRACKER_PLANNED_REASON_CONFIG_APPLY,
-						 RESTART_TRACKER_SOURCE_CONFIG_SERVER,
-						 RESTART_TRACKER_FLAG_SETTINGS_SAVED);
-	free((void *)resp_str);
-    cJSON_Delete(root);
-}
-
