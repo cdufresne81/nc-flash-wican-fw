@@ -1408,9 +1408,9 @@ function addCustomCanFilterEntry(rowData = {}) {
                     <td>Unit:</td>
                     <td><input type="text" class="unit-input" value="${safe(p.unit)}" placeholder="Unit"></td>
                 </tr>
-                <!-- Class + Period hidden here too: only the Legacy AutoPID ATMA monitor
-                     (process_can_filter_frame) honors a filter parameter's period; poll_log
-                     and fast_log decode broadcasts with their own fixed throttles. Inputs
+                <!-- Class + Period hidden here too: the firmware no longer parses either
+                     (the Legacy AutoPID ATMA monitor that honored period was deleted in #148);
+                     poll_log decodes broadcasts with its own fixed throttle. Inputs
                      stay in the DOM for the auto_pid.json round-trip. -->
                 <tr style="display:none">
                     <td>Class:</td>

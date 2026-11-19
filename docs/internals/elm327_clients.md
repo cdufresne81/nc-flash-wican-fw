@@ -35,8 +35,8 @@ NC Flash out, never blocks a reboot or a config save, and is not part of the fla
 
 Every command queued for the chip is a client command **unless the firmware queued it for its own
 housekeeping** with `elm327_process_housekeeping_cmd()`. Only `obd.c` does: power-pin setup,
-sleep configuration, the battery-voltage read. So the 35000 socket, BLE, the wired UART
-(`wc_uart.c`) and the web page's Test-PID are all clients and all gated.
+sleep configuration, the battery-voltage read. So the 35000 socket, BLE and the wired UART
+(`wc_uart.c`) are all clients and all gated.
 
 The test is who called, not what the arguments look like. The first version keyed on "has a reply
 queue" and let the wired UART and Test-PID through during a flash.

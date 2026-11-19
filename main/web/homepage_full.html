@@ -1705,11 +1705,10 @@
             </table>
             <div id="automate">
             <!-- Low-Voltage Behavior hidden: disable_on_sleep_voltage /
-                 pid_polling_min_voltage are honored only by the Legacy AutoPID ELM task
-                 (autopid_task / autopid_should_pause_pid_polling in autopid.c) -- the
-                 Datalogger (poll_log) protocol this product always runs never reads
-                 them. Elements stay in the DOM so storeAutoTableData() keeps
-                 round-tripping the auto_pid.json keys. -->
+                 pid_polling_min_voltage were honored only by the Legacy AutoPID ELM task,
+                 deleted in #148 -- the firmware no longer parses them. Elements stay in
+                 the DOM so storeAutoTableData() keeps round-tripping the auto_pid.json
+                 keys. -->
             <div style="display:none">
             <table class="form-table">
                 <tbody>

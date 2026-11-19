@@ -805,8 +805,8 @@ static void polllog_eval_gate(int64_t now_us)
 /*
  * Hybrid: decode one drained NON-response frame against the configured broadcast filters and push
  * any matches to the wide CSV with source "CANFLT".
- * Keyed to poll_log's own s_cfg. parameter_t.timer is repurposed as a per-channel throttle (the
- * AutoPID task isn't running in POLL_LOG, so that field is otherwise unused). Takes the same brief
+ * Keyed to poll_log's own s_cfg. parameter_t.timer is repurposed as a per-channel throttle (that
+ * field is otherwise unused). Takes the same brief
  * autopid_lock as the response decode; never nested (a frame is EITHER our response OR broadcast).
  * A stale 0x7E8 response frame matches no can_filter, so it is correctly ignored here.
  */
@@ -816,8 +816,7 @@ static void polllog_decode_broadcast(const twai_message_t *msg)
         return;
     /* Try-lock (0): broadcast decode is opportunistic -- the next frame is ~20 ms away, so
      * skipping under contention is free. A blocking wait here would multiply per drained frame
-     * inside the pre-send drain loop: an HTTP Test-PID/Test-filter handler holds this lock for
-     * seconds, and at real bus rates that would stall ALL polling for the whole hold. */
+     * inside the pre-send drain loop, and at real bus rates that would stall ALL polling. */
     if (!autopid_lock(0))
         return;
 

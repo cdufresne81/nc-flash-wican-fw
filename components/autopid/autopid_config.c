@@ -60,74 +60,6 @@ static char *strdup_psram(const char *s)
     return copy;
 }
 
-// Helper function to replace all occurrences of "ATSP" with "ATTP" in a string.
-// Normalizes case and tolerates whitespace, e.g. "atsp6", "AT SP 6", "At s p6".
-static void replace_atsp_with_attp(char *str)
-{
-    if (!str)
-        return;
-
-    for (size_t i = 0; str[i] != '\0'; i++)
-    {
-        unsigned char c0 = (unsigned char)str[i];
-        if (tolower(c0) != 'a')
-            continue;
-
-        unsigned char c1 = (unsigned char)str[i + 1];
-        if (c1 == 0 || tolower(c1) != 't')
-            continue;
-
-        size_t j = i + 2;
-        while (str[j] != '\0' && isspace((unsigned char)str[j]))
-            j++;
-
-        if (str[j] == '\0' || tolower((unsigned char)str[j]) != 's')
-            continue;
-
-        size_t k = j + 1;
-        while (str[k] != '\0' && isspace((unsigned char)str[k]))
-            k++;
-
-        if (str[k] == '\0' || tolower((unsigned char)str[k]) != 'p')
-            continue;
-
-        // Force canonical form "ATTP" (preserve any spacing in-between)
-        str[i] = 'A';
-        str[i + 1] = 'T';
-        str[j] = 'T';
-        str[k] = 'P';
-
-        // Continue scanning after the matched 'P'
-        i = k;
-    }
-}
-
-static char *normalize_init_string(const char *src)
-{
-    if (!src || src[0] == '\0')
-    {
-        return NULL;
-    }
-
-    char *out = strdup_psram(src);
-    if (!out)
-    {
-        return NULL;
-    }
-
-    // Replace semicolons with carriage returns
-    for (size_t i = 0; out[i] != '\0'; i++)
-    {
-        if (out[i] == ';')
-        {
-            out[i] = '\r';
-        }
-    }
-
-    replace_atsp_with_attp(out);
-    return out;
-}
-
 static cJSON *parse_json_file(FILE *f)
 {
     fseek(f, 0, SEEK_END);
@@ -163,22 +95,6 @@ static float json_item_to_float(const cJSON *item, float default_value)
     const char *s = json_get_string(item);
     if (s && s[0] != '\0')
         return (float)atof(s);
-    return default_value;
-}
-
-static uint32_t json_item_to_u32(const cJSON *item, uint32_t default_value)
-{
-    if (!item)
-        return default_value;
-    if (cJSON_IsNumber(item))
-    {
-        if (item->valuedouble < 0)
-            return default_value;
-        return (uint32_t)item->valuedouble;
-    }
-    const char *s = json_get_string(item);
-    if (s && s[0] != '\0')
-        return (uint32_t)atoi(s);
     return default_value;
 }
 
@@ -223,9 +139,7 @@ static uint8_t json_item_to_sample_every(const cJSON *item, const char *dbg)
  * files load unchanged. Short/non-hex PID -> 0x01 (standard OBD).
  * Mirrors to keep in sync: main/web/src/main.js pidServiceMode() (UI emit) and
  * tools/nc_datalogger/gen_logcfg_pid.py build_pids() (guard-free request[:2]; safe
- * because the generator controls its inputs). The Test button sniffs the same prefix
- * independently for its +0x40 echo check (autopid_http_test_pid.c req_service) --
- * left separate because that whole path dies with issue #28. */
+ * because the generator controls its inputs). */
 static uint8_t pid_prefix_mode(const char *pid_str)
 {
     if (pid_str && isxdigit((unsigned char)pid_str[0]) && isxdigit((unsigned char)pid_str[1]))
@@ -262,23 +176,10 @@ static char *json_strdup_key_or_default(const cJSON *obj, const char *key, const
     return default_value ? strdup_psram(default_value) : NULL;
 }
 
-static sensor_type_t json_sensor_type(const cJSON *obj, const char *key, sensor_type_t default_value)
-{
-    if (!obj || !key)
-        return default_value;
-    const cJSON *item = cJSON_GetObjectItem((cJSON *)obj, key);
-    const char *s = json_get_string(item);
-    if (!s)
-        return default_value;
-    return (strcmp(s, "binary") == 0) ? BINARY_SENSOR : SENSOR;
-}
-
 static void parse_parameter_object(parameter_t *out_param, const cJSON *param_obj,
                                    const char *name_key, const char *expr_key,
-                                   const char *unit_key, const char *class_key,
-                                   const char *sensor_type_key,
-                                   const char *min_key, const char *max_key,
-                                   const char *period_key)
+                                   const char *unit_key,
+                                   const char *min_key, const char *max_key)
 {
     if (!out_param || !param_obj)
         return;
@@ -292,16 +193,12 @@ static void parse_parameter_object(parameter_t *out_param, const cJSON *param_ob
     out_param->name = json_strdup_key_or_default(param_obj, name_key, "none");
     out_param->expression = json_strdup_key_or_default(param_obj, expr_key, "none");
     out_param->unit = json_strdup_key_or_default(param_obj, unit_key, "none");
-    out_param->class = json_strdup_key_or_default(param_obj, class_key, "none");
-    out_param->sensor_type = json_sensor_type(param_obj, sensor_type_key, SENSOR);
 
     out_param->min = json_item_to_float(min_key ? cJSON_GetObjectItem((cJSON *)param_obj, min_key) : NULL, FLT_MAX);
     out_param->max = json_item_to_float(max_key ? cJSON_GetObjectItem((cJSON *)param_obj, max_key) : NULL, FLT_MAX);
-    out_param->period = json_item_to_u32(period_key ? cJSON_GetObjectItem((cJSON *)param_obj, period_key) : NULL, 0);
 
     out_param->timer = 0;
     out_param->value = FLT_MAX;
-    out_param->failed = false;
 }
 
 static bool parse_frame_id(const cJSON *frame_id_item, uint32_t *out_frame_id)
@@ -499,83 +396,10 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
 
     int idx = *pid_index;
 
-    cJSON *init_item = cJSON_GetObjectItem(root, "initialisation");
-    cJSON *car_model_item = cJSON_GetObjectItem(root, "car_model");
-    cJSON *ecu_protocol_item = cJSON_GetObjectItem(root, "ecu_protocol");
-    cJSON *disable_on_sleep_voltage_item = cJSON_GetObjectItem(root, "disable_on_sleep_voltage");
-    cJSON *pid_polling_min_voltage_item = cJSON_GetObjectItem(root, "pid_polling_min_voltage");
-    cJSON *cycle_item = cJSON_GetObjectItem(root, "cycle");
-    cJSON *pid_validation_item = cJSON_GetObjectItem(root, "pid_validation");
     cJSON *standard_pids_item = cJSON_GetObjectItem(root, "standard_pids");
     cJSON *specific_pids_item = cJSON_GetObjectItem(root, "car_specific");
     cJSON *can_filters_item = cJSON_GetObjectItem(root, "can_filters");
     cJSON *calculated_item = cJSON_GetObjectItem(root, "calculated");   // Task #17 calculated channels
-
-    if (init_item && init_item->valuestring)
-    {
-        autopid_config->custom_init = normalize_init_string(init_item->valuestring);
-    }
-    else
-    {
-        autopid_config->custom_init = NULL;
-    }
-
-    autopid_config->vehicle_model = car_model_item ? strdup_psram(car_model_item->valuestring) : NULL;
-    autopid_config->std_ecu_protocol = ecu_protocol_item ? strdup_psram(ecu_protocol_item->valuestring) : NULL;
-
-    // Backward-compatible default: do NOT disable AutoPID on low voltage unless explicitly enabled.
-    autopid_config->disable_on_sleep_voltage = false;
-    autopid_config->disable_pid_requests_on_sleep_voltage = false;
-    autopid_config->disable_pid_requests_on_automate_threshold = false;
-    if (disable_on_sleep_voltage_item)
-    {
-        if (cJSON_IsString(disable_on_sleep_voltage_item) && disable_on_sleep_voltage_item->valuestring)
-        {
-            const char *v = disable_on_sleep_voltage_item->valuestring;
-            // Supported values:
-            //  - "disable" (default)
-            //  - "enable" (pause AutoPID entirely on low voltage)
-            //  - "disable_pid_requests" (skip PID requests but keep CAN filters active)
-            //  - "automate_threshold" (skip PID requests below pid_polling_min_voltage; CAN filters remain active)
-            autopid_config->disable_on_sleep_voltage = (strcmp(v, "enable") == 0);
-            autopid_config->disable_pid_requests_on_sleep_voltage = (strcmp(v, "disable_pid_requests") == 0);
-            autopid_config->disable_pid_requests_on_automate_threshold = (strcmp(v, "automate_threshold") == 0);
-        }
-        else if (cJSON_IsBool(disable_on_sleep_voltage_item))
-        {
-            autopid_config->disable_on_sleep_voltage = cJSON_IsTrue(disable_on_sleep_voltage_item);
-            autopid_config->disable_pid_requests_on_sleep_voltage = false;
-            autopid_config->disable_pid_requests_on_automate_threshold = false;
-        }
-    }
-
-    // PID polling minimum voltage (used only for automate_threshold mode)
-    autopid_config->pid_polling_min_voltage = 13.1f;
-    if (pid_polling_min_voltage_item)
-    {
-        float v = autopid_config->pid_polling_min_voltage;
-        if (cJSON_IsNumber(pid_polling_min_voltage_item))
-        {
-            v = (float)pid_polling_min_voltage_item->valuedouble;
-        }
-        else if (cJSON_IsString(pid_polling_min_voltage_item) && pid_polling_min_voltage_item->valuestring)
-        {
-            v = (float)atof(pid_polling_min_voltage_item->valuestring);
-        }
-
-        // Basic sanity clamp: ignore clearly invalid values.
-        if (v >= 9.0f && v <= 18.0f)
-        {
-            autopid_config->pid_polling_min_voltage = v;
-        }
-    }
-
-    if (cycle_item && cycle_item->valuestring && strlen(cycle_item->valuestring) > 0)
-        autopid_config->cycle = atoi(cycle_item->valuestring);
-    else if (cycle_item && cycle_item->valueint)
-        autopid_config->cycle = cycle_item->valueint;
-    else
-        autopid_config->cycle = 10000;
 
     // Guard against non-string JSON (e.g. "standard_pids":123): valuestring is NULL for
     // non-string cJSON, so strcmp(NULL) would panic. With the live hot-reload this parse
@@ -584,22 +408,6 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                                      ? (strcmp(standard_pids_item->valuestring, "enable") == 0) : false;
     autopid_config->pid_specific_en = (specific_pids_item && cJSON_IsString(specific_pids_item) && specific_pids_item->valuestring)
                                      ? (strcmp(specific_pids_item->valuestring, "enable") == 0) : false;
-
-    // PID response validation (optional)
-    // Supports either string: "enable"/"disable" or boolean: true/false.
-    autopid_config->pid_validation_en = true; // default to enabled
-    if (pid_validation_item)
-    {
-        if (cJSON_IsString(pid_validation_item) && pid_validation_item->valuestring)
-        {
-            autopid_config->pid_validation_en = (strcmp(pid_validation_item->valuestring, "enable") == 0);
-        }
-        else if (cJSON_IsBool(pid_validation_item))
-        {
-            autopid_config->pid_validation_en = cJSON_IsTrue(pid_validation_item);
-        }
-    }
-    autopid_config->pid_validation_en = true; 
 
     // Load custom pids. Guard cJSON_IsArray: the sizing pass (count_auto_pid_pids) only
     // counts arrays, but cJSON_ArrayForEach happily walks an OBJECT's children too -- a
@@ -614,8 +422,6 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
             pid_data_t *curr_pid = &autopid_config->pids[idx];
 
             cJSON *pid_item = cJSON_GetObjectItem(pid, "PID");
-            cJSON *period_item = cJSON_GetObjectItem(pid, "Period");
-            cJSON *rxheader_item = cJSON_GetObjectItem(pid, "header");
             cJSON *enabled_item = cJSON_GetObjectItem(pid, "enabled");
 
             if (cJSON_GetArraySize(pids) > 0)
@@ -639,14 +445,6 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                 curr_pid->cmd[0] = '\0';
             }
 
-            if (period_item && period_item->valuestring && strlen(period_item->valuestring) > 0)
-                curr_pid->period = atoi(period_item->valuestring);
-            else if (period_item && period_item->valueint)
-                curr_pid->period = (uint32_t)period_item->valueint;
-            else
-                curr_pid->period = 10000;
-
-            curr_pid->rxheader = rxheader_item ? strdup_psram(rxheader_item->valuestring) : NULL;
             curr_pid->pid_type = PID_CUSTOM;
             curr_pid->enabled = (enabled_item && cJSON_IsBool(enabled_item)) ? cJSON_IsTrue(enabled_item) : true;
             curr_pid->sample_every = json_item_to_sample_every(cJSON_GetObjectItem(pid, "SampleEvery"), "auto_pid pids");
@@ -664,11 +462,8 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                     "Name",
                     "Expression",
                     "unit",
-                    "class",
-                    "sensor_type",
                     "MinValue",
-                    "MaxValue",
-                    "Period");
+                    "MaxValue");
             }
 
             idx++;
@@ -692,17 +487,10 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                 curr_pid->mode = 0x01;   /* std pids build cmd as "01%s" below -- always standard OBD */
             }
 
-            char std_init_buf[64];
-            int is_protocol_68 = 1;
-            int is_protocol_79 = 0;
-            const char *sh_value = "";
-
             curr_pid->parameters_count = 1;
             curr_pid->parameters = (parameter_t *)heap_caps_calloc(1, sizeof(parameter_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
             if (curr_pid->parameters)
             {
-                cJSON *rxheader_item = cJSON_GetObjectItem(pid, "ReceiveHeader");
-
                 parse_parameter_object(
                     curr_pid->parameters,
                     pid,
@@ -710,72 +498,9 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                     NULL,
                     NULL,
                     NULL,
-                    "sensor_type",
-                    NULL,
-                    NULL,
-                    "Period");
-                if (curr_pid->parameters->period == 0)
-                {
-                    curr_pid->parameters->period = 10000;
-                }
+                    NULL);
                 curr_pid->parameters->min = FLT_MAX;
                 curr_pid->parameters->max = FLT_MAX;
-
-                curr_pid->rxheader = rxheader_item ? strdup_psram(rxheader_item->valuestring) : NULL;
-
-                if (autopid_config->std_ecu_protocol)
-                {
-                    is_protocol_68 = (strcmp(autopid_config->std_ecu_protocol, "6") == 0 ||
-                                      strcmp(autopid_config->std_ecu_protocol, "8") == 0);
-                    is_protocol_79 = (strcmp(autopid_config->std_ecu_protocol, "7") == 0 ||
-                                      strcmp(autopid_config->std_ecu_protocol, "9") == 0);
-                }
-
-                if (is_protocol_68)
-                {
-                    sh_value = "7DF";
-                }
-                else if (is_protocol_79)
-                {
-                    sh_value = "18DB33F1";
-                }
-
-                // standard_init is a single global field re-derived by every
-                // std_pid iteration (last one wins). Free the prior strdup before
-                // overwriting so N std_pids don't leak N-1 copies per parse -- a
-                // per-apply leak once live hot-reload re-parses on each save.
-                // (The block below reassigns it on every path, so no NULL needed.)
-                free(autopid_config->standard_init);
-                if (is_protocol_68 || is_protocol_79)
-                {
-                    if (curr_pid->rxheader != NULL && strlen(curr_pid->rxheader) > 0)
-                    {
-                        snprintf(std_init_buf, sizeof(std_init_buf), "ATTP%s\rATSH%s\rATCRA%s\r",
-                                 autopid_config->std_ecu_protocol, sh_value, curr_pid->rxheader);
-                    }
-                    else
-                    {
-                        snprintf(std_init_buf, sizeof(std_init_buf), "ATTP%s\rATSH%s\rATCRA\r",
-                                 autopid_config->std_ecu_protocol, sh_value);
-                    }
-                    autopid_config->standard_init = strdup_psram(std_init_buf);
-                }
-                else
-                {
-                    // For non-CAN / unknown protocols, still honor the configured protocol.
-                    // Keep it minimal: only set protocol via ATTP.
-                    if (autopid_config->std_ecu_protocol &&
-                        autopid_config->std_ecu_protocol[0] != '\0' &&
-                        strcmp(autopid_config->std_ecu_protocol, "0") != 0)
-                    {
-                        snprintf(std_init_buf, sizeof(std_init_buf), "ATTP%s\r", autopid_config->std_ecu_protocol);
-                        autopid_config->standard_init = strdup_psram(std_init_buf);
-                    }
-                    else
-                    {
-                        autopid_config->standard_init = strdup_psram("ATTP0\r");
-                    }
-                }
 
                 if (curr_pid->parameters->name != NULL && strlen(curr_pid->parameters->name) > 0)
                 {
@@ -789,11 +514,9 @@ static void parse_auto_pid_json(autopid_config_t *autopid_config, int *pid_index
                         {
                             if (strcmp(pid_info->params[i].name, dash + 1) == 0)
                             {
-                                // parse_parameter_object already strdup'd "none"
-                                // defaults into class/unit; free them before the
-                                // lookup overwrite so the defaults don't leak.
-                                free(curr_pid->parameters->class);
-                                curr_pid->parameters->class = strdup_psram(pid_info->params[i].class);
+                                // parse_parameter_object already strdup'd a "none"
+                                // default into unit; free it before the lookup
+                                // overwrite so the default doesn't leak.
                                 free(curr_pid->parameters->unit);
                                 curr_pid->parameters->unit = strdup_psram(pid_info->params[i].unit);
                                 char pid_hex[3];
@@ -889,16 +612,8 @@ static void parse_can_filter_object(can_filter_t *out, const cJSON *filter)
             "name",
             "expression",
             "unit",
-            "class",
-            "sensor_type",
             "min",
-            "max",
-            "period");
-
-        if (out->parameters[pi].period == 0)
-        {
-            out->parameters[pi].period = 5000;
-        }
+            "max");
 
         pi++;
     }
@@ -983,8 +698,8 @@ static void autopid_cfg_parse_calculated_from_array(autopid_config_t *cfg, const
             continue;
         }
         parse_parameter_object(&arr[filled], obj,
-                               "name", "expression", "unit", "class", "sensor_type",
-                               "min", "max", "period");
+                               "name", "expression", "unit",
+                               "min", "max");
         filled++;
     }
 
@@ -1010,17 +725,6 @@ static void parse_car_data_json(autopid_config_t *autopid_config, int *pid_index
         cJSON *car = cJSON_GetArrayItem(cars, 0);
         if (car)
         {
-            cJSON *init_item = cJSON_GetObjectItem(car, "init");
-            if (init_item && cJSON_IsString(init_item) && init_item->valuestring)
-            {
-                autopid_config->specific_init = normalize_init_string(init_item->valuestring);
-                ESP_LOGI(TAG, "car_data init='%s' -> specific_init=%p", init_item->valuestring, (void *)autopid_config->specific_init);
-            }
-            else
-            {
-                ESP_LOGW(TAG, "car_data 'init' missing or not a string");
-            }
-
             cJSON *can_filters = cJSON_GetObjectItem(car, "can_filters");
             if (can_filters && cJSON_IsArray(can_filters))
             {
@@ -1084,15 +788,8 @@ static void parse_car_data_json(autopid_config_t *autopid_config, int *pid_index
                                 "name",
                                 "expression",
                                 "unit",
-                                "class",
-                                "sensor_type",
                                 "min",
-                                "max",
-                                "period");
-                            if (curr_pid->parameters[param_index].period == 0)
-                            {
-                                curr_pid->parameters[param_index].period = autopid_config->cycle;
-                            }
+                                "max");
                             param_index++;
                         }
                     }
@@ -1141,7 +838,6 @@ autopid_config_t *load_autopid_config(void)
         return NULL;
     }
 
-    autopid_config->last_successful_pid_time = 0;
     autopid_config->can_filters = NULL;
     autopid_config->can_filters_count = 0;
     autopid_config->from_session_list = from_session;
@@ -1175,7 +871,7 @@ autopid_config_t *load_autopid_config(void)
 }
 
 // Free every heap-allocated member of a parameter_t array, then the array base.
-// Guards the base so a partial-alloc (count>0 but base NULL) can't deref. All four
+// Guards the base so a partial-alloc (count>0 but base NULL) can't deref. All three
 // strings are strdup_psram'd (incl. "none" defaults) -> no static literals, safe free.
 static void autopid_free_param_array(parameter_t *params, uint32_t count)
 {
@@ -1186,15 +882,14 @@ static void autopid_free_param_array(parameter_t *params, uint32_t count)
         free(params[j].name);
         free(params[j].expression);
         free(params[j].unit);
-        free(params[j].class);
     }
     free(params);
 }
 
 // Deep-free a table produced by load_autopid_config(). Mirrors the parser's exact
-// allocation set: pids[].cmd/rxheader + each pid's parameter strings+array,
-// can_filters[] parameter strings+array, calculated[] strings+array, the six
-// top-level char*, then the struct. Guards every array base (partial-alloc safe).
+// allocation set: pids[].cmd + each pid's parameter strings+array,
+// can_filters[] parameter strings+array, calculated[] strings+array, then the struct.
+// Guards every array base (partial-alloc safe).
 void autopid_config_deep_free(autopid_config_t *c)
 {
     if (!c)
@@ -1205,7 +900,6 @@ void autopid_config_deep_free(autopid_config_t *c)
         for (uint32_t i = 0; i < c->pid_count; i++)
         {
             free(c->pids[i].cmd);
-            free(c->pids[i].rxheader);
             autopid_free_param_array(c->pids[i].parameters, c->pids[i].parameters_count);
         }
         free(c->pids);
@@ -1221,13 +915,6 @@ void autopid_config_deep_free(autopid_config_t *c)
     }
 
     autopid_free_param_array(c->calculated, c->calculated_count);
-
-    free(c->custom_init);
-    free(c->standard_init);
-    free(c->specific_init);
-    free(c->selected_car_model);
-    free(c->std_ecu_protocol);
-    free(c->vehicle_model);
 
     free(c);
 }

@@ -2437,46 +2437,17 @@ static esp_err_t upload_sd_handler(httpd_req_t *req)
 	return ESP_OK;
 }
 
-#define MAX_AVAILABLE_PIDS_SIZE 		(1024*15)
 static esp_err_t scan_available_pids_handler(httpd_req_t *req)
 {
-    char protocol[8];
-    char param[32];
-    uint8_t protocol_num = 6; // Default protocol
-
-    /* Always taken: config_server_protocol() is the constant POLL_LOG. The legacy AutoPID
-     * scanner is unreachable on this fork -- the mode field is gone and there is no Settings
-     * control to point the user at any more, so the old "go and set Protocol to AutoPID"
-     * message named a UI that no longer exists. */
+    /* The legacy AutoPID scanner was deleted (issue #148). The mode field is gone too and
+     * there is no Settings control to point the user at any more, so the old "go and set
+     * Protocol to AutoPID" message named a UI that no longer exists. */
     {
         httpd_resp_set_type(req, "application/json");
 		const char *resp_str = "{\"text\":\"Scanning for available PIDs is not supported on this firmware. Add the PIDs you want under Logger -> Polled PIDs.\"}";
         httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
-	
-    if (httpd_req_get_url_query_str(req, param, sizeof(param)) == ESP_OK) {
-        if (httpd_query_key_value(param, "protocol", protocol, sizeof(protocol)) == ESP_OK) {
-            protocol_num = atoi(protocol);
-            ESP_LOGI(TAG, "Scanning PIDs with protocol: %d", protocol_num);
-        }
-    }
-
-    // char *available_pids = malloc(MAX_AVAILABLE_PIDS_SIZE);
-    char *available_pids = heap_caps_malloc(MAX_AVAILABLE_PIDS_SIZE, MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
-    if (available_pids == NULL) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    memset(available_pids, 0, MAX_AVAILABLE_PIDS_SIZE);
-    
-    if (autopid_find_standard_pid(protocol_num, available_pids, MAX_AVAILABLE_PIDS_SIZE) == ESP_OK) {
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, available_pids, HTTPD_RESP_USE_STRLEN);
-    }
-
-    free(available_pids);
-    return ESP_OK;
 }
 
 static esp_err_t std_pid_info_handler(httpd_req_t *req) 

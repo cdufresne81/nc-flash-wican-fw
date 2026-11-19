@@ -25,10 +25,6 @@
 #include <stdint.h>
 
 #include <esp_err.h>
-#include <time.h>
-
-#define AUTOPID_BUFFER_SIZE (1024*4)
-#define QUEUE_SIZE 10
 
 // Safety caps for user-configurable destinations (prevents stack/heap abuse via config JSON)
 #define AUTOPID_MAX_DESTINATIONS 6
@@ -39,19 +35,6 @@
  * authoritative enforcement point because it INDEXES arrays with the value while running
  * on the sole-TWAI-owner poll task. The UI validator must use the same 64. */
 #define AUTOPID_MAX_SAMPLE_EVERY 64
-
-typedef struct {
-    uint8_t data[AUTOPID_BUFFER_SIZE];
-    uint32_t length;
-    uint8_t* priority_data;
-    uint8_t  priority_data_len;
-} response_t;
-
-typedef enum
-{
-    SENSOR = 0,
-    BINARY_SENSOR = 1,
-} sensor_type_t;
 
 ////////////////
 
@@ -69,25 +52,19 @@ typedef struct
     char *name;
     char *expression;
     char *unit;
-    char *class;
     bool enabled;
-    uint32_t period; 
     float min;
     float max;
-    sensor_type_t sensor_type;
     int64_t timer;
     float value;
-    bool failed;
 }parameter_t;
 
 typedef struct
 {
     char* cmd;
-    uint32_t period;
     parameter_t *parameters;
     uint32_t parameters_count;
     pid_type_t pid_type;
-    char* rxheader;
     bool enabled;
     /* OBD service/mode byte (issue #31): 0x01 standard OBD, 0x22 ReadDataByIdentifier,
      * 0x23 ReadMemoryByAddress (issue #51).
@@ -97,10 +74,9 @@ typedef struct
      * byte (poll_log packs cmd verbatim) -- the parser derives mode FROM that prefix and
      * warns if a stored "Mode" contradicts it, so this field can never claim a service
      * the request doesn't send. Replaces the deleted free-text per-PID "Init" (inert
-     * under poll_log; its ATSH use is covered by the hardcoded 0x7E0). Consumed
-     * BEHAVIORALLY only by the legacy scheduler's mode-22 ATSH7E0 prologue (autopid.c,
-     * dies with issue #28); informational under poll_log, which shapes and matches a 0x23
-     * request from cmd alone (see polllog_req_bytes / polllog_match). */
+     * under poll_log; its ATSH use is covered by the hardcoded 0x7E0). Informational
+     * only: nothing reads it at runtime -- poll_log shapes and matches a 0x23 request
+     * from cmd alone (see polllog_req_bytes / polllog_match). */
     uint8_t mode;
     /* Sweep-divisor scheduling (issue #29): poll this PID on every Nth poll_log sweep.
      * 0 or 1 == every sweep -- the default and today's shipped behaviour. Parsed from
@@ -140,37 +116,9 @@ typedef struct
     // channel NAMES, not raw CAN bytes -- evaluated by autopid_eval_calculated_channels().
     parameter_t *calculated;
     uint32_t calculated_count;
-    char* custom_init;
-    char* standard_init;
-    char* specific_init;
-    char* selected_car_model;
     bool pid_std_en;
     bool pid_custom_en;
     bool pid_specific_en;
-    // When enabled, pause Automate/AutoPID when battery voltage is below configured sleep voltage.
-    // Stored in auto_pid.json as: disable_on_sleep_voltage = "enable"/"disable".
-    bool disable_on_sleep_voltage;
-    // Alternative low-voltage mode: when battery voltage is below configured sleep voltage,
-    // disable PID requests (polling) but keep CAN filter monitoring active.
-    // Stored in auto_pid.json as: disable_on_sleep_voltage = "disable_pid_requests".
-    bool disable_pid_requests_on_sleep_voltage;
-
-    // Alternative voltage mode: disable PID requests (polling) when battery voltage is below
-    // a configurable threshold (separate from Power Saving -> Sleep Voltage).
-    // CAN filter monitoring remains active.
-    // Stored in auto_pid.json as: disable_on_sleep_voltage = "automate_threshold".
-    bool disable_pid_requests_on_automate_threshold;
-
-    // Voltage threshold used when disable_pid_requests_on_automate_threshold is enabled.
-    // Stored in auto_pid.json as: pid_polling_min_voltage = <number>.
-    float pid_polling_min_voltage;
-    // When enabled, validate that each PID request's response matches the request (service + PID bytes)
-    // using the command string (cmd_str) provided by the ELM command runner.
-    bool pid_validation_en;
-    char* std_ecu_protocol;
-    char* vehicle_model;
-    uint32_t cycle;     //To be removed when std pid gets its own period
-    time_t last_successful_pid_time;  // Timestamp in seconds since epoch of last successful PID response
     // True when this table was parsed from the temporary session list (RAM) instead of
     // auto_pid.json. Set once by load_autopid_config(), never changed afterwards.
     bool from_session_list;
@@ -187,32 +135,20 @@ typedef struct
     SemaphoreHandle_t mutex; // Mutex to protect access to the data
 } autopid_data_t;
 
-void autopid_parser(char *str, uint32_t len, QueueHandle_t *q, char* cmd_str);
-void autopid_init(char* id);
-
-// FAST_LOG support (Task #18): parse auto_pid.json into the module config WITHOUT starting
-// the AutoPID task or any ELM polling. Creates autopid_config + its mutex and registers the
-// wide-CSV column provider, so the native-TWAI fast datalogger (components/fast_log) can
+// FAST_LOG support (Task #18): parse auto_pid.json into the module config. Creates
+// autopid_config + its mutex and registers the wide-CSV column provider, so the
+// native-TWAI fast datalogger (components/fast_log) can
 // read can_filters[]/pids[] and reuse autopid_lock()/the column provider. Returns the parsed
 // config (NULL on failure). Idempotent: returns the existing config if already loaded.
-// Unlike autopid_init() it does NOT require pid_count>0 (broadcast-only configs are valid).
+// It does NOT require pid_count>0 (broadcast-only configs are valid).
 autopid_config_t* autopid_load_config_only(void);
 char *autopid_data_read(void);
 bool autopid_get_ecu_status(void);
-char* autopid_get_config(void);
-esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint32_t available_pids_size) ;
-
-// Protocol tracking helpers used by AutoPID parsing and related modules.
-esp_err_t autopid_set_protocol_number(int32_t protocol_value);
-esp_err_t autopid_get_protocol_number(int32_t *protocol_value);
 
 char *autopid_get_value_by_name(char* name);
-void autopid_app_reset_timer(void);
 
-// Shared lock for ELM327 access.
-// The AutoPID task uses this mutex to serialize access to the ELM327 interface.
-// Other modules (e.g. AutoPID HTTP test endpoint) should take this lock to
-// prevent interleaved commands/responses.
+// Shared lock for the PID table (autopid_config). poll_log, the CSV column provider and the
+// calculated-channel evaluator take it to serialize access to the table.
 bool autopid_lock(uint32_t timeout_ms);
 void autopid_unlock(void);
 
